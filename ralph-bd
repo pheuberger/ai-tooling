@@ -86,11 +86,18 @@ if [[ -n "$PARENT_ID" ]]; then
     echo "Cannot use --parent and --beads together." >&2; exit 1
   fi
 
-  children_json=$(bd children "$PARENT_ID" --json 2>/dev/null) || { echo "Failed to fetch children of $PARENT_ID" >&2; exit 1; }
+  # Try parent-child relationship first, fall back to dependency (blocks) relationship
+  children_json=$(bd children "$PARENT_ID" --json 2>/dev/null) || children_json="[]"
   child_count=$(echo "$children_json" | jq 'length')
 
   if [[ "$child_count" -eq 0 ]]; then
-    echo "No children found for $PARENT_ID" >&2; exit 1
+    # No parent-child links — try dependents (beads this one blocks)
+    children_json=$(bd dep list "$PARENT_ID" --direction=up --json 2>/dev/null) || children_json="[]"
+    child_count=$(echo "$children_json" | jq 'length')
+  fi
+
+  if [[ "$child_count" -eq 0 ]]; then
+    echo "No children or dependents found for $PARENT_ID" >&2; exit 1
   fi
 
   # Apply --type filter to children
@@ -111,7 +118,7 @@ if [[ -n "$PARENT_ID" ]]; then
   BEAD_IDS=$(echo "$children_json" | jq -r '[.[].id] | join(",")')
 
   if [[ -z "$BEAD_IDS" ]]; then
-    echo "No children of $PARENT_ID match the given filters." >&2; exit 1
+    echo "No beads under $PARENT_ID match the given filters." >&2; exit 1
   fi
 
   echo "[$(ts)] Resolved --parent $PARENT_ID → $(echo "$children_json" | jq 'length') child bead(s): ${BEAD_IDS//,/, }"
