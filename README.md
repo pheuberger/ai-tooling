@@ -87,6 +87,7 @@ If the coding agent fails after all retries, the bead is released (`bd update �
 | `--respect-deps` | off | With `--beads`: skip beads whose dependencies aren't closed yet. Blocked beads are re-queued at the end of the list. |
 | `--type TYPE` | — | Filter `bd ready` by `issue_type` (`feature`, `bug`, `task`) |
 | `--priority N` | — | Only pick beads with `priority <= N` (0=critical, 1=high, 2=medium, 3=low, 4=backlog) |
+| `--owner NAME` | — | Only pick beads owned by `NAME` |
 | `-h`, `--help` | — | Print usage and exit |
 
 ### Examples
@@ -100,6 +101,9 @@ If the coding agent fails after all retries, the bead is released (`bd update �
 
 # Use a specific model, limit iterations
 ./ralph-bd.sh --model claude-sonnet-4-5-20250929 --max-iterations 5
+
+# Only beads owned by a specific person
+./ralph-bd.sh --owner bitbeckers
 
 # Maximum retries for flaky CI environments
 ./ralph-bd.sh --max-retries 5
@@ -131,6 +135,9 @@ FILTER_TYPE="feature"
 # Only process beads with priority <= this value (default: "" = all priorities)
 # 0=critical, 1=high, 2=medium, 3=low, 4=backlog
 FILTER_PRIORITY=2
+
+# Only process beads owned by this name (default: "" = all owners)
+FILTER_OWNER="bitbeckers"
 
 # Where to write logs (default: ".ralph-logs")
 LOG_DIR=".ralph-logs"

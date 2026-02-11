@@ -14,11 +14,13 @@
 #   --respect-deps       With --beads: skip beads whose dependencies aren't closed yet
 #   --type TYPE          Filter ready beads by issue_type (feature|bug|task)
 #   --priority N         Only pick beads with priority <= N (0=critical … 4=backlog)
+#   --owner NAME         Only pick beads owned by NAME
 #
 # Configuration files (optional):
 #   .ralphrc             Sourced from project root before CLI args are parsed.
 #                        Set any of: MAX_ITERATIONS, MAX_RETRIES, MODEL,
-#                        FILTER_TYPE, FILTER_PRIORITY, LOG_DIR, RALPH_RULES_FILE.
+#                        FILTER_TYPE, FILTER_PRIORITY, FILTER_OWNER, LOG_DIR,
+#                        RALPH_RULES_FILE.
 #                        CLI flags override values set here.
 #   .ralph-rules.md      Extra instructions injected into the agent prompt as a
 #                        "## Project Rules" section. Use for ralph-specific rules
@@ -46,6 +48,7 @@ EXPLICIT_MODE=false  # set when --beads is used (prevents fallback to bd ready)
 RESPECT_DEPS=false   # with --beads: skip beads whose deps aren't closed
 FILTER_TYPE=""       # filter by issue_type (feature|bug|task)
 FILTER_PRIORITY=""   # only beads with priority <= this value (0=critical … 4=backlog)
+FILTER_OWNER=""      # only beads owned by this name
 LOG_DIR=".ralph-logs"
 RALPH_RULES_FILE=".ralph-rules.md"
 
@@ -66,6 +69,7 @@ while [[ $# -gt 0 ]]; do
     --respect-deps)   RESPECT_DEPS=true; shift ;;
     --type)           FILTER_TYPE="$2"; shift 2 ;;
     --priority)       FILTER_PRIORITY="$2"; shift 2 ;;
+    --owner)          FILTER_OWNER="$2"; shift 2 ;;
     -h|--help)        sed -n '/^# Usage/,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
     *)                echo "Unknown option: $1" >&2; exit 1 ;;
   esac
@@ -107,6 +111,7 @@ echo "[$(ts)] Ralph Loop starting (max_iterations=$MAX_ITERATIONS, max_retries=$
 [[ "$RESPECT_DEPS" == true ]]     && echo "[$(ts)]   Respect deps: yes (blocked beads deferred)"
 [[ -n "$FILTER_TYPE" ]]           && echo "[$(ts)]   Filter type: $FILTER_TYPE"
 [[ -n "$FILTER_PRIORITY" ]]       && echo "[$(ts)]   Filter priority: <= $FILTER_PRIORITY"
+[[ -n "$FILTER_OWNER" ]]          && echo "[$(ts)]   Filter owner: $FILTER_OWNER"
 echo "================================================================="
 
 # ---------------------------------------------------------------------------
@@ -197,6 +202,11 @@ while true; do
     # Apply --priority filter (keep beads with priority <= threshold)
     if [[ -n "$FILTER_PRIORITY" ]]; then
       ready_json=$(echo "$ready_json" | jq --argjson p "$FILTER_PRIORITY" '[.[] | select((.priority // 4) <= $p)]')
+    fi
+
+    # Apply --owner filter
+    if [[ -n "$FILTER_OWNER" ]]; then
+      ready_json=$(echo "$ready_json" | jq --arg o "$FILTER_OWNER" '[.[] | select(.owner == $o)]')
     fi
 
     # Pick first not already skipped
