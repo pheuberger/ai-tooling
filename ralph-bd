@@ -11,7 +11,9 @@
 #   --max-retries N      Retries per bead on failure (default: 3)
 #   --model MODEL        Claude model override (default: CLI default)
 #   --beads ID[,ID,...]  Only process these beads, in order (skip bd ready)
-#   --parent ID          Process all children of a feature/epic bead
+#   --parent ID          Process all children/dependents of an epic/feature in
+#                        dependency order (implies --respect-deps, excludes the
+#                        parent itself from dep checks so children aren't all blocked)
 #   --respect-deps       With --beads/--parent: skip beads whose dependencies aren't closed yet
 #   --type TYPE          Filter ready beads by issue_type (feature|bug|task)
 #   --priority N         Only pick beads with priority <= N (0=critical … 4=backlog)
@@ -121,6 +123,9 @@ if [[ -n "$PARENT_ID" ]]; then
     echo "No beads under $PARENT_ID match the given filters." >&2; exit 1
   fi
 
+  # --parent implies --respect-deps so children are processed in dependency order
+  RESPECT_DEPS=true
+
   echo "[$(ts)] Resolved --parent $PARENT_ID → $(echo "$children_json" | jq 'length') child bead(s): ${BEAD_IDS//,/, }"
 fi
 
@@ -199,9 +204,11 @@ while true; do
           continue   # failed earlier — drop from list
         fi
 
-        # Check if all dependencies are closed
+        # Check if all dependencies are closed (exclude parent bead — it blocks
+        # all children structurally, not as an ordering constraint)
         dep_json=$(bd show "$candidate" --json 2>/dev/null) || dep_json="[]"
-        open_deps=$(echo "$dep_json" | jq '[.[0].dependencies // [] | .[] | select(.status != "closed")] | length')
+        open_deps=$(echo "$dep_json" | jq --arg parent "$PARENT_ID" \
+          '[.[0].dependencies // [] | .[] | select(.status != "closed" and .id != $parent)] | length')
 
         if [[ "$open_deps" -gt 0 ]]; then
           # Still blocked — re-queue at the end
