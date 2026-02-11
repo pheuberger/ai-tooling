@@ -11,7 +11,8 @@
 #   --max-retries N      Retries per bead on failure (default: 3)
 #   --model MODEL        Claude model override (default: CLI default)
 #   --beads ID[,ID,...]  Only process these beads, in order (skip bd ready)
-#   --respect-deps       With --beads: skip beads whose dependencies aren't closed yet
+#   --parent ID          Process all children of a feature/epic bead
+#   --respect-deps       With --beads/--parent: skip beads whose dependencies aren't closed yet
 #   --type TYPE          Filter ready beads by issue_type (feature|bug|task)
 #   --priority N         Only pick beads with priority <= N (0=critical … 4=backlog)
 #   --owner NAME         Only pick beads owned by NAME
@@ -44,8 +45,9 @@ MAX_ITERATIONS=50
 MAX_RETRIES=3
 MODEL=""
 BEAD_IDS=""          # comma-separated explicit bead list
-EXPLICIT_MODE=false  # set when --beads is used (prevents fallback to bd ready)
-RESPECT_DEPS=false   # with --beads: skip beads whose deps aren't closed
+PARENT_ID=""         # parent bead ID (epic/feature) — children resolved at startup
+EXPLICIT_MODE=false  # set when --beads/--parent is used (prevents fallback to bd ready)
+RESPECT_DEPS=false   # with --beads/--parent: skip beads whose deps aren't closed
 FILTER_TYPE=""       # filter by issue_type (feature|bug|task)
 FILTER_PRIORITY=""   # only beads with priority <= this value (0=critical … 4=backlog)
 FILTER_OWNER=""      # only beads owned by this name
@@ -66,6 +68,7 @@ while [[ $# -gt 0 ]]; do
     --max-retries)    MAX_RETRIES="$2"; shift 2 ;;
     --model)          MODEL="$2"; shift 2 ;;
     --beads)          BEAD_IDS="$2"; EXPLICIT_MODE=true; shift 2 ;;
+    --parent)         PARENT_ID="$2"; EXPLICIT_MODE=true; shift 2 ;;
     --respect-deps)   RESPECT_DEPS=true; shift ;;
     --type)           FILTER_TYPE="$2"; shift 2 ;;
     --priority)       FILTER_PRIORITY="$2"; shift 2 ;;
@@ -74,6 +77,45 @@ while [[ $# -gt 0 ]]; do
     *)                echo "Unknown option: $1" >&2; exit 1 ;;
   esac
 done
+
+# ---------------------------------------------------------------------------
+# Resolve --parent into a bead list
+# ---------------------------------------------------------------------------
+if [[ -n "$PARENT_ID" ]]; then
+  if [[ -n "$BEAD_IDS" ]]; then
+    echo "Cannot use --parent and --beads together." >&2; exit 1
+  fi
+
+  children_json=$(bd children "$PARENT_ID" --json 2>/dev/null) || { echo "Failed to fetch children of $PARENT_ID" >&2; exit 1; }
+  child_count=$(echo "$children_json" | jq 'length')
+
+  if [[ "$child_count" -eq 0 ]]; then
+    echo "No children found for $PARENT_ID" >&2; exit 1
+  fi
+
+  # Apply --type filter to children
+  if [[ -n "$FILTER_TYPE" ]]; then
+    children_json=$(echo "$children_json" | jq --arg t "$FILTER_TYPE" '[.[] | select(.issue_type == $t)]')
+  fi
+
+  # Apply --priority filter to children
+  if [[ -n "$FILTER_PRIORITY" ]]; then
+    children_json=$(echo "$children_json" | jq --argjson p "$FILTER_PRIORITY" '[.[] | select((.priority // 4) <= $p)]')
+  fi
+
+  # Apply --owner filter to children
+  if [[ -n "$FILTER_OWNER" ]]; then
+    children_json=$(echo "$children_json" | jq --arg o "$FILTER_OWNER" '[.[] | select(.owner == $o)]')
+  fi
+
+  BEAD_IDS=$(echo "$children_json" | jq -r '[.[].id] | join(",")')
+
+  if [[ -z "$BEAD_IDS" ]]; then
+    echo "No children of $PARENT_ID match the given filters." >&2; exit 1
+  fi
+
+  echo "[$(ts)] Resolved --parent $PARENT_ID → $(echo "$children_json" | jq 'length') child bead(s): ${BEAD_IDS//,/, }"
+fi
 
 # ---------------------------------------------------------------------------
 # Preflight
@@ -107,6 +149,7 @@ iteration=0
 echo "[$(ts)] Ralph Loop starting (max_iterations=$MAX_ITERATIONS, max_retries=$MAX_RETRIES)"
 [[ -f ".ralphrc" ]]               && echo "[$(ts)]   Config: .ralphrc loaded"
 [[ -f "$RALPH_RULES_FILE" ]]      && echo "[$(ts)]   Rules: $RALPH_RULES_FILE loaded"
+[[ -n "$PARENT_ID" ]]             && echo "[$(ts)]   Parent: $PARENT_ID"
 [[ -n "$BEAD_IDS" ]]              && echo "[$(ts)]   Beads: $BEAD_IDS"
 [[ "$RESPECT_DEPS" == true ]]     && echo "[$(ts)]   Respect deps: yes (blocked beads deferred)"
 [[ -n "$FILTER_TYPE" ]]           && echo "[$(ts)]   Filter type: $FILTER_TYPE"
