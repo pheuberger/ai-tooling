@@ -1,0 +1,423 @@
+#!/usr/bin/env bash
+# ralph-bd.sh — Ralph Loop for beads-driven autonomous coding
+#
+# Spawns a fresh Claude Code instance per ready bead. Each instance gets
+# clean context — no conversation history carries over. State lives in
+# the filesystem and git, not in the LLM's memory. This sidesteps context
+# degradation by treating every iteration as a brand-new session.
+#
+# Usage: ./ralph-bd.sh [options]
+#   --max-iterations N   Maximum total iterations (default: 50)
+#   --max-retries N      Retries per bead on failure (default: 3)
+#   --model MODEL        Claude model override (default: CLI default)
+#   --beads ID[,ID,...]  Only process these beads, in order (skip bd ready)
+#   --respect-deps       With --beads: skip beads whose dependencies aren't closed yet
+#   --type TYPE          Filter ready beads by issue_type (feature|bug|task)
+#   --priority N         Only pick beads with priority <= N (0=critical … 4=backlog)
+#
+# Configuration files (optional):
+#   .ralphrc             Sourced from project root before CLI args are parsed.
+#                        Set any of: MAX_ITERATIONS, MAX_RETRIES, MODEL,
+#                        FILTER_TYPE, FILTER_PRIORITY, LOG_DIR, RALPH_RULES_FILE.
+#                        CLI flags override values set here.
+#   .ralph-rules.md      Extra instructions injected into the agent prompt as a
+#                        "## Project Rules" section. Use for ralph-specific rules
+#                        that don't belong in AGENTS.md or CLAUDE.md. Silently
+#                        skipped if absent. Path configurable via RALPH_RULES_FILE.
+#
+# Requires: claude (Claude Code CLI), bd (beads), jq, git
+#
+# References:
+#   https://github.com/snarktank/ralph
+#   https://medium.com/@tentenco/what-is-ralph-loop-a-new-era-of-autonomous-coding-96a4bb3e2ac8
+
+set -euo pipefail
+
+ts() { printf '%s' "$(date '+%Y-%m-%d %H:%M:%S')"; }
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+MAX_ITERATIONS=50
+MAX_RETRIES=3
+MODEL=""
+BEAD_IDS=""          # comma-separated explicit bead list
+EXPLICIT_MODE=false  # set when --beads is used (prevents fallback to bd ready)
+RESPECT_DEPS=false   # with --beads: skip beads whose deps aren't closed
+FILTER_TYPE=""       # filter by issue_type (feature|bug|task)
+FILTER_PRIORITY=""   # only beads with priority <= this value (0=critical … 4=backlog)
+LOG_DIR=".ralph-logs"
+RALPH_RULES_FILE=".ralph-rules.md"
+
+# Source per-project config (CLI flags override)
+if [[ -f ".ralphrc" ]]; then
+  # shellcheck source=/dev/null
+  source ".ralphrc"
+fi
+
+SKIP_FILE="$LOG_DIR/.skipped"
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --max-iterations) MAX_ITERATIONS="$2"; shift 2 ;;
+    --max-retries)    MAX_RETRIES="$2"; shift 2 ;;
+    --model)          MODEL="$2"; shift 2 ;;
+    --beads)          BEAD_IDS="$2"; EXPLICIT_MODE=true; shift 2 ;;
+    --respect-deps)   RESPECT_DEPS=true; shift ;;
+    --type)           FILTER_TYPE="$2"; shift 2 ;;
+    --priority)       FILTER_PRIORITY="$2"; shift 2 ;;
+    -h|--help)        sed -n '/^# Usage/,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    *)                echo "Unknown option: $1" >&2; exit 1 ;;
+  esac
+done
+
+# ---------------------------------------------------------------------------
+# Preflight
+# ---------------------------------------------------------------------------
+for cmd in claude bd jq git; do
+  command -v "$cmd" >/dev/null 2>&1 || { echo "Required: $cmd" >&2; exit 1; }
+done
+
+git diff --quiet --cached 2>/dev/null || { echo "Staged changes exist. Commit or stash first." >&2; exit 1; }
+
+# Move pre-existing untracked files (PLAN.md, SPEC.md, etc.) out of the
+# working tree so git add -A inside the loop doesn't pick them up.
+# We can't use git stash because it would also revert unstaged tracked
+# changes in .beads/, breaking bd ready.
+STASH_DIR=""
+untracked=$(git ls-files --others --exclude-standard -- ':!.beads' ':!.ralph-logs' 2>/dev/null)
+if [[ -n "$untracked" ]]; then
+  STASH_DIR=$(mktemp -d /tmp/ralph-stash.XXXXXX)
+  echo "$untracked" | while IFS= read -r f; do
+    mkdir -p "$STASH_DIR/$(dirname "$f")"
+    mv "$f" "$STASH_DIR/$f"
+  done
+  echo "[$(ts)] Shelved $(echo "$untracked" | wc -l | tr -d ' ') untracked file(s) to $STASH_DIR"
+fi
+
+mkdir -p "$LOG_DIR"
+: > "$SKIP_FILE"
+
+iteration=0
+
+echo "[$(ts)] Ralph Loop starting (max_iterations=$MAX_ITERATIONS, max_retries=$MAX_RETRIES)"
+[[ -f ".ralphrc" ]]               && echo "[$(ts)]   Config: .ralphrc loaded"
+[[ -f "$RALPH_RULES_FILE" ]]      && echo "[$(ts)]   Rules: $RALPH_RULES_FILE loaded"
+[[ -n "$BEAD_IDS" ]]              && echo "[$(ts)]   Beads: $BEAD_IDS"
+[[ "$RESPECT_DEPS" == true ]]     && echo "[$(ts)]   Respect deps: yes (blocked beads deferred)"
+[[ -n "$FILTER_TYPE" ]]           && echo "[$(ts)]   Filter type: $FILTER_TYPE"
+[[ -n "$FILTER_PRIORITY" ]]       && echo "[$(ts)]   Filter priority: <= $FILTER_PRIORITY"
+echo "================================================================="
+
+# ---------------------------------------------------------------------------
+# Main loop — runs as long as there are unblocked beads
+# ---------------------------------------------------------------------------
+while true; do
+  # -----------------------------------------------------------------------
+  # Pick next bead — explicit list, filtered ready, or default ready
+  # -----------------------------------------------------------------------
+  bead_id=""
+  bead_title=""
+  bead_type=""
+
+  if [[ "$EXPLICIT_MODE" == true ]]; then
+    # Explicit bead list — stop when exhausted
+    if [[ -z "$BEAD_IDS" ]]; then
+      break
+    fi
+
+    if [[ "$RESPECT_DEPS" == true ]]; then
+      # Scan the list for the first bead whose dependencies are all closed.
+      # Beads that are still blocked get re-queued at the end.
+      remaining=""
+      found=false
+
+      IFS=',' read -ra candidates <<< "$BEAD_IDS"
+      for candidate in "${candidates[@]}"; do
+        if [[ "$found" == true ]]; then
+          # Already picked one — keep the rest as-is
+          remaining="${remaining:+$remaining,}$candidate"
+          continue
+        fi
+
+        if grep -qxF "$candidate" "$SKIP_FILE" 2>/dev/null; then
+          continue   # failed earlier — drop from list
+        fi
+
+        # Check if all dependencies are closed
+        dep_json=$(bd show "$candidate" --json 2>/dev/null) || dep_json="[]"
+        open_deps=$(echo "$dep_json" | jq '[.[0].dependencies // [] | .[] | select(.status != "closed")] | length')
+
+        if [[ "$open_deps" -gt 0 ]]; then
+          # Still blocked — re-queue at the end
+          remaining="${remaining:+$remaining,}$candidate"
+        else
+          # Ready to go
+          bead_id="$candidate"
+          bead_title=$(echo "$dep_json" | jq -r '.[0].title // "unknown"')
+          bead_type=$(echo "$dep_json" | jq -r '.[0].issue_type // "task"')
+          found=true
+        fi
+      done
+
+      BEAD_IDS="$remaining"
+
+      if [[ "$found" == false ]]; then
+        if [[ -n "$remaining" ]]; then
+          echo ""
+          echo "[$(ts)] All remaining beads are blocked. Stopping."
+          echo "[$(ts)]   Blocked: ${remaining//,/, }"
+        fi
+        break
+      fi
+    else
+      # No dep checking — pop first ID from the comma-separated list
+      bead_id="${BEAD_IDS%%,*}"
+      rest="${BEAD_IDS#*,}"
+      [[ "$rest" == "$bead_id" ]] && rest=""   # was the last item
+      BEAD_IDS="$rest"
+
+      if grep -qxF "$bead_id" "$SKIP_FILE" 2>/dev/null; then
+        continue   # already failed — skip silently
+      fi
+
+      # Resolve title/type from bd show
+      bead_json=$(bd show "$bead_id" --json 2>/dev/null) || bead_json="[]"
+      bead_title=$(echo "$bead_json" | jq -r '.[0].title // "unknown"')
+      bead_type=$(echo "$bead_json" | jq -r '.[0].issue_type // "task"')
+    fi
+  else
+    ready_json=$(bd ready --json 2>/dev/null) || ready_json="[]"
+
+    # Apply --type filter
+    if [[ -n "$FILTER_TYPE" ]]; then
+      ready_json=$(echo "$ready_json" | jq --arg t "$FILTER_TYPE" '[.[] | select(.issue_type == $t)]')
+    fi
+
+    # Apply --priority filter (keep beads with priority <= threshold)
+    if [[ -n "$FILTER_PRIORITY" ]]; then
+      ready_json=$(echo "$ready_json" | jq --argjson p "$FILTER_PRIORITY" '[.[] | select((.priority // 4) <= $p)]')
+    fi
+
+    # Pick first not already skipped
+    count=$(echo "$ready_json" | jq 'length')
+    for i in $(seq 0 $((count - 1))); do
+      candidate=$(echo "$ready_json" | jq -r ".[$i].id")
+      if ! grep -qxF "$candidate" "$SKIP_FILE" 2>/dev/null; then
+        bead_id="$candidate"
+        bead_title=$(echo "$ready_json" | jq -r ".[$i].title")
+        bead_type=$(echo "$ready_json" | jq -r ".[$i].issue_type")
+        break
+      fi
+    done
+  fi
+
+  if [[ -z "$bead_id" ]]; then
+    echo ""
+    echo "[$(ts)] No more ready beads. Ralph is done."
+    break
+  fi
+
+  iteration=$((iteration + 1))
+  if [[ $iteration -gt $MAX_ITERATIONS ]]; then
+    echo ""
+    echo "[$(ts)] Reached max iterations ($MAX_ITERATIONS). Stopping."
+    exit 1
+  fi
+
+  echo ""
+  echo "[$(ts)] === Iteration $iteration: $bead_id — $bead_title ==="
+
+  # Claim the bead
+  bd update "$bead_id" --status=in_progress 2>/dev/null || true
+
+  # -----------------------------------------------------------------------
+  # Build the prompt — fresh context each time (core Ralph insight)
+  # -----------------------------------------------------------------------
+  bead_details=$(bd show "$bead_id" 2>/dev/null)
+  prompt_file=$(mktemp /tmp/ralph-prompt.XXXXXX)
+
+  # Load project-specific rules if the file exists
+  project_rules=""
+  if [[ -f "$RALPH_RULES_FILE" ]]; then
+    project_rules=$(cat "$RALPH_RULES_FILE")
+  fi
+
+  cat > "$prompt_file" <<__RALPH_PROMPT__
+You are an autonomous coding agent working on a single task.
+This is a fresh Claude Code instance — you have no prior conversation history.
+State lives in the filesystem and git, not in your memory (Ralph Loop pattern).
+
+## Rules
+- Do NOT create git commits. The outer loop handles all commits.
+- Do NOT run any bead commands (bd close, bd update, bd sync). Bead lifecycle is managed externally.
+- Do NOT use TodoWrite or TaskCreate for tracking.
+- Focus ONLY on the task below. Do not work on anything else.
+${project_rules:+
+## Project Rules
+$project_rules
+}
+## When you are done
+End your output with a "## Learnings" section. Include ONLY things that were
+unexpected or required a pivot from the spec — e.g. the spec said X but the
+code actually needed Y, a dependency behaved differently than expected, a file
+was structured differently than described, an edge case the spec didn't cover.
+If everything went exactly as described, write "None — task matched spec."
+
+## Task
+${bead_details}
+__RALPH_PROMPT__
+
+  # -----------------------------------------------------------------------
+  # Run Claude — retry on failure
+  # -----------------------------------------------------------------------
+  claude_flags=(--print --dangerously-skip-permissions)
+  [[ -n "$MODEL" ]] && claude_flags+=(--model "$MODEL")
+
+  log_file="$LOG_DIR/iter-${iteration}-${bead_id}.log"
+  retries=0
+  success=false
+
+  while [[ $retries -lt $MAX_RETRIES ]]; do
+    echo "[$(ts)]   Attempt $((retries + 1))/$MAX_RETRIES..."
+
+    if claude "${claude_flags[@]}" < "$prompt_file" > "$log_file" 2>&1; then
+      success=true
+      break
+    fi
+
+    retries=$((retries + 1))
+    if [[ $retries -lt $MAX_RETRIES ]]; then
+      echo "[$(ts)]   Claude exited non-zero. Retrying in 5s..."
+      sleep 5
+    fi
+  done
+
+  rm -f "$prompt_file"
+
+  if [[ "$success" == false ]]; then
+    echo "[$(ts)]   Failed after $MAX_RETRIES attempts. Skipping $bead_id."
+    echo "$bead_id" >> "$SKIP_FILE"
+    bd update "$bead_id" --status=open 2>/dev/null || true   # release claim
+    continue
+  fi
+
+  # -----------------------------------------------------------------------
+  # Commit code changes only.
+  # .beads/ is managed by bd sync. .ralph-logs/ is script-internal.
+  # Exclude pathspecs (:!) don't play well with git add, so we use
+  # add-then-reset instead.
+  # -----------------------------------------------------------------------
+  code_changed=false
+  git diff --quiet -- ':!.beads' ':!.ralph-logs' 2>/dev/null            || code_changed=true
+  git diff --cached --quiet -- ':!.beads' ':!.ralph-logs' 2>/dev/null   || code_changed=true
+  [[ -z "$(git ls-files --others --exclude-standard -- ':!.beads' ':!.ralph-logs' 2>/dev/null)" ]] || code_changed=true
+
+  if [[ "$code_changed" == true ]]; then
+    commit_log="$LOG_DIR/iter-${iteration}-${bead_id}-commit.log"
+
+    # Spawn a tiny Claude instance to handle the commit.
+    # It reviews the diff, writes a good commit message, and can fix
+    # lint issues if husky/lint-staged rejects the commit.
+    claude --print --dangerously-skip-permissions -p "$(cat <<'__RALPH_COMMIT__'
+Stage and commit the current code changes.
+
+Steps:
+1. Run: git add -A && git reset HEAD -- .beads .ralph-logs
+2. Run: git diff --cached (to see what you're committing)
+3. Write a commit message that focuses on the *why* more than the *what*.
+   Follow any commit conventions the project has (check CLAUDE.md, AGENTS.md).
+4. Commit using a heredoc for the message.
+5. If the commit fails due to lint-staged or husky, fix the reported issues and retry.
+6. Do NOT run bd commands. Do NOT push.
+__RALPH_COMMIT__
+    )" > "$commit_log" 2>&1 && echo "[$(ts)]   Committed." || echo "[$(ts)]   Commit agent failed. See $commit_log"
+  else
+    echo "[$(ts)]   No code changes to commit."
+  fi
+
+  # -----------------------------------------------------------------------
+  # Close the bead if Claude didn't somehow close it already
+  # -----------------------------------------------------------------------
+  bead_status=$(bd show "$bead_id" --json 2>/dev/null | jq -r '.[0].status // "unknown"')
+  if [[ "$bead_status" != "closed" ]]; then
+    bd close "$bead_id" --reason="Completed by ralph loop (iteration $iteration)" 2>/dev/null || true
+    echo "[$(ts)]   Closed $bead_id."
+  fi
+
+  bd sync 2>/dev/null || true
+
+  echo "[$(ts)] === Done: $bead_id ==="
+  sleep 2
+done
+
+# ---------------------------------------------------------------------------
+# Wrap up
+# ---------------------------------------------------------------------------
+bd sync 2>/dev/null || true
+
+# Restore shelved untracked files
+if [[ -n "$STASH_DIR" && -d "$STASH_DIR" ]]; then
+  cp -a "$STASH_DIR"/. . 2>/dev/null || true
+  rm -rf "$STASH_DIR"
+  echo "[$(ts)] Restored shelved untracked files."
+fi
+
+echo ""
+echo "================================================================="
+echo "[$(ts)] Ralph Loop completed after $iteration iteration(s)."
+if [[ -s "$SKIP_FILE" ]]; then
+  echo ""
+  echo "[$(ts)] Skipped beads (failed after retries):"
+  while IFS= read -r id; do echo "  - $id"; done < "$SKIP_FILE"
+fi
+echo "[$(ts)] Logs: $LOG_DIR/"
+
+# ---------------------------------------------------------------------------
+# Post-run summary — read all work logs and extract learnings
+# ---------------------------------------------------------------------------
+if [[ $iteration -gt 0 ]]; then
+  echo ""
+  echo "[$(ts)] Generating run summary..."
+  summary_file="$LOG_DIR/summary-$(date '+%Y%m%d-%H%M%S').md"
+
+  # Collect work logs (skip commit logs)
+  log_list=""
+  for f in "$LOG_DIR"/iter-*; do
+    [[ "$f" == *-commit.log ]] && continue
+    [[ -f "$f" ]] && log_list="$log_list $f"
+  done
+
+  if [[ -n "$log_list" ]]; then
+    claude --print --dangerously-skip-permissions -p "$(cat <<EOF
+Read each of the following log files. They are outputs from autonomous coding
+agents that each worked on a single task.
+
+Log files: ${log_list}
+
+Write a concise run summary to stdout. Start with a line: "Generated: $(date '+%Y-%m-%d %H:%M:%S')"
+Then include these sections:
+
+## Completed
+One-line per bead: what was done.
+
+## Learnings & Surprises
+Extract anything from the agents' "## Learnings" sections (or from the body
+of their output) that was unexpected — spec inaccuracies, pivots, edge cases,
+dependency quirks, code structure that differed from expectations.
+Group related items. Skip anything that was "None — task matched spec."
+
+## Skipped / Failed
+List any beads that failed (if the skip file at ${SKIP_FILE} is non-empty,
+read it). Briefly note what went wrong if visible in the logs.
+
+Keep it tight — this is a debrief, not a novel.
+EOF
+    )" > "$summary_file" 2>&1
+
+    echo ""
+    cat "$summary_file"
+    echo ""
+    echo "[$(ts)] (saved to $summary_file)"
+  fi
+fi
