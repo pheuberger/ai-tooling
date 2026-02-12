@@ -117,7 +117,15 @@ if [[ -n "$PARENT_ID" ]]; then
     children_json=$(echo "$children_json" | jq --arg o "$FILTER_OWNER" '[.[] | select(.owner == $o)]')
   fi
 
-  BEAD_IDS=$(echo "$children_json" | jq -r '[.[].id] | join(",")')
+  # Sort children by numeric suffix (e.g., parent.1, parent.2, ...) so they
+  # process in phase order even when there are no explicit inter-dependencies
+  BEAD_IDS=$(echo "$children_json" | jq -r '
+    [.[].id] |
+    sort_by(
+      split(".") | .[-1] |
+      if test("^[0-9]+$") then tonumber else . end
+    ) |
+    join(",")')
 
   if [[ -z "$BEAD_IDS" ]]; then
     echo "No beads under $PARENT_ID match the given filters." >&2; exit 1
