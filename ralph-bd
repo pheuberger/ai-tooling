@@ -38,7 +38,18 @@
 
 set -euo pipefail
 
-ts() { printf '%s' "$(date '+%Y-%m-%d %H:%M:%S')"; }
+ts()         { printf '%s' "$(date '+%Y-%m-%d %H:%M:%S')"; }
+log()        { echo "[$(ts)] $*"; }
+bd_sync()    { bd sync 2>/dev/null || true; }
+bead_field() { echo "$1" | jq -r ".[0].$2 // \"$3\""; }
+
+# True if there are unstaged, staged, or untracked changes outside .beads/ and .ralph-logs/
+has_code_changes() {
+  git diff --quiet -- ':!.beads' ':!.ralph-logs' 2>/dev/null            || return 0
+  git diff --cached --quiet -- ':!.beads' ':!.ralph-logs' 2>/dev/null   || return 0
+  [[ -z "$(git ls-files --others --exclude-standard -- ':!.beads' ':!.ralph-logs' 2>/dev/null)" ]] || return 0
+  return 1
+}
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -123,7 +134,7 @@ if [[ -n "$untracked" ]]; then
     mkdir -p "$STASH_DIR/$(dirname "$f")"
     mv "$f" "$STASH_DIR/$f"
   done
-  echo "[$(ts)] Shelved $(echo "$untracked" | wc -l | tr -d ' ') untracked file(s) to $STASH_DIR"
+  log "Shelved $(echo "$untracked" | wc -l | tr -d ' ') untracked file(s) to $STASH_DIR"
 fi
 
 mkdir -p "$LOG_DIR"
@@ -131,22 +142,27 @@ mkdir -p "$LOG_DIR"
 
 iteration=0
 
-echo "[$(ts)] Ralph Loop starting (max_iterations=$MAX_ITERATIONS, max_retries=$MAX_RETRIES)"
-[[ -f ".ralphrc" ]]               && echo "[$(ts)]   Config: .ralphrc loaded"
-[[ -f "$RALPH_RULES_FILE" ]]      && echo "[$(ts)]   Rules: $RALPH_RULES_FILE loaded"
-[[ -n "$PLAN_FILE" ]]              && echo "[$(ts)]   Plan: $PLAN_FILE"
-[[ -n "$PARENT_ID" ]]             && echo "[$(ts)]   Parent: $PARENT_ID"
-[[ -n "$BEAD_IDS" ]]              && echo "[$(ts)]   Beads: $BEAD_IDS"
-[[ "$RESPECT_DEPS" == true ]]     && echo "[$(ts)]   Respect deps: yes (blocked beads deferred)"
-[[ -n "$FILTER_TYPE" ]]           && echo "[$(ts)]   Filter type: $FILTER_TYPE"
-[[ -n "$FILTER_PRIORITY" ]]       && echo "[$(ts)]   Filter priority: <= $FILTER_PRIORITY"
-[[ -n "$FILTER_OWNER" ]]          && echo "[$(ts)]   Filter owner: $FILTER_OWNER"
-[[ -n "$FILTER_LABEL" ]]          && echo "[$(ts)]   Filter label: $FILTER_LABEL"
+log "Ralph Loop starting (max_iterations=$MAX_ITERATIONS, max_retries=$MAX_RETRIES)"
+log_opt() { [[ -n "${2:-}" ]] && log "  $1: $2"; }
+[[ -f ".ralphrc" ]]          && log "  Config: .ralphrc loaded"
+[[ -f "$RALPH_RULES_FILE" ]] && log "  Rules: $RALPH_RULES_FILE loaded"
+log_opt "Plan"            "$PLAN_FILE"
+log_opt "Parent"          "$PARENT_ID"
+log_opt "Beads"           "$BEAD_IDS"
+log_opt "Filter type"     "$FILTER_TYPE"
+log_opt "Filter priority" "${FILTER_PRIORITY:+<= $FILTER_PRIORITY}"
+log_opt "Filter owner"    "$FILTER_OWNER"
+log_opt "Filter label"    "$FILTER_LABEL"
+[[ "$RESPECT_DEPS" == true ]] && log "  Respect deps: yes (blocked beads deferred)"
 echo "================================================================="
 
 # Common claude flags — shared by all agent invocations
 claude_flags=(--print --dangerously-skip-permissions)
 [[ -n "$MODEL" ]] && claude_flags+=(--model "$MODEL")
+
+# Load project-specific rules once (injected into worker prompts)
+project_rules=""
+[[ -f "$RALPH_RULES_FILE" ]] && project_rules=$(<"$RALPH_RULES_FILE")
 
 # ---------------------------------------------------------------------------
 # --from-plan: decompose a plan file into beads, then fall through to loop
@@ -156,11 +172,11 @@ if [[ -n "$PLAN_FILE" ]]; then
 
   # Create the epic in bd — ralph owns this, not the agent
   PARENT_ID=$(bd create "$plan_title" -t epic -d "$plan_body" --silent)
-  bd sync 2>/dev/null || true
-  echo "[$(ts)] Created epic $PARENT_ID: $plan_title"
+  bd_sync
+  log "Created epic $PARENT_ID: $plan_title"
 
   # --- Phase 1: Decompose epic into tasks ---
-  echo "[$(ts)] Lead: decomposing into tasks..."
+  log "Lead: decomposing into tasks..."
   lead_log="$LOG_DIR/lead-$(date '+%H%M%S').log"
 
   claude "${claude_flags[@]}" -p "$(cat <<LEAD_PROMPT
@@ -189,11 +205,11 @@ Each task must be completable in under 30 minutes by a fresh agent with zero pri
 If you can't define binary acceptance criteria, break the task smaller.
 LEAD_PROMPT
   )" > "$lead_log" 2>&1
-  bd sync 2>/dev/null || true
-  echo "[$(ts)] Lead: done. See $lead_log"
+  bd_sync
+  log "Lead: done. See $lead_log"
 
   # --- Phase 2: Validate specs ---
-  echo "[$(ts)] Validating specs..."
+  log "Validating specs..."
   spec_log="$LOG_DIR/spec-review-$(date '+%H%M%S').log"
   children_json=$(bd list --parent "$PARENT_ID" --status open --json --limit 0 2>/dev/null) || children_json="[]"
 
@@ -217,8 +233,8 @@ ${children_json}
 Output a one-line summary per task: PASS or what you fixed.
 SPEC_PROMPT
   )" > "$spec_log" 2>&1
-  bd sync 2>/dev/null || true
-  echo "[$(ts)] Spec review: done. See $spec_log"
+  bd_sync
+  log "Spec review: done. See $spec_log"
 
   # PARENT_ID is set — fall through into the main worker+reviewer loop
 fi
@@ -270,8 +286,8 @@ while true; do
         else
           # Ready to go
           bead_id="$candidate"
-          bead_title=$(echo "$dep_json" | jq -r '.[0].title // "unknown"')
-          bead_type=$(echo "$dep_json" | jq -r '.[0].issue_type // "task"')
+          bead_title=$(bead_field "$dep_json" title unknown)
+          bead_type=$(bead_field "$dep_json" issue_type task)
           found=true
         fi
       done
@@ -281,8 +297,8 @@ while true; do
       if [[ "$found" == false ]]; then
         if [[ -n "$remaining" ]]; then
           echo ""
-          echo "[$(ts)] All remaining beads are blocked. Stopping."
-          echo "[$(ts)]   Blocked: ${remaining//,/, }"
+          log "All remaining beads are blocked. Stopping."
+          log "  Blocked: ${remaining//,/, }"
         fi
         break
       fi
@@ -299,8 +315,8 @@ while true; do
 
       # Resolve title/type from bd show
       bead_json=$(bd show "$bead_id" --json 2>/dev/null) || bead_json="[]"
-      bead_title=$(echo "$bead_json" | jq -r '.[0].title // "unknown"')
-      bead_type=$(echo "$bead_json" | jq -r '.[0].issue_type // "task"')
+      bead_title=$(bead_field "$bead_json" title unknown)
+      bead_type=$(bead_field "$bead_json" issue_type task)
     fi
   else
     # Default mode — ask bd ready with passthrough filters
@@ -328,19 +344,19 @@ while true; do
 
   if [[ -z "$bead_id" ]]; then
     echo ""
-    echo "[$(ts)] No more ready beads. Ralph is done."
+    log "No more ready beads. Ralph is done."
     break
   fi
 
   iteration=$((iteration + 1))
   if [[ $iteration -gt $MAX_ITERATIONS ]]; then
     echo ""
-    echo "[$(ts)] Reached max iterations ($MAX_ITERATIONS). Stopping."
+    log "Reached max iterations ($MAX_ITERATIONS). Stopping."
     exit 1
   fi
 
   echo ""
-  echo "[$(ts)] === Iteration $iteration: $bead_id — $bead_title ==="
+  log "=== Iteration $iteration: $bead_id — $bead_title ==="
 
   # Claim the bead
   bd update "$bead_id" --status=in_progress 2>/dev/null || true
@@ -353,12 +369,6 @@ while true; do
   acceptance=$(echo "$bead_show_json" | jq -r '.[0].acceptance_criteria // empty')
   bead_parent=$(echo "$bead_show_json" | jq -r '.[0].parent // empty')
   prompt_file=$(mktemp /tmp/ralph-prompt.XXXXXX)
-
-  # Load project-specific rules if the file exists
-  project_rules=""
-  if [[ -f "$RALPH_RULES_FILE" ]]; then
-    project_rules=$(cat "$RALPH_RULES_FILE")
-  fi
 
   cat > "$prompt_file" <<__RALPH_PROMPT__
 You are an autonomous coding agent working on a single task.
@@ -402,7 +412,7 @@ __RALPH_PROMPT__
   success=false
 
   while [[ $retries -lt $MAX_RETRIES ]]; do
-    echo "[$(ts)]   Attempt $((retries + 1))/$MAX_RETRIES..."
+    log "  Attempt $((retries + 1))/$MAX_RETRIES..."
 
     if claude "${claude_flags[@]}" < "$prompt_file" > "$log_file" 2>&1; then
       success=true
@@ -411,7 +421,7 @@ __RALPH_PROMPT__
 
     retries=$((retries + 1))
     if [[ $retries -lt $MAX_RETRIES ]]; then
-      echo "[$(ts)]   Claude exited non-zero. Retrying in 5s..."
+      log "  Claude exited non-zero. Retrying in 5s..."
       sleep 5
     fi
   done
@@ -419,7 +429,7 @@ __RALPH_PROMPT__
   rm -f "$prompt_file"
 
   if [[ "$success" == false ]]; then
-    echo "[$(ts)]   Failed after $MAX_RETRIES attempts. Skipping $bead_id."
+    log "  Failed after $MAX_RETRIES attempts. Skipping $bead_id."
     echo "$bead_id" >> "$SKIP_FILE"
     bd update "$bead_id" --status=open 2>/dev/null || true   # release claim
     continue
@@ -431,18 +441,13 @@ __RALPH_PROMPT__
   # Exclude pathspecs (:!) don't play well with git add, so we use
   # add-then-reset instead.
   # -----------------------------------------------------------------------
-  code_changed=false
-  git diff --quiet -- ':!.beads' ':!.ralph-logs' 2>/dev/null            || code_changed=true
-  git diff --cached --quiet -- ':!.beads' ':!.ralph-logs' 2>/dev/null   || code_changed=true
-  [[ -z "$(git ls-files --others --exclude-standard -- ':!.beads' ':!.ralph-logs' 2>/dev/null)" ]] || code_changed=true
-
-  if [[ "$code_changed" == true ]]; then
+  if has_code_changes; then
     commit_log="$LOG_DIR/iter-${iteration}-${bead_id}-commit.log"
 
     # Spawn a tiny Claude instance to handle the commit.
     # It reviews the diff, writes a good commit message, and can fix
     # lint issues if husky/lint-staged rejects the commit.
-    claude --print --dangerously-skip-permissions -p "$(cat <<__RALPH_COMMIT__
+    claude "${claude_flags[@]}" -p "$(cat <<__RALPH_COMMIT__
 Stage and commit the current code changes.
 
 Steps:
@@ -455,23 +460,22 @@ Steps:
 5. If the commit fails due to lint-staged or husky, fix the reported issues and retry.
 6. Do NOT run bd commands. Do NOT push.
 __RALPH_COMMIT__
-    )" > "$commit_log" 2>&1 && echo "[$(ts)]   Committed." || echo "[$(ts)]   Commit agent failed. See $commit_log"
+    )" > "$commit_log" 2>&1 && log "  Committed." || log "  Commit agent failed. See $commit_log"
   else
-    echo "[$(ts)]   No code changes to commit."
+    log "  No code changes to commit."
   fi
 
   # -----------------------------------------------------------------------
   # Review the work — fresh Claude instance, read-only
   # -----------------------------------------------------------------------
   review_log="$LOG_DIR/iter-${iteration}-${bead_id}-review.log"
-  review_details=$(bd show "$bead_id" 2>/dev/null)
 
   claude "${claude_flags[@]}" -p "$(cat <<__RALPH_REVIEW__
 You are a code reviewer. Review the implementation of this task.
 Do NOT modify any code. Do NOT close or update bead status.
 
 ## Task
-${review_details}
+${bead_details}
 
 ## Instructions
 1. Find what changed: git log --oneline -1 --grep="(${bead_id})" then git show <hash>.
@@ -487,9 +491,9 @@ ${review_details}
 5. If everything looks good, output: REVIEW_PASS
 6. If you filed fix beads, output: REVIEW_ISSUES_FILED
 __RALPH_REVIEW__
-  )" > "$review_log" 2>&1 || echo "[$(ts)]   Review failed. See $review_log"
+  )" > "$review_log" 2>&1 || log "  Review failed. See $review_log"
 
-  echo "[$(ts)]   Reviewed. $(tail -1 "$review_log")"
+  log "  Reviewed. $(tail -1 "$review_log")"
 
   # -----------------------------------------------------------------------
   # Close the bead (or release if blocked)
@@ -498,47 +502,47 @@ __RALPH_REVIEW__
     | jq '[.[] | select(.status != "closed")] | length' 2>/dev/null) || open_blockers=0
 
   if [[ "$open_blockers" -gt 0 ]]; then
-    echo "[$(ts)]   $bead_id has open blockers — releasing claim."
+    log "  $bead_id has open blockers — releasing claim."
     bd update "$bead_id" --status=open 2>/dev/null || true
   else
     bd close "$bead_id" --reason="Completed by ralph (iteration $iteration)" 2>/dev/null || true
-    echo "[$(ts)]   Closed $bead_id."
+    log "  Closed $bead_id."
   fi
 
-  bd sync 2>/dev/null || true
+  bd_sync
 
-  echo "[$(ts)] === Done: $bead_id ==="
+  log "=== Done: $bead_id ==="
   sleep 2
 done
 
 # ---------------------------------------------------------------------------
 # Wrap up
 # ---------------------------------------------------------------------------
-bd sync 2>/dev/null || true
+bd_sync
 
 # Restore shelved untracked files
 if [[ -n "$STASH_DIR" && -d "$STASH_DIR" ]]; then
   cp -a "$STASH_DIR"/. . 2>/dev/null || true
   rm -rf "$STASH_DIR"
-  echo "[$(ts)] Restored shelved untracked files."
+  log "Restored shelved untracked files."
 fi
 
 echo ""
 echo "================================================================="
-echo "[$(ts)] Ralph Loop completed after $iteration iteration(s)."
+log "Ralph Loop completed after $iteration iteration(s)."
 if [[ -s "$SKIP_FILE" ]]; then
   echo ""
-  echo "[$(ts)] Skipped beads (failed after retries):"
+  log "Skipped beads (failed after retries):"
   while IFS= read -r id; do echo "  - $id"; done < "$SKIP_FILE"
 fi
-echo "[$(ts)] Logs: $LOG_DIR/"
+log "Logs: $LOG_DIR/"
 
 # ---------------------------------------------------------------------------
 # Post-run summary — read all work logs and extract learnings
 # ---------------------------------------------------------------------------
 if [[ $iteration -gt 0 ]]; then
   echo ""
-  echo "[$(ts)] Generating run summary..."
+  log "Generating run summary..."
   summary_file="$LOG_DIR/summary-$(date '+%Y%m%d-%H%M%S').md"
 
   # Collect work logs (skip commit logs)
@@ -549,7 +553,7 @@ if [[ $iteration -gt 0 ]]; then
   done
 
   if [[ -n "$log_list" ]]; then
-    claude --print --dangerously-skip-permissions -p "$(cat <<EOF
+    claude "${claude_flags[@]}" -p "$(cat <<EOF
 Read each of the following log files. They are outputs from autonomous coding
 agents that each worked on a single task.
 
@@ -578,6 +582,6 @@ EOF
     echo ""
     cat "$summary_file"
     echo ""
-    echo "[$(ts)] (saved to $summary_file)"
+    log "(saved to $summary_file)"
   fi
 fi
