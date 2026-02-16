@@ -9,7 +9,7 @@
 # Usage: ./ralph-bd [options]
 #   --max-iterations N   Maximum total iterations (default: 50)
 #   --max-retries N      Retries per bead on failure (default: 3)
-#   --model MODEL        Claude model override (default: CLI default)
+#   --model MODEL        Force ALL agents to this model (overrides per-agent models)
 #   --beads ID[,ID,...]  Only process these beads, in order (skip bd ready)
 #   --parent ID          Scope to children of this epic/feature (passed to bd ready)
 #   --respect-deps       With --beads: skip beads whose dependencies aren't closed yet
@@ -22,6 +22,8 @@
 # Configuration files (optional):
 #   .ralphrc             Sourced from project root before CLI args are parsed.
 #                        Set any of: MAX_ITERATIONS, MAX_RETRIES, MODEL,
+#                        WORKER_MODEL, REVIEWER_MODEL, COMMIT_MODEL,
+#                        LEAD_MODEL, SPEC_MODEL, SUMMARY_MODEL,
 #                        FILTER_TYPE, FILTER_PRIORITY, FILTER_OWNER,
 #                        FILTER_LABEL, LOG_DIR, RALPH_RULES_FILE.
 #                        CLI flags override values set here.
@@ -56,16 +58,22 @@ has_code_changes() {
 # ---------------------------------------------------------------------------
 MAX_ITERATIONS=50
 MAX_RETRIES=3
-MODEL=""
-BEAD_IDS=""          # comma-separated explicit bead list (--beads mode only)
-PARENT_ID=""         # parent bead ID — passed through to bd ready
-EXPLICIT_MODE=false  # set when --beads is used (prevents fallback to bd ready)
-RESPECT_DEPS=false   # with --beads: skip beads whose deps aren't closed
-FILTER_TYPE=""       # filter by issue_type (feature|bug|task)
-FILTER_PRIORITY=""   # only beads with priority <= this value (0=critical … 4=backlog)
-FILTER_OWNER=""      # only beads owned by this name
-FILTER_LABEL=""      # filter by label
-PLAN_FILE=""         # --from-plan: plan file to decompose into beads
+MODEL=""              # global override — forces all agents to this model
+LEAD_MODEL=""         # lead agent (plan decomposition) — default: opus
+SPEC_MODEL=""         # spec reviewer — default: opus
+WORKER_MODEL=""       # coding worker — default: sonnet
+COMMIT_MODEL=""       # commit agent — default: haiku
+REVIEWER_MODEL=""     # code reviewer — default: opus
+SUMMARY_MODEL=""      # post-run summary — default: haiku
+BEAD_IDS=""           # comma-separated explicit bead list (--beads mode only)
+PARENT_ID=""          # parent bead ID — passed through to bd ready
+EXPLICIT_MODE=false   # set when --beads is used (prevents fallback to bd ready)
+RESPECT_DEPS=false    # with --beads: skip beads whose deps aren't closed
+FILTER_TYPE=""        # filter by issue_type (feature|bug|task)
+FILTER_PRIORITY=""    # only beads with priority <= this value (0=critical … 4=backlog)
+FILTER_OWNER=""       # only beads owned by this name
+FILTER_LABEL=""       # filter by label
+PLAN_FILE=""          # --from-plan: plan file to decompose into beads
 LOG_DIR=".ralph-logs"
 RALPH_RULES_FILE=".ralph-rules.md"
 
@@ -142,6 +150,23 @@ mkdir -p "$LOG_DIR"
 
 iteration=0
 
+# Common claude flags — shared by all agent invocations
+claude_flags=(--print --dangerously-skip-permissions)
+
+# Per-agent model defaults — global MODEL overrides everything
+LEAD_MODEL="${MODEL:-${LEAD_MODEL:-claude-opus-4-6}}"
+SPEC_MODEL="${MODEL:-${SPEC_MODEL:-claude-opus-4-6}}"
+WORKER_MODEL="${MODEL:-${WORKER_MODEL:-claude-sonnet-4-5-20250929}}"
+COMMIT_MODEL="${MODEL:-${COMMIT_MODEL:-claude-haiku-4-5-20251001}}"
+REVIEWER_MODEL="${MODEL:-${REVIEWER_MODEL:-claude-opus-4-6}}"
+SUMMARY_MODEL="${MODEL:-${SUMMARY_MODEL:-claude-haiku-4-5-20251001}}"
+
+# Run claude with a specific model: claude_as <model> [extra-args...]
+claude_as() {
+  local model="$1"; shift
+  claude "${claude_flags[@]}" --model "$model" "$@"
+}
+
 log "Ralph Loop starting (max_iterations=$MAX_ITERATIONS, max_retries=$MAX_RETRIES)"
 log_opt() { [[ -n "${2:-}" ]] && log "  $1: $2"; }
 [[ -f ".ralphrc" ]]          && log "  Config: .ralphrc loaded"
@@ -154,11 +179,14 @@ log_opt "Filter priority" "${FILTER_PRIORITY:+<= $FILTER_PRIORITY}"
 log_opt "Filter owner"    "$FILTER_OWNER"
 log_opt "Filter label"    "$FILTER_LABEL"
 [[ "$RESPECT_DEPS" == true ]] && log "  Respect deps: yes (blocked beads deferred)"
+if [[ -n "$MODEL" ]]; then
+  log "  Model (all agents): $MODEL"
+else
+  log "  Models: worker=$WORKER_MODEL  reviewer=$REVIEWER_MODEL  commit=$COMMIT_MODEL"
+  [[ -n "$PLAN_FILE" ]] && log "          lead=$LEAD_MODEL  spec=$SPEC_MODEL"
+  log "          summary=$SUMMARY_MODEL"
+fi
 echo "================================================================="
-
-# Common claude flags — shared by all agent invocations
-claude_flags=(--print --dangerously-skip-permissions)
-[[ -n "$MODEL" ]] && claude_flags+=(--model "$MODEL")
 
 # Load project-specific rules once (injected into worker prompts)
 project_rules=""
@@ -179,7 +207,7 @@ if [[ -n "$PLAN_FILE" ]]; then
   log "Lead: decomposing into tasks..."
   lead_log="$LOG_DIR/lead-$(date '+%H%M%S').log"
 
-  claude "${claude_flags[@]}" -p "$(cat <<LEAD_PROMPT
+  claude_as "$LEAD_MODEL" -p "$(cat <<LEAD_PROMPT
 You are a lead agent decomposing an epic into implementable tasks.
 Do NOT write implementation code. Your job is planning only.
 
@@ -213,7 +241,7 @@ LEAD_PROMPT
   spec_log="$LOG_DIR/spec-review-$(date '+%H%M%S').log"
   children_json=$(bd list --parent "$PARENT_ID" --status open --json --limit 0 2>/dev/null) || children_json="[]"
 
-  claude "${claude_flags[@]}" -p "$(cat <<SPEC_PROMPT
+  claude_as "$SPEC_MODEL" -p "$(cat <<SPEC_PROMPT
 You are a spec reviewer. Validate that each task under this epic is ready for a worker agent.
 
 ## Tasks
@@ -414,7 +442,7 @@ __RALPH_PROMPT__
   while [[ $retries -lt $MAX_RETRIES ]]; do
     log "  Attempt $((retries + 1))/$MAX_RETRIES..."
 
-    if claude "${claude_flags[@]}" < "$prompt_file" > "$log_file" 2>&1; then
+    if claude_as "$WORKER_MODEL" < "$prompt_file" > "$log_file" 2>&1; then
       success=true
       break
     fi
@@ -447,7 +475,7 @@ __RALPH_PROMPT__
     # Spawn a tiny Claude instance to handle the commit.
     # It reviews the diff, writes a good commit message, and can fix
     # lint issues if husky/lint-staged rejects the commit.
-    claude "${claude_flags[@]}" -p "$(cat <<__RALPH_COMMIT__
+    claude_as "$COMMIT_MODEL" -p "$(cat <<__RALPH_COMMIT__
 Stage and commit the current code changes.
 
 Steps:
@@ -470,7 +498,7 @@ __RALPH_COMMIT__
   # -----------------------------------------------------------------------
   review_log="$LOG_DIR/iter-${iteration}-${bead_id}-review.log"
 
-  claude "${claude_flags[@]}" -p "$(cat <<__RALPH_REVIEW__
+  claude_as "$REVIEWER_MODEL" -p "$(cat <<__RALPH_REVIEW__
 You are a code reviewer. Review the implementation of this task.
 Do NOT modify any code. Do NOT close or update bead status.
 
@@ -553,7 +581,7 @@ if [[ $iteration -gt 0 ]]; then
   done
 
   if [[ -n "$log_list" ]]; then
-    claude "${claude_flags[@]}" -p "$(cat <<EOF
+    claude_as "$SUMMARY_MODEL" -p "$(cat <<EOF
 Read each of the following log files. They are outputs from autonomous coding
 agents that each worked on a single task.
 

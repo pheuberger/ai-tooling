@@ -82,7 +82,7 @@ If the coding agent fails after all retries, the bead is released (`bd update �
 |------|---------|-------------|
 | `--max-iterations N` | `50` | Maximum total loop iterations |
 | `--max-retries N` | `3` | Retries per bead on Claude failure |
-| `--model MODEL` | CLI default | Claude model override (e.g. `claude-sonnet-4-5-20250929`) |
+| `--model MODEL` | per-agent | Force ALL agents to this model (overrides per-agent defaults) |
 | `--beads ID[,ID,...]` | — | Process only these beads, in order. Skips `bd ready`. |
 | `--respect-deps` | off | With `--beads`: skip beads whose dependencies aren't closed yet. Blocked beads are re-queued at the end of the list. |
 | `--type TYPE` | — | Filter `bd ready` by `issue_type` (`feature`, `bug`, `task`) |
@@ -99,7 +99,7 @@ If the coding agent fails after all retries, the bead is released (`bd update �
 # Specific beads with dependency awareness
 ./ralph-bd.sh --beads auth-1,auth-2,auth-3 --respect-deps
 
-# Use a specific model, limit iterations
+# Force all agents to a single model, limit iterations
 ./ralph-bd.sh --model claude-sonnet-4-5-20250929 --max-iterations 5
 
 # Only beads owned by a specific person
@@ -126,8 +126,16 @@ MAX_ITERATIONS=30
 # How many times to retry a bead if Claude exits non-zero (default: 3)
 MAX_RETRIES=5
 
-# Claude model to use (default: "" = CLI default)
-MODEL="claude-sonnet-4-5-20250929"
+# Per-agent model overrides (defaults shown below)
+# WORKER_MODEL="claude-sonnet-4-5-20250929"    # coding worker — well-specified tasks
+# REVIEWER_MODEL="claude-opus-4-6"             # code reviewer — catches subtle bugs
+# COMMIT_MODEL="claude-haiku-4-5-20251001"     # commit agent — trivial mechanical task
+# LEAD_MODEL="claude-opus-4-6"                 # lead agent — plan decomposition
+# SPEC_MODEL="claude-opus-4-6"                 # spec reviewer — validates task specs
+# SUMMARY_MODEL="claude-haiku-4-5-20251001"    # post-run summary
+
+# Force ALL agents to a single model (overrides per-agent settings above)
+# MODEL="claude-sonnet-4-5-20250929"
 
 # Filter beads by issue_type (default: "" = all types)
 FILTER_TYPE="feature"
@@ -149,12 +157,11 @@ RALPH_RULES_FILE=".ralph-rules.md"
 You don't need to set every variable — only override what you want to change. Since `.ralphrc` is just bash, you can use conditionals or environment variables:
 
 ```bash
-# .ralphrc — use sonnet locally, opus in CI
+# .ralphrc — use opus for workers in CI (cost is less of a concern), sonnet locally
 if [[ -n "$CI" ]]; then
-  MODEL="claude-opus-4-6"
+  WORKER_MODEL="claude-opus-4-6"
   MAX_RETRIES=5
 else
-  MODEL="claude-sonnet-4-5-20250929"
   MAX_RETRIES=3
 fi
 ```
@@ -229,6 +236,23 @@ Ralph spawns Claude Code instances that inherit your project's configuration:
 - **`.ralph-rules.md`** — Loaded by ralph and injected into the agent prompt. Put ralph-specific behavioral rules here (e.g., "always run tests", "don't touch package X").
 
 The commit agent also picks up project conventions from `CLAUDE.md` / `AGENTS.md` automatically — there's no hardcoded commit format.
+
+## Model selection
+
+Each agent type has a default model matched to its cognitive demand:
+
+| Agent | Default | Rationale |
+|-------|---------|-----------|
+| Lead | opus | Architectural reasoning, task boundary decisions — quality here determines everything downstream |
+| Spec reviewer | opus | Catches ambiguity and missing context in task specs |
+| Worker | sonnet | Tasks are well-specified with file paths and acceptance criteria — Sonnet's sweet spot |
+| Commit | haiku | Mechanical: stage files, read diff, write message |
+| Reviewer | opus | Subtle bug detection, security issues, edge cases |
+| Summary | haiku | Reading logs and writing a debrief |
+
+The Ralph Loop design deliberately front-loads reasoning (lead + spec review produce detailed, self-contained specs), which means workers can run on a faster, cheaper model without sacrificing quality. The reviewer runs on Opus as a safety net.
+
+`--model` overrides everything to a single model, useful for testing or when you want uniform behavior. Per-agent models are configurable via `.ralphrc` (e.g. `WORKER_MODEL`, `REVIEWER_MODEL`).
 
 ## Tips
 

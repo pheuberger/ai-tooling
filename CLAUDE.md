@@ -14,6 +14,7 @@ Runtime deps: `claude`, `bd`, `jq`, `git`
 - **Integrated loop** — each iteration: worker → commit → reviewer → close (or release if blocked)
 - **File-forward reviews** — reviewer files "Fix:" beads instead of blocking; they appear in `bd ready` next iteration
 - **`--from-plan` mode** — lead agent decomposes plan into beads, spec reviewer validates, then the worker loop runs
+- **Per-agent model selection** — each agent type (lead, spec, worker, commit, reviewer, summary) has its own model default; `--model` overrides all; `claude_as()` helper dispatches
 - **Separate commit agent** — second Claude instance stages/commits with `(bead-id)` in message
 - **Untracked file safety** — shelves untracked files before loop, restores after
 - **Config precedence**: CLI flags > `.ralphrc` (sourced as bash) > built-in defaults
