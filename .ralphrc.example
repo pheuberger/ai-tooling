@@ -1,0 +1,52 @@
+# .ralphrc.example — copy to .ralphrc and uncomment what you need
+#
+# Sourced as bash before CLI args are parsed.
+# CLI flags override values set here.
+
+# ---------------------------------------------------------------------------
+# Loop behavior
+# ---------------------------------------------------------------------------
+# MAX_ITERATIONS=50        # Total iterations before ralph stops
+# MAX_RETRIES=3            # Retries per bead on Claude failure
+
+# ---------------------------------------------------------------------------
+# Model selection
+#
+# Each agent has a default matched to its cognitive demand:
+#   Lead/Spec/Reviewer → opus (planning, judgment, bug detection)
+#   Worker             → sonnet (well-specified implementation tasks)
+#   Commit/Summary     → haiku (mechanical / low-complexity)
+#
+# Override individual agents here, or set MODEL to force all agents
+# to a single model.
+# ---------------------------------------------------------------------------
+# LEAD_MODEL="claude-opus-4-6"
+# SPEC_MODEL="claude-opus-4-6"
+# WORKER_MODEL="claude-sonnet-4-5-20250929"
+# COMMIT_MODEL="claude-haiku-4-5-20251001"
+# REVIEWER_MODEL="claude-opus-4-6"
+# SUMMARY_MODEL="claude-haiku-4-5-20251001"
+#
+# MODEL="claude-sonnet-4-5-20250929"   # uncomment to force ALL agents
+
+# ---------------------------------------------------------------------------
+# Bead filters (same as CLI flags)
+# ---------------------------------------------------------------------------
+# FILTER_TYPE="feature"    # feature | bug | task
+# FILTER_PRIORITY=2        # 0=critical, 1=high, 2=medium, 3=low, 4=backlog
+# FILTER_OWNER=""
+# FILTER_LABEL=""
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+# LOG_DIR=".ralph-logs"
+# RALPH_RULES_FILE=".ralph-rules.md"
+
+# ---------------------------------------------------------------------------
+# Conditional example — different settings per environment
+# ---------------------------------------------------------------------------
+# if [[ -n "$CI" ]]; then
+#   WORKER_MODEL="claude-opus-4-6"   # cost matters less in CI
+#   MAX_RETRIES=5
+# fi
