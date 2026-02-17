@@ -40,10 +40,24 @@
 
 set -euo pipefail
 
+# Colors
+C_RESET='\033[0m'
+C_BOLD='\033[1m'
+C_DIM='\033[2m'
+C_CYAN='\033[36m'
+C_GREEN='\033[32m'
+C_YELLOW='\033[33m'
+C_MAGENTA='\033[35m'
+C_BLUE='\033[34m'
+C_RED='\033[31m'
+C_WHITE='\033[97m'
+
 ts()         { printf '%s' "$(date '+%Y-%m-%d %H:%M:%S')"; }
-log()        { echo "[$(ts)] $*"; }
+log()        { echo -e "${C_DIM}[$(ts)]${C_RESET} $*"; }
 bd_sync()    { bd sync 2>/dev/null || true; }
 bead_field() { echo "$1" | jq -r ".[0].$2 // \"$3\""; }
+phase()      { echo -e "\n${C_BOLD}${1}--- ${2} ---${C_RESET}"; }
+divider()    { echo -e "${C_DIM}$(printf '%.0s─' {1..65})${C_RESET}"; }
 
 # True if there are unstaged, staged, or untracked changes outside .beads/ and .ralph-logs/
 has_code_changes() {
@@ -154,9 +168,11 @@ ralph_stream_filter() {
     if .type == "assistant" then
       [.message.content[]? |
         if .type == "text" then .text
-        elif .type == "tool_use" then ">>> " + .name
+        elif .type == "tool_use" then "\u001b[36m>>> " + .name + "\u001b[0m"
         else empty end
       ] | join("\n") | select(length > 0)
+    elif .type == "result" then
+      "\u001b[2m--- " + .subtype + " | " + (.duration_ms | tostring) + "ms | $" + (.total_cost_usd | tostring) + " ---\u001b[0m"
     else empty end
   ' 2>/dev/null
 }
@@ -199,7 +215,7 @@ else
   [[ -n "$PLAN_FILE" ]] && log "          lead=$LEAD_MODEL  spec=$SPEC_MODEL" || true
   log "          summary=$SUMMARY_MODEL"
 fi
-echo "================================================================="
+divider
 
 # Load project-specific rules once (injected into worker prompts)
 project_rules=""
@@ -391,7 +407,7 @@ while true; do
 
   if [[ -z "$bead_id" ]]; then
     echo ""
-    log "No more ready beads. Ralph is done."
+    log "${C_GREEN}${C_BOLD}No more ready beads. Ralph is done.${C_RESET}"
     break
   fi
 
@@ -403,7 +419,9 @@ while true; do
   fi
 
   echo ""
-  log "=== Iteration $iteration: $bead_id — $bead_title ==="
+  divider
+  log "${C_BOLD}${C_WHITE}ITERATION $iteration: $bead_id${C_RESET} — ${C_CYAN}$bead_title${C_RESET}"
+  divider
 
   # Claim the bead
   bd update "$bead_id" --status=in_progress 2>/dev/null || true
@@ -459,9 +477,8 @@ __RALPH_PROMPT__
   success=false
 
   while [[ $retries -lt $MAX_RETRIES ]]; do
-    log "  Attempt $((retries + 1))/$MAX_RETRIES..."
-
-    log "  Log: $log_file"
+    phase "$C_BLUE" "WORKER (attempt $((retries + 1))/$MAX_RETRIES) — $WORKER_MODEL"
+    log "  ${C_DIM}Log: $log_file${C_RESET}"
     claude_as "$WORKER_MODEL" --output-format stream-json --verbose \
       < "$prompt_file" 2>&1 \
       | tee "$log_file" \
@@ -475,7 +492,7 @@ __RALPH_PROMPT__
 
     retries=$((retries + 1))
     if [[ $retries -lt $MAX_RETRIES ]]; then
-      log "  Claude exited non-zero. Retrying in 5s..."
+      log "  ${C_YELLOW}Worker failed. Retrying in 5s...${C_RESET}"
       sleep 5
     fi
   done
@@ -483,7 +500,7 @@ __RALPH_PROMPT__
   rm -f "$prompt_file"
 
   if [[ "$success" == false ]]; then
-    log "  Failed after $MAX_RETRIES attempts. Skipping $bead_id."
+    log "  ${C_RED}Failed after $MAX_RETRIES attempts. Skipping $bead_id.${C_RESET}"
     echo "$bead_id" >> "$SKIP_FILE"
     bd update "$bead_id" --status=open 2>/dev/null || true   # release claim
     continue
@@ -496,11 +513,8 @@ __RALPH_PROMPT__
   # add-then-reset instead.
   # -----------------------------------------------------------------------
   if has_code_changes; then
+    phase "$C_YELLOW" "COMMIT — $COMMIT_MODEL"
     commit_log="$LOG_DIR/iter-${iteration}-${bead_id}-commit.log"
-
-    # Spawn a tiny Claude instance to handle the commit.
-    # It reviews the diff, writes a good commit message, and can fix
-    # lint issues if husky/lint-staged rejects the commit.
     claude_as "$COMMIT_MODEL" -p "$(cat <<__RALPH_COMMIT__
 Stage and commit the current code changes.
 
@@ -514,14 +528,15 @@ Steps:
 5. If the commit fails due to lint-staged or husky, fix the reported issues and retry.
 6. Do NOT run bd commands. Do NOT push.
 __RALPH_COMMIT__
-    )" 2>&1 | tee "$commit_log" && log "  Committed." || log "  Commit agent failed. See $commit_log"
+    )" 2>&1 | tee "$commit_log" && log "  ${C_GREEN}Committed.${C_RESET}" || log "  ${C_RED}Commit agent failed.${C_RESET} See $commit_log"
   else
-    log "  No code changes to commit."
+    log "  ${C_DIM}No code changes to commit.${C_RESET}"
   fi
 
   # -----------------------------------------------------------------------
   # Review the work — fresh Claude instance, read-only
   # -----------------------------------------------------------------------
+  phase "$C_MAGENTA" "REVIEW — $REVIEWER_MODEL"
   review_log="$LOG_DIR/iter-${iteration}-${bead_id}-review.log"
 
   claude_as "$REVIEWER_MODEL" -p "$(cat <<__RALPH_REVIEW__
@@ -545,9 +560,16 @@ ${bead_details}
 5. If everything looks good, output: REVIEW_PASS
 6. If you filed fix beads, output: REVIEW_ISSUES_FILED
 __RALPH_REVIEW__
-  )" 2>&1 | tee "$review_log" || log "  Review failed. See $review_log"
+  )" 2>&1 | tee "$review_log" || log "  ${C_RED}Review failed.${C_RESET} See $review_log"
 
-  log "  Reviewed. $(tail -1 "$review_log")"
+  review_result=$(tail -1 "$review_log")
+  if [[ "$review_result" == *"REVIEW_PASS"* ]]; then
+    log "  ${C_GREEN}Review: PASS${C_RESET}"
+  elif [[ "$review_result" == *"REVIEW_ISSUES_FILED"* ]]; then
+    log "  ${C_YELLOW}Review: ISSUES FILED${C_RESET}"
+  else
+    log "  Review: $review_result"
+  fi
 
   # -----------------------------------------------------------------------
   # Close the bead (or release if blocked)
@@ -555,18 +577,19 @@ __RALPH_REVIEW__
   open_blockers=$(bd dep list "$bead_id" --json 2>/dev/null \
     | jq '[.[] | select(.status != "closed" and .dependency_type != "parent-child")] | length' 2>/dev/null) || open_blockers=0
 
-  log "  Open blockers: $open_blockers"
   if [[ "$open_blockers" -gt 0 ]]; then
-    log "  $bead_id has open blockers — releasing claim."
+    log "  ${C_YELLOW}$bead_id has $open_blockers open blocker(s) — releasing claim.${C_RESET}"
     bd update "$bead_id" --status=open 2>/dev/null || true
   else
     bd close "$bead_id" --reason="Completed by ralph (iteration $iteration)" 2>/dev/null || true
-    log "  Closed $bead_id."
+    log "  ${C_GREEN}Closed $bead_id.${C_RESET}"
   fi
 
   bd_sync
 
-  log "=== Done: $bead_id ==="
+  divider
+  log "${C_GREEN}${C_BOLD}DONE: $bead_id${C_RESET}"
+  divider
   sleep 2
 done
 
@@ -583,7 +606,7 @@ if [[ -n "$STASH_DIR" && -d "$STASH_DIR" ]]; then
 fi
 
 echo ""
-echo "================================================================="
+divider
 log "Ralph Loop completed after $iteration iteration(s)."
 if [[ -s "$SKIP_FILE" ]]; then
   echo ""
