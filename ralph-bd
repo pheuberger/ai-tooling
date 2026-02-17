@@ -196,7 +196,7 @@ claude_flags=(--print --dangerously-skip-permissions)
 # Per-agent model defaults — global MODEL overrides everything
 LEAD_MODEL="${MODEL:-${LEAD_MODEL:-claude-opus-4-6}}"
 SPEC_MODEL="${MODEL:-${SPEC_MODEL:-claude-opus-4-6}}"
-WORKER_MODEL="${MODEL:-${WORKER_MODEL:-claude-sonnet-4-5-20250929}}"
+WORKER_MODEL="${MODEL:-${WORKER_MODEL:-claude-sonnet-4-6}}"
 COMMIT_MODEL="${MODEL:-${COMMIT_MODEL:-claude-haiku-4-5-20251001}}"
 REVIEWER_MODEL="${MODEL:-${REVIEWER_MODEL:-claude-opus-4-6}}"
 SUMMARY_MODEL="${MODEL:-${SUMMARY_MODEL:-claude-haiku-4-5-20251001}}"

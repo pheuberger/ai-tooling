@@ -22,12 +22,12 @@
 # ---------------------------------------------------------------------------
 # LEAD_MODEL="claude-opus-4-6"
 # SPEC_MODEL="claude-opus-4-6"
-# WORKER_MODEL="claude-sonnet-4-5-20250929"
+# WORKER_MODEL="claude-sonnet-4-6"
 # COMMIT_MODEL="claude-haiku-4-5-20251001"
 # REVIEWER_MODEL="claude-opus-4-6"
 # SUMMARY_MODEL="claude-haiku-4-5-20251001"
 #
-# MODEL="claude-sonnet-4-5-20250929"   # uncomment to force ALL agents
+# MODEL="claude-sonnet-4-6"   # uncomment to force ALL agents
 
 # ---------------------------------------------------------------------------
 # Bead filters (same as CLI flags)

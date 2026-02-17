@@ -100,7 +100,7 @@ If the coding agent fails after all retries, the bead is released (`bd update �
 ./ralph-bd.sh --beads auth-1,auth-2,auth-3 --respect-deps
 
 # Force all agents to a single model, limit iterations
-./ralph-bd.sh --model claude-sonnet-4-5-20250929 --max-iterations 5
+./ralph-bd.sh --model claude-sonnet-4-6 --max-iterations 5
 
 # Only beads owned by a specific person
 ./ralph-bd.sh --owner bitbeckers
@@ -127,7 +127,7 @@ MAX_ITERATIONS=30
 MAX_RETRIES=5
 
 # Per-agent model overrides (defaults shown below)
-# WORKER_MODEL="claude-sonnet-4-5-20250929"    # coding worker — well-specified tasks
+# WORKER_MODEL="claude-sonnet-4-6"    # coding worker — well-specified tasks
 # REVIEWER_MODEL="claude-opus-4-6"             # code reviewer — catches subtle bugs
 # COMMIT_MODEL="claude-haiku-4-5-20251001"     # commit agent — trivial mechanical task
 # LEAD_MODEL="claude-opus-4-6"                 # lead agent — plan decomposition
@@ -135,7 +135,7 @@ MAX_RETRIES=5
 # SUMMARY_MODEL="claude-haiku-4-5-20251001"    # post-run summary
 
 # Force ALL agents to a single model (overrides per-agent settings above)
-# MODEL="claude-sonnet-4-5-20250929"
+# MODEL="claude-sonnet-4-6"
 
 # Filter beads by issue_type (default: "" = all types)
 FILTER_TYPE="feature"
