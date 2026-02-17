@@ -168,7 +168,18 @@ ralph_stream_filter() {
     if .type == "assistant" then
       [.message.content[]? |
         if .type == "text" then .text
-        elif .type == "tool_use" then "\u001b[36m>>> " + .name + "\u001b[0m"
+        elif .type == "tool_use" then
+          (.input // {}) as $in |
+          (.name as $n |
+            if   $n == "Bash"   then $in.command // ""
+            elif $n == "Edit"   then $in.file_path // ""
+            elif $n == "Read"   then $in.file_path // ""
+            elif $n == "Write"  then $in.file_path // ""
+            elif $n == "Grep"   then ($in.pattern // "") + " " + ($in.path // "")
+            elif $n == "Glob"   then $in.pattern // ""
+            else "" end
+          ) as $detail |
+          "\u001b[36m>>> " + .name + "\u001b[2m " + ($detail | .[0:120]) + "\u001b[0m"
         else empty end
       ] | join("\n") | select(length > 0)
     elif .type == "result" then
