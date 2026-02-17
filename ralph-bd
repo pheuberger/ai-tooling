@@ -11,7 +11,7 @@
 #   --max-retries N      Retries per bead on failure (default: 3)
 #   --model MODEL        Force ALL agents to this model (overrides per-agent models)
 #   --beads ID[,ID,...]  Only process these beads, in order (skip bd ready)
-#   --parent ID          Scope to children of this epic/feature (passed to bd ready)
+#   --parent ID          Scope to children of this epic/feature (filters bd ready via --label)
 #   --respect-deps       With --beads: skip beads whose dependencies aren't closed yet
 #   --type TYPE          Filter ready beads by issue_type (feature|bug|task)
 #   --priority N         Only pick beads with priority <= N (0=critical … 4=backlog)
@@ -222,7 +222,7 @@ For each task:
   bd create "<title>" -t task --parent ${PARENT_ID} \\
     -d "<self-contained description: file paths, function names, expected behavior, edge cases>" \\
     --acceptance "<binary pass/fail verification: a command to run, or a specific check>" \\
-    -e <minutes> -l scope:small --silent
+    -e <minutes> -l scope:small -l ${PARENT_ID} --silent
 
 Set dependencies only where ordering truly matters:
   bd dep <blocker-id> --blocks <blocked-id>
@@ -349,7 +349,7 @@ while true; do
   else
     # Default mode — ask bd ready with passthrough filters
     ready_args=(--json)
-    [[ -n "$PARENT_ID" ]]       && ready_args+=(--parent "$PARENT_ID")
+    [[ -n "$PARENT_ID" ]]       && ready_args+=(--label "$PARENT_ID")
     [[ -n "$FILTER_LABEL" ]]    && ready_args+=(--label "$FILTER_LABEL")
     [[ -n "$FILTER_TYPE" ]]     && ready_args+=(--type "$FILTER_TYPE")
     [[ -n "$FILTER_PRIORITY" ]] && ready_args+=(--priority "$FILTER_PRIORITY")
