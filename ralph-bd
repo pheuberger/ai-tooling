@@ -168,7 +168,7 @@ claude_as() {
 }
 
 log "Ralph Loop starting (max_iterations=$MAX_ITERATIONS, max_retries=$MAX_RETRIES)"
-log_opt() { [[ -n "${2:-}" ]] && log "  $1: $2"; }
+log_opt() { [[ -n "${2:-}" ]] && log "  $1: $2" || true; }
 [[ -f ".ralphrc" ]]          && log "  Config: .ralphrc loaded"
 [[ -f "$RALPH_RULES_FILE" ]] && log "  Rules: $RALPH_RULES_FILE loaded"
 log_opt "Plan"            "$PLAN_FILE"
@@ -178,12 +178,12 @@ log_opt "Filter type"     "$FILTER_TYPE"
 log_opt "Filter priority" "${FILTER_PRIORITY:+<= $FILTER_PRIORITY}"
 log_opt "Filter owner"    "$FILTER_OWNER"
 log_opt "Filter label"    "$FILTER_LABEL"
-[[ "$RESPECT_DEPS" == true ]] && log "  Respect deps: yes (blocked beads deferred)"
+[[ "$RESPECT_DEPS" == true ]] && log "  Respect deps: yes (blocked beads deferred)" || true
 if [[ -n "$MODEL" ]]; then
   log "  Model (all agents): $MODEL"
 else
   log "  Models: worker=$WORKER_MODEL  reviewer=$REVIEWER_MODEL  commit=$COMMIT_MODEL"
-  [[ -n "$PLAN_FILE" ]] && log "          lead=$LEAD_MODEL  spec=$SPEC_MODEL"
+  [[ -n "$PLAN_FILE" ]] && log "          lead=$LEAD_MODEL  spec=$SPEC_MODEL" || true
   log "          summary=$SUMMARY_MODEL"
 fi
 echo "================================================================="
@@ -355,13 +355,18 @@ while true; do
     [[ -n "$FILTER_PRIORITY" ]] && ready_args+=(--priority "$FILTER_PRIORITY")
     [[ -n "$FILTER_OWNER" ]]    && ready_args+=(--assignee "$FILTER_OWNER")
 
+    log "  bd ready ${ready_args[*]}"
     ready_json=$(bd ready "${ready_args[@]}" 2>/dev/null) || ready_json="[]"
 
     # Pick first not already skipped
     count=$(echo "$ready_json" | jq 'length')
+    log "  Found $count candidate(s)"
     for i in $(seq 0 $((count - 1))); do
       candidate=$(echo "$ready_json" | jq -r ".[$i].id")
-      [[ -n "$PARENT_ID" && "$candidate" == "$PARENT_ID" ]] && continue
+      if [[ -n "$PARENT_ID" && "$candidate" == "$PARENT_ID" ]]; then
+        log "  Skipping parent $candidate"
+        continue
+      fi
       if ! grep -qxF "$candidate" "$SKIP_FILE" 2>/dev/null; then
         bead_id="$candidate"
         bead_title=$(echo "$ready_json" | jq -r ".[$i].title")
