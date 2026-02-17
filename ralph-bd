@@ -534,8 +534,9 @@ __RALPH_REVIEW__
   # Close the bead (or release if blocked)
   # -----------------------------------------------------------------------
   open_blockers=$(bd dep list "$bead_id" --json 2>/dev/null \
-    | jq '[.[] | select(.status != "closed")] | length' 2>/dev/null) || open_blockers=0
+    | jq '[.[] | select(.status != "closed" and .dependency_type != "parent-child")] | length' 2>/dev/null) || open_blockers=0
 
+  log "  Open blockers: $open_blockers"
   if [[ "$open_blockers" -gt 0 ]]; then
     log "  $bead_id has open blockers — releasing claim."
     bd update "$bead_id" --status=open 2>/dev/null || true
