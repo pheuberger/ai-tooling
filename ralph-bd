@@ -361,6 +361,7 @@ while true; do
     count=$(echo "$ready_json" | jq 'length')
     for i in $(seq 0 $((count - 1))); do
       candidate=$(echo "$ready_json" | jq -r ".[$i].id")
+      [[ -n "$PARENT_ID" && "$candidate" == "$PARENT_ID" ]] && continue
       if ! grep -qxF "$candidate" "$SKIP_FILE" 2>/dev/null; then
         bead_id="$candidate"
         bead_title=$(echo "$ready_json" | jq -r ".[$i].title")
