@@ -59,11 +59,11 @@ bead_field() { echo "$1" | jq -r ".[0].$2 // \"$3\""; }
 phase()      { echo -e "\n${C_BOLD}${1}--- ${2} ---${C_RESET}"; }
 divider()    { echo -e "${C_DIM}$(printf '%.0s─' {1..65})${C_RESET}"; }
 
-# True if there are unstaged, staged, or untracked changes outside .beads/ and .ralph-logs/
+# True if there are unstaged, staged, or untracked changes outside .ralph-logs/
 has_code_changes() {
-  git diff --quiet -- ':!.beads' ':!.ralph-logs' 2>/dev/null            || return 0
-  git diff --cached --quiet -- ':!.beads' ':!.ralph-logs' 2>/dev/null   || return 0
-  [[ -z "$(git ls-files --others --exclude-standard -- ':!.beads' ':!.ralph-logs' 2>/dev/null)" ]] || return 0
+  git diff --quiet -- ':!.ralph-logs' 2>/dev/null            || return 0
+  git diff --cached --quiet -- ':!.ralph-logs' 2>/dev/null   || return 0
+  [[ -z "$(git ls-files --others --exclude-standard -- ':!.ralph-logs' 2>/dev/null)" ]] || return 0
   return 1
 }
 
@@ -518,8 +518,8 @@ __RALPH_PROMPT__
   fi
 
   # -----------------------------------------------------------------------
-  # Commit code changes only.
-  # .beads/ is managed by bd sync. .ralph-logs/ is script-internal.
+  # Commit code + beads changes together.
+  # .ralph-logs/ is script-internal and excluded.
   # Exclude pathspecs (:!) don't play well with git add, so we use
   # add-then-reset instead.
   # -----------------------------------------------------------------------
@@ -530,7 +530,7 @@ __RALPH_PROMPT__
 Stage and commit the current code changes.
 
 Steps:
-1. Run: git add -A && git reset HEAD -- .beads .ralph-logs
+1. Run: git add -A && git reset HEAD -- .ralph-logs
 2. Run: git diff --cached (to see what you're committing)
 3. Write a commit message that focuses on the *why* more than the *what*.
    Follow any commit conventions the project has (check CLAUDE.md, AGENTS.md).
