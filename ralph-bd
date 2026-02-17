@@ -148,6 +148,19 @@ fi
 mkdir -p "$LOG_DIR"
 : > "$SKIP_FILE"
 
+# Stream filter — extracts readable progress from stream-json output
+ralph_stream_filter() {
+  jq --unbuffered -r '
+    if .type == "assistant" then
+      [.message.content[]? |
+        if .type == "text" then .text
+        elif .type == "tool_use" then ">>> " + .name
+        else empty end
+      ] | join("\n") | select(length > 0)
+    else empty end
+  ' 2>/dev/null
+}
+
 iteration=0
 
 # Common claude flags — shared by all agent invocations
@@ -449,7 +462,13 @@ __RALPH_PROMPT__
     log "  Attempt $((retries + 1))/$MAX_RETRIES..."
 
     log "  Log: $log_file"
-    if claude_as "$WORKER_MODEL" < "$prompt_file" 2>&1 | tee "$log_file"; then
+    claude_as "$WORKER_MODEL" --output-format stream-json --verbose \
+      < "$prompt_file" 2>&1 \
+      | tee "$log_file" \
+      | ralph_stream_filter || true
+
+    # Check success from the stream-json result event (not pipeline exit code)
+    if jq -e 'select(.type == "result" and .subtype == "success")' "$log_file" > /dev/null 2>&1; then
       success=true
       break
     fi
