@@ -448,7 +448,8 @@ __RALPH_PROMPT__
   while [[ $retries -lt $MAX_RETRIES ]]; do
     log "  Attempt $((retries + 1))/$MAX_RETRIES..."
 
-    if claude_as "$WORKER_MODEL" < "$prompt_file" > "$log_file" 2>&1; then
+    log "  Log: $log_file"
+    if claude_as "$WORKER_MODEL" < "$prompt_file" 2>&1 | tee "$log_file"; then
       success=true
       break
     fi
@@ -494,7 +495,7 @@ Steps:
 5. If the commit fails due to lint-staged or husky, fix the reported issues and retry.
 6. Do NOT run bd commands. Do NOT push.
 __RALPH_COMMIT__
-    )" > "$commit_log" 2>&1 && log "  Committed." || log "  Commit agent failed. See $commit_log"
+    )" 2>&1 | tee "$commit_log" && log "  Committed." || log "  Commit agent failed. See $commit_log"
   else
     log "  No code changes to commit."
   fi
@@ -525,7 +526,7 @@ ${bead_details}
 5. If everything looks good, output: REVIEW_PASS
 6. If you filed fix beads, output: REVIEW_ISSUES_FILED
 __RALPH_REVIEW__
-  )" > "$review_log" 2>&1 || log "  Review failed. See $review_log"
+  )" 2>&1 | tee "$review_log" || log "  Review failed. See $review_log"
 
   log "  Reviewed. $(tail -1 "$review_log")"
 
