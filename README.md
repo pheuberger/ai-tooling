@@ -13,7 +13,9 @@ Based on the [Ralph Loop](https://github.com/snarktank/ralph) pattern.
 | `jq` | JSON processing |
 | `git` | Version control |
 
-All four must be on your `PATH`.
+| `envsubst` | Template variable substitution (part of `gettext`) |
+
+All five must be on your `PATH`.
 
 ## Quick start
 
@@ -253,6 +255,63 @@ The path is configurable via `RALPH_RULES_FILE` in `.ralphrc` if you want a diff
 ```bash
 # .ralphrc
 RALPH_RULES_FILE="docs/ralph-instructions.md"
+```
+
+## Prompt templates
+
+All agent prompts live in `prompts/*.md` as standalone markdown files. This makes them easy to find, edit, and iterate on without touching the main script.
+
+```
+prompts/
+  lead.md                      # Plan decomposition (--from-plan)
+  spec-review.md               # Spec validation (--from-plan)
+  worker.md                    # Main coding agent
+  commit.md                    # Commit agent
+  review.md                    # Per-bead reviewer
+  final-review-security.md     # Final review: security persona
+  final-review-integration.md  # Final review: integration persona
+  final-review-patterns.md     # Final review: codebase patterns persona
+  final-review-plan.md         # Final review: plan adherence persona
+  summary.md                   # Post-run summary
+```
+
+### Template format
+
+Templates use `${VAR_NAME}` placeholders (UPPER_SNAKE_CASE) and optional `{{#IF VAR}}`/`{{/IF VAR}}` conditional blocks:
+
+```markdown
+You are a coding agent working on a single task.
+
+- If blocked, file a blocker:
+    NEW_ID=$(bd create "Blocker: <description>" -t bug -p 1 ${BEAD_LABELS} --silent)
+{{#IF PROJECT_RULES}}
+
+## Project Rules
+${PROJECT_RULES}
+{{/IF PROJECT_RULES}}
+
+## Task
+${BEAD_DETAILS}
+```
+
+Variable substitution is handled by `envsubst` with an explicit variable list — only named variables are replaced. Literal `$` in agent instructions (like `$(bd create ...)`) are left untouched. No `eval` is used.
+
+### Customizing prompts
+
+Override `PROMPTS_DIR` to point to a custom directory:
+
+```bash
+# .ralphrc
+PROMPTS_DIR="/path/to/my/prompts"
+```
+
+Or edit the files in `prompts/` directly. Each call site in `ralph-bd` exports only the variables that template needs, scoped in a subshell:
+
+```bash
+claude_as "$COMMIT_MODEL" -p "$(
+  export BEAD_ID="$bead_id"
+  render_prompt "$PROMPTS_DIR/commit.md" BEAD_ID
+)"
 ```
 
 ## Logs
