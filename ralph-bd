@@ -11,21 +11,21 @@
 #   --max-retries N      Retries per bead on failure (default: 3)
 #   --model MODEL        Force ALL agents to this model (overrides per-agent models)
 #   --beads ID[,ID,...]  Only process these beads, in order (skip bd ready)
-#   --parent ID          Scope to children of this epic/feature (filters bd ready via --label)
 #   --respect-deps       With --beads: skip beads whose dependencies aren't closed yet
 #   --type TYPE          Filter ready beads by issue_type (feature|bug|task)
 #   --priority N         Only pick beads with priority <= N (0=critical … 4=backlog)
 #   --owner NAME         Only pick beads owned by NAME
 #   --label LABEL        Filter ready beads by label
-#   --from-plan FILE     Decompose a plan file into an epic + tasks, then work them
+#   --from-plan FILE     Decompose a plan file into label-grouped tasks, then work them
+#   --test-cmd CMD       Run CMD as post-loop test gate; files bead + exits 1 on failure
 #
 # Configuration files (optional):
 #   .ralphrc             Sourced from project root before CLI args are parsed.
 #                        Set any of: MAX_ITERATIONS, MAX_RETRIES, MODEL,
 #                        WORKER_MODEL, REVIEWER_MODEL, COMMIT_MODEL,
-#                        LEAD_MODEL, SPEC_MODEL, SUMMARY_MODEL,
+#                        FINAL_REVIEW_MODEL, LEAD_MODEL, SPEC_MODEL, SUMMARY_MODEL,
 #                        FILTER_TYPE, FILTER_PRIORITY, FILTER_OWNER,
-#                        FILTER_LABEL, LOG_DIR, RALPH_RULES_FILE.
+#                        FILTER_LABEL, TEST_CMD, LOG_DIR, RALPH_RULES_FILE.
 #                        CLI flags override values set here.
 #   .ralph-rules.md      Extra instructions injected into the agent prompt as a
 #                        "## Project Rules" section. Use for ralph-specific rules
@@ -39,6 +39,9 @@
 #   https://medium.com/@tentenco/what-is-ralph-loop-a-new-era-of-autonomous-coding-96a4bb3e2ac8
 
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROMPTS_DIR="${PROMPTS_DIR:-$SCRIPT_DIR/prompts}"
 
 # Colors
 C_RESET='\033[0m'
@@ -58,6 +61,38 @@ bd_sync()    { bd sync 2>/dev/null || true; }
 bead_field() { echo "$1" | jq -r ".[0].$2 // \"$3\""; }
 phase()      { echo -e "\n${C_BOLD}${1}--- ${2} ---${C_RESET}"; }
 divider()    { echo -e "${C_DIM}$(printf '%.0s─' {1..65})${C_RESET}"; }
+slugify()    { echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g; s/--*/-/g; s/^-//; s/-$//' | cut -c1-50; }
+
+# render_prompt <template_file> [VAR1 VAR2 ...]
+# Reads a markdown template, processes {{#IF VAR}}/{{/IF VAR}} conditionals,
+# then runs envsubst with an explicit variable list. No eval — safe by design.
+render_prompt() {
+  local template="$1"; shift
+  [[ -f "$template" ]] || { echo "Missing prompt template: $template" >&2; return 1; }
+
+  local content
+  content=$(<"$template")
+
+  # Process {{#IF VAR}}...{{/IF VAR}} conditional blocks.
+  # If the named env var is non-empty, keep the block contents; otherwise remove the block.
+  while [[ "$content" =~ \{\{#IF\ ([A-Z_]+)\}\} ]]; do
+    local var_name="${BASH_REMATCH[1]}"
+    local var_val="${!var_name:-}"
+    if [[ -n "$var_val" ]]; then
+      # Keep block contents, remove markers
+      content=$(echo "$content" | sed "/{{#IF ${var_name}}}/d; /{{\/IF ${var_name}}}/d")
+    else
+      # Remove entire block including markers
+      content=$(echo "$content" | sed "/{{#IF ${var_name}}}/,/{{\/IF ${var_name}}}/d")
+    fi
+  done
+
+  # Build envsubst variable list: $VAR1 $VAR2 ...
+  local varlist=""
+  for v in "$@"; do varlist="$varlist \${$v}"; done
+
+  echo "$content" | envsubst "$varlist"
+}
 
 # True if there are unstaged, staged, or untracked changes outside .ralph-logs/
 has_code_changes() {
@@ -77,10 +112,11 @@ LEAD_MODEL=""         # lead agent (plan decomposition) — default: opus
 SPEC_MODEL=""         # spec reviewer — default: opus
 WORKER_MODEL=""       # coding worker — default: sonnet
 COMMIT_MODEL=""       # commit agent — default: haiku
-REVIEWER_MODEL=""     # code reviewer — default: opus
+REVIEWER_MODEL=""     # intermittent code reviewer — default: sonnet
+FINAL_REVIEW_MODEL="" # final parallel review personas — default: opus
 SUMMARY_MODEL=""      # post-run summary — default: haiku
 BEAD_IDS=""           # comma-separated explicit bead list (--beads mode only)
-PARENT_ID=""          # parent bead ID — passed through to bd ready
+PLAN_LABEL=""         # label slug generated from --from-plan title
 EXPLICIT_MODE=false   # set when --beads is used (prevents fallback to bd ready)
 RESPECT_DEPS=false    # with --beads: skip beads whose deps aren't closed
 FILTER_TYPE=""        # filter by issue_type (feature|bug|task)
@@ -88,6 +124,7 @@ FILTER_PRIORITY=""    # only beads with priority <= this value (0=critical … 4
 FILTER_OWNER=""       # only beads owned by this name
 FILTER_LABEL=""       # filter by label
 PLAN_FILE=""          # --from-plan: plan file to decompose into beads
+TEST_CMD=""           # --test-cmd: command to run as post-loop test gate
 LOG_DIR=".ralph-logs"
 RALPH_RULES_FILE=".ralph-rules.md"
 
@@ -105,24 +142,17 @@ while [[ $# -gt 0 ]]; do
     --max-retries)    MAX_RETRIES="$2"; shift 2 ;;
     --model)          MODEL="$2"; shift 2 ;;
     --beads)          BEAD_IDS="$2"; EXPLICIT_MODE=true; shift 2 ;;
-    --parent)         PARENT_ID="$2"; shift 2 ;;
     --respect-deps)   RESPECT_DEPS=true; shift ;;
     --type)           FILTER_TYPE="$2"; shift 2 ;;
     --priority)       FILTER_PRIORITY="$2"; shift 2 ;;
     --owner)          FILTER_OWNER="$2"; shift 2 ;;
     --label)          FILTER_LABEL="$2"; shift 2 ;;
     --from-plan)      PLAN_FILE="$2"; shift 2 ;;
+    --test-cmd)       TEST_CMD="$2"; shift 2 ;;
     -h|--help)        sed -n '/^# Usage/,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
     *)                echo "Unknown option: $1" >&2; exit 1 ;;
   esac
 done
-
-# ---------------------------------------------------------------------------
-# Validate mutually exclusive flags
-# ---------------------------------------------------------------------------
-if [[ -n "$PARENT_ID" && -n "$BEAD_IDS" ]]; then
-  echo "Cannot use --parent and --beads together." >&2; exit 1
-fi
 
 # Read plan file early — before untracked-file stashing moves it away
 plan_title=""
@@ -138,7 +168,7 @@ fi
 # ---------------------------------------------------------------------------
 # Preflight
 # ---------------------------------------------------------------------------
-for cmd in claude bd jq git; do
+for cmd in claude bd jq git envsubst; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "Required: $cmd" >&2; exit 1; }
 done
 
@@ -198,7 +228,8 @@ LEAD_MODEL="${MODEL:-${LEAD_MODEL:-claude-opus-4-6}}"
 SPEC_MODEL="${MODEL:-${SPEC_MODEL:-claude-opus-4-6}}"
 WORKER_MODEL="${MODEL:-${WORKER_MODEL:-claude-sonnet-4-6}}"
 COMMIT_MODEL="${MODEL:-${COMMIT_MODEL:-claude-haiku-4-5-20251001}}"
-REVIEWER_MODEL="${MODEL:-${REVIEWER_MODEL:-claude-opus-4-6}}"
+REVIEWER_MODEL="${MODEL:-${REVIEWER_MODEL:-claude-sonnet-4-6}}"
+FINAL_REVIEW_MODEL="${MODEL:-${FINAL_REVIEW_MODEL:-claude-opus-4-6}}"
 SUMMARY_MODEL="${MODEL:-${SUMMARY_MODEL:-claude-haiku-4-5-20251001}}"
 
 # Run claude with a specific model: claude_as <model> [extra-args...]
@@ -212,17 +243,18 @@ log_opt() { [[ -n "${2:-}" ]] && log "  $1: $2" || true; }
 [[ -f ".ralphrc" ]]          && log "  Config: .ralphrc loaded"
 [[ -f "$RALPH_RULES_FILE" ]] && log "  Rules: $RALPH_RULES_FILE loaded"
 log_opt "Plan"            "$PLAN_FILE"
-log_opt "Parent"          "$PARENT_ID"
 log_opt "Beads"           "$BEAD_IDS"
 log_opt "Filter type"     "$FILTER_TYPE"
 log_opt "Filter priority" "${FILTER_PRIORITY:+<= $FILTER_PRIORITY}"
 log_opt "Filter owner"    "$FILTER_OWNER"
 log_opt "Filter label"    "$FILTER_LABEL"
+log_opt "Test cmd"        "$TEST_CMD"
 [[ "$RESPECT_DEPS" == true ]] && log "  Respect deps: yes (blocked beads deferred)" || true
 if [[ -n "$MODEL" ]]; then
   log "  Model (all agents): $MODEL"
 else
   log "  Models: worker=$WORKER_MODEL  reviewer=$REVIEWER_MODEL  commit=$COMMIT_MODEL"
+  log "          final-review=$FINAL_REVIEW_MODEL"
   [[ -n "$PLAN_FILE" ]] && log "          lead=$LEAD_MODEL  spec=$SPEC_MODEL" || true
   log "          summary=$SUMMARY_MODEL"
 fi
@@ -238,40 +270,20 @@ project_rules=""
 if [[ -n "$PLAN_FILE" ]]; then
   # plan_title and plan_body were read before stashing (see above)
 
-  # Create the epic in bd — ralph owns this, not the agent
-  PARENT_ID=$(bd create "$plan_title" -t epic -d "$plan_body" --silent)
-  bd_sync
-  log "Created epic $PARENT_ID: $plan_title"
+  # Derive a label slug from the plan title for grouping
+  PLAN_LABEL=$(slugify "$plan_title")
+  [[ -z "$PLAN_LABEL" ]] && { echo "Could not generate label from plan title: $plan_title" >&2; exit 1; }
+  [[ -n "$FILTER_LABEL" ]] && log "  Note: --label '$FILTER_LABEL' overridden by plan label '$PLAN_LABEL'"
+  FILTER_LABEL="$PLAN_LABEL"
+  log "Plan label: $PLAN_LABEL"
 
   # --- Phase 1: Decompose epic into tasks ---
   log "Lead: decomposing into tasks..."
   lead_log="$LOG_DIR/lead-$(date '+%H%M%S').log"
 
-  claude_as "$LEAD_MODEL" -p "$(cat <<LEAD_PROMPT
-You are a lead agent decomposing an epic into implementable tasks.
-Do NOT write implementation code. Your job is planning only.
-
-## Epic: ${plan_title}
-${plan_body}
-
-## Instructions
-Break this into small, independently implementable child tasks using bd create.
-Each task will be worked on by a separate Claude Code instance with NO shared context.
-
-For each task:
-  bd create "<title>" -t task --parent ${PARENT_ID} \\
-    -d "<self-contained description: file paths, function names, expected behavior, edge cases>" \\
-    --acceptance "<binary pass/fail verification: a command to run, or a specific check>" \\
-    -e <minutes> -l scope:small -l ${PARENT_ID} --silent
-
-Set dependencies only where ordering truly matters:
-  bd dep <blocker-id> --blocks <blocked-id>
-
-After creating all tasks: bd sync
-
-Each task must be completable in under 30 minutes by a fresh agent with zero prior context.
-If you can't define binary acceptance criteria, break the task smaller.
-LEAD_PROMPT
+  claude_as "$LEAD_MODEL" -p "$(
+    export PLAN_TITLE="$plan_title" PLAN_BODY="$plan_body" PLAN_LABEL="$PLAN_LABEL"
+    render_prompt "$PROMPTS_DIR/lead.md" PLAN_TITLE PLAN_BODY PLAN_LABEL
   )" > "$lead_log" 2>&1
   bd_sync
   log "Lead: done. See $lead_log"
@@ -279,33 +291,30 @@ LEAD_PROMPT
   # --- Phase 2: Validate specs ---
   log "Validating specs..."
   spec_log="$LOG_DIR/spec-review-$(date '+%H%M%S').log"
-  children_json=$(bd list --parent "$PARENT_ID" --status open --json --limit 0 2>/dev/null) || children_json="[]"
+  children_json=$(bd list --label "$PLAN_LABEL" --status open --json --limit 0 2>/dev/null) || children_json="[]"
 
-  claude_as "$SPEC_MODEL" -p "$(cat <<SPEC_PROMPT
-You are a spec reviewer. Validate that each task under this epic is ready for a worker agent.
-
-## Tasks
-${children_json}
-
-## Checks per task
-1. Description is self-contained (a fresh agent with no context can implement it)
-2. File paths and function names are specified
-3. Acceptance criteria exist and are binary pass/fail
-4. No implicit dependencies on other tasks that aren't declared
-
-## Actions
-- If a task fails validation, fix it: bd update <id> -d "<improved description>" --acceptance "<improved criteria>"
-- If a task is too large, split it: bd close <id> --reason "split" then create smaller tasks
-- After all fixes: bd sync
-
-Output a one-line summary per task: PASS or what you fixed.
-SPEC_PROMPT
+  claude_as "$SPEC_MODEL" -p "$(
+    export CHILDREN_JSON="$children_json"
+    render_prompt "$PROMPTS_DIR/spec-review.md" CHILDREN_JSON
   )" > "$spec_log" 2>&1
   bd_sync
   log "Spec review: done. See $spec_log"
 
-  # PARENT_ID is set — fall through into the main worker+reviewer loop
+  # FILTER_LABEL is set — fall through into the main worker+reviewer loop
 fi
+
+PRE_LOOP_HEAD=$(git rev-parse HEAD)
+
+# Cost tracking — associative array by agent type
+declare -A AGENT_COSTS
+extract_cost() {
+  local agent_type="$1" log_file="$2"
+  local cost
+  cost=$(jq -r 'select(.type == "result") | .total_cost_usd // 0' "$log_file" 2>/dev/null | tail -1)
+  if [[ -n "$cost" && "$cost" != "0" && "$cost" != "null" ]]; then
+    AGENT_COSTS[$agent_type]=$(echo "${AGENT_COSTS[$agent_type]:-0} + $cost" | bc 2>/dev/null || echo "${AGENT_COSTS[$agent_type]:-0}")
+  fi
+}
 
 # ---------------------------------------------------------------------------
 # Main loop — runs as long as there are unblocked beads
@@ -342,11 +351,10 @@ while true; do
           continue   # failed earlier — drop from list
         fi
 
-        # Check if all dependencies are closed (exclude parent bead — it blocks
-        # all children structurally, not as an ordering constraint)
+        # Check if all dependencies are closed
         dep_json=$(bd show "$candidate" --json 2>/dev/null) || dep_json="[]"
-        open_deps=$(echo "$dep_json" | jq --arg parent "$PARENT_ID" \
-          '[.[0].dependencies // [] | .[] | select(.status != "closed" and .id != $parent)] | length')
+        open_deps=$(echo "$dep_json" | jq \
+          '[.[0].dependencies // [] | .[] | select(.status != "closed")] | length')
 
         if [[ "$open_deps" -gt 0 ]]; then
           # Still blocked — re-queue at the end
@@ -389,7 +397,6 @@ while true; do
   else
     # Default mode — ask bd ready with passthrough filters
     ready_args=(--json)
-    [[ -n "$PARENT_ID" ]]       && ready_args+=(--label "$PARENT_ID")
     [[ -n "$FILTER_LABEL" ]]    && ready_args+=(--label "$FILTER_LABEL")
     [[ -n "$FILTER_TYPE" ]]     && ready_args+=(--type "$FILTER_TYPE")
     [[ -n "$FILTER_PRIORITY" ]] && ready_args+=(--priority "$FILTER_PRIORITY")
@@ -403,10 +410,6 @@ while true; do
     log "  Found $count candidate(s)"
     for i in $(seq 0 $((count - 1))); do
       candidate=$(echo "$ready_json" | jq -r ".[$i].id")
-      if [[ -n "$PARENT_ID" && "$candidate" == "$PARENT_ID" ]]; then
-        log "  Skipping parent $candidate"
-        continue
-      fi
       if ! grep -qxF "$candidate" "$SKIP_FILE" 2>/dev/null; then
         bead_id="$candidate"
         bead_title=$(echo "$ready_json" | jq -r ".[$i].title")
@@ -443,43 +446,15 @@ while true; do
   bead_details=$(bd show "$bead_id" 2>/dev/null)
   bead_show_json=$(bd show "$bead_id" --json 2>/dev/null) || bead_show_json="[]"
   acceptance=$(echo "$bead_show_json" | jq -r '.[0].acceptance_criteria // empty')
-  bead_parent=$(echo "$bead_show_json" | jq -r '.[0].parent // empty')
   bead_labels=$(echo "$bead_show_json" | jq -r '.[0].labels // [] | map("-l " + .) | join(" ")') || bead_labels=""
   prompt_file=$(mktemp /tmp/ralph-prompt.XXXXXX)
 
-  cat > "$prompt_file" <<__RALPH_PROMPT__
-You are an autonomous coding agent working on a single task.
-This is a fresh Claude Code instance — you have no prior conversation history.
-State lives in the filesystem and git, not in your memory (Ralph Loop pattern).
-
-## Rules
-- Do NOT create git commits. The outer loop handles all commits.
-- Do NOT close, update status, or sync beads. Bead lifecycle is managed externally.
-- Do NOT use TodoWrite or TaskCreate for tracking.
-- Focus ONLY on the task below. Do not work on anything else.
-- If you are genuinely blocked (missing dependency, wrong spec, file doesn't exist), file a blocker and stop:
-    NEW_ID=\$(bd create "Blocker: <description>" -t bug -p 1 --parent ${bead_parent:-$PARENT_ID} ${bead_labels} --silent)
-    bd dep "\$NEW_ID" --blocks ${bead_id}
-  Then explain what blocked you and stop working.
-${project_rules:+
-## Project Rules
-$project_rules
-}
-## When you are done
-End your output with a "## Learnings" section. Include ONLY things that were
-unexpected or required a pivot from the spec — e.g. the spec said X but the
-code actually needed Y, a dependency behaved differently than expected, a file
-was structured differently than described, an edge case the spec didn't cover.
-If everything went exactly as described, write "None — task matched spec."
-
-## Task
-${bead_details}
-${acceptance:+
-## Acceptance Criteria
-$acceptance
-Verify each criterion passes before you finish.
-}
-__RALPH_PROMPT__
+  (
+    export BEAD_LABELS="$bead_labels" BEAD_ID="$bead_id"
+    export PROJECT_RULES="$project_rules" BEAD_DETAILS="$bead_details"
+    export ACCEPTANCE="$acceptance"
+    render_prompt "$PROMPTS_DIR/worker.md" BEAD_LABELS BEAD_ID PROJECT_RULES BEAD_DETAILS ACCEPTANCE
+  ) > "$prompt_file"
 
   # -----------------------------------------------------------------------
   # Run Claude — retry on failure
@@ -497,6 +472,7 @@ __RALPH_PROMPT__
       | ralph_stream_filter || true
 
     # Check success from the stream-json result event (not pipeline exit code)
+    extract_cost "worker" "$log_file"
     if jq -e 'select(.type == "result" and .subtype == "success")' "$log_file" > /dev/null 2>&1; then
       success=true
       break
@@ -527,19 +503,9 @@ __RALPH_PROMPT__
   if has_code_changes; then
     phase "$C_YELLOW" "COMMIT — $COMMIT_MODEL"
     commit_log="$LOG_DIR/iter-${iteration}-${bead_id}-commit.log"
-    claude_as "$COMMIT_MODEL" -p "$(cat <<__RALPH_COMMIT__
-Stage and commit the current code changes.
-
-Steps:
-1. Run: git add -A && git reset HEAD -- .ralph-logs
-2. Run: git diff --cached (to see what you're committing)
-3. Write a commit message that focuses on the *why* more than the *what*.
-   Follow any commit conventions the project has (check CLAUDE.md, AGENTS.md).
-   Include "(${bead_id})" on its own line at the bottom of the commit body.
-4. Commit using a heredoc for the message.
-5. If the commit fails due to lint-staged or husky, fix the reported issues and retry.
-6. Do NOT run bd commands. Do NOT push.
-__RALPH_COMMIT__
+    claude_as "$COMMIT_MODEL" -p "$(
+      export BEAD_ID="$bead_id"
+      render_prompt "$PROMPTS_DIR/commit.md" BEAD_ID
     )" 2>&1 | tee "$commit_log" && log "  ${C_GREEN}Committed.${C_RESET}" || log "  ${C_RED}Commit agent failed.${C_RESET} See $commit_log"
   else
     log "  ${C_DIM}No code changes to commit.${C_RESET}"
@@ -551,43 +517,27 @@ __RALPH_COMMIT__
   phase "$C_MAGENTA" "REVIEW — $REVIEWER_MODEL"
   review_log="$LOG_DIR/iter-${iteration}-${bead_id}-review.log"
 
-  claude_as "$REVIEWER_MODEL" -p "$(cat <<__RALPH_REVIEW__
-You are a code reviewer. Review the implementation of this task.
-Do NOT modify any code. Do NOT close or update bead status.
+  claude_as "$REVIEWER_MODEL" --output-format stream-json -p "$(
+    export BEAD_DETAILS="$bead_details" BEAD_ID="$bead_id"
+    export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" BEAD_LABELS="$bead_labels"
+    render_prompt "$PROMPTS_DIR/review.md" BEAD_DETAILS BEAD_ID PRE_LOOP_HEAD BEAD_LABELS
+  )" 2>&1 | tee "$review_log" | ralph_stream_filter || log "  ${C_RED}Review failed.${C_RESET} See $review_log"
 
-## Task
-${bead_details}
-
-## Instructions
-1. Find what changed: git log --oneline -1 --grep="(${bead_id})" then git show <hash>.
-   If no commit found, check the files mentioned in the task description.
-2. Does the implementation match the spec and acceptance criteria?
-3. Are there bugs, missing edge cases, or security issues?
-4. If you find problems that need fixing, file each as a new bead:
-   NEW_ID=\$(bd create "Fix: <problem> (from ${bead_id})" -t bug -p 2 \\
-     --parent ${bead_parent:-$PARENT_ID} ${bead_labels} \\
-     -d "<what's wrong and how to fix it>" \\
-     --acceptance "<how to verify the fix>" --silent)
-   Then run: bd sync
-5. If everything looks good, output: REVIEW_PASS
-6. If you filed fix beads, output: REVIEW_ISSUES_FILED
-__RALPH_REVIEW__
-  )" 2>&1 | tee "$review_log" || log "  ${C_RED}Review failed.${C_RESET} See $review_log"
-
-  review_result=$(tail -1 "$review_log")
+  extract_cost "reviewer" "$review_log"
+  review_result=$(jq -r 'select(.type == "assistant") | .message.content[]? | select(.type == "text") | .text' "$review_log" 2>/dev/null | tail -1)
   if [[ "$review_result" == *"REVIEW_PASS"* ]]; then
     log "  ${C_GREEN}Review: PASS${C_RESET}"
   elif [[ "$review_result" == *"REVIEW_ISSUES_FILED"* ]]; then
     log "  ${C_YELLOW}Review: ISSUES FILED${C_RESET}"
   else
-    log "  Review: $review_result"
+    log "  Review: ${review_result:-(no verdict)}"
   fi
 
   # -----------------------------------------------------------------------
   # Close the bead (or release if blocked)
   # -----------------------------------------------------------------------
   open_blockers=$(bd dep list "$bead_id" --json 2>/dev/null \
-    | jq '[.[] | select(.status != "closed" and .dependency_type != "parent-child")] | length' 2>/dev/null) || open_blockers=0
+    | jq '[.[] | select(.status != "closed")] | length' 2>/dev/null) || open_blockers=0
 
   if [[ "$open_blockers" -gt 0 ]]; then
     log "  ${C_YELLOW}$bead_id has $open_blockers open blocker(s) — releasing claim.${C_RESET}"
@@ -628,6 +578,153 @@ fi
 log "Logs: $LOG_DIR/"
 
 # ---------------------------------------------------------------------------
+# Post-loop test gate
+# ---------------------------------------------------------------------------
+test_output=""
+test_passed=true
+if [[ -n "$TEST_CMD" && $iteration -gt 0 ]]; then
+  echo ""
+  phase "$C_CYAN" "TEST GATE"
+  test_log="$LOG_DIR/test-gate-$(date '+%H%M%S').log"
+  log "Running: $TEST_CMD"
+
+  if eval "$TEST_CMD" > "$test_log" 2>&1; then
+    log "  ${C_GREEN}Tests: PASS${C_RESET}"
+  else
+    test_passed=false
+    log "  ${C_RED}Tests: FAIL${C_RESET} See $test_log"
+    bd create "Fix: test suite failures after ralph session" -t bug -p 1 \
+      ${FILTER_LABEL:+-l "$FILTER_LABEL"} \
+      -d "Test command '$TEST_CMD' failed after ralph session. See log: $test_log" \
+      --acceptance "Running '$TEST_CMD' passes" --silent 2>/dev/null || true
+    bd sync 2>/dev/null || true
+  fi
+  test_output=$(tail -100 "$test_log" 2>/dev/null)
+fi
+
+# ---------------------------------------------------------------------------
+# Diff stats + final review personas
+# ---------------------------------------------------------------------------
+final_review_failed=false
+
+if [[ $iteration -gt 0 ]]; then
+  echo ""
+  log "Session diff stats:"
+  git diff --stat "$PRE_LOOP_HEAD"..HEAD
+
+  # Build plan context — from --from-plan flag or PLAN.md in repo
+  plan_context=""
+  if [[ -n "${plan_body:-}" ]]; then
+    plan_context="## Original Plan
+# ${plan_title}
+${plan_body}"
+  elif [[ -f "PLAN.md" ]]; then
+    plan_context="## Original Plan (from PLAN.md)
+$(cat PLAN.md)"
+  fi
+
+  echo ""
+  phase "$C_MAGENTA" "FINAL REVIEW — parallel personas ($FINAL_REVIEW_MODEL)"
+
+  closed_beads=""
+  if [[ -n "${FILTER_LABEL:-}" ]]; then
+    closed_beads=$(bd list --label "$FILTER_LABEL" --status closed --json --limit 0 2>/dev/null) || closed_beads="[]"
+  fi
+  skipped=""; [[ -s "$SKIP_FILE" ]] && skipped=$(cat "$SKIP_FILE")
+
+  test_context=""
+  if [[ -n "$TEST_CMD" ]]; then
+    if [[ "$test_passed" == true ]]; then
+      test_context="## Test Results
+Tests passed ('$TEST_CMD')."
+    else
+      test_context="## Test Results — FAILED
+Command: $TEST_CMD
+Output (last 100 lines):
+${test_output}"
+    fi
+  fi
+
+  # Collect intermittent review logs for calibration
+  review_logs=""
+  for f in "$LOG_DIR"/iter-*-review.log; do
+    [[ -f "$f" ]] && review_logs="$review_logs $f"
+  done
+
+  bead_labels_flag="${FILTER_LABEL:+-l $FILTER_LABEL}"
+
+  calibration_block="## Intermittent Review Calibration
+The following log files contain reviews performed by a lighter model
+(${REVIEWER_MODEL}) during the session. Scan them and note if the
+intermittent reviewer missed anything significant that you caught.
+Include a brief \"## Calibration\" section at the end of your output
+noting any gaps (or \"Intermittent reviews were adequate\").
+
+Review logs: ${review_logs}"
+
+  # --- Persona A: Security Reviewer ---
+  sec_log="$LOG_DIR/final-review-security-$(date '+%H%M%S').log"
+  claude_as "$FINAL_REVIEW_MODEL" --output-format stream-json -p "$(
+    export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" BEAD_LABELS_FLAG="$bead_labels_flag"
+    export TEST_CONTEXT="$test_context" CALIBRATION_BLOCK="$calibration_block"
+    render_prompt "$PROMPTS_DIR/final-review-security.md" PRE_LOOP_HEAD BEAD_LABELS_FLAG TEST_CONTEXT CALIBRATION_BLOCK
+  )" 2>&1 | tee "$sec_log" | ralph_stream_filter &
+  sec_pid=$!
+
+  # --- Persona B: Integration Reviewer ---
+  int_log="$LOG_DIR/final-review-integration-$(date '+%H%M%S').log"
+  claude_as "$FINAL_REVIEW_MODEL" --output-format stream-json -p "$(
+    export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" BEAD_LABELS_FLAG="$bead_labels_flag"
+    export TEST_CONTEXT="$test_context" CALIBRATION_BLOCK="$calibration_block"
+    render_prompt "$PROMPTS_DIR/final-review-integration.md" PRE_LOOP_HEAD BEAD_LABELS_FLAG TEST_CONTEXT CALIBRATION_BLOCK
+  )" 2>&1 | tee "$int_log" | ralph_stream_filter &
+  int_pid=$!
+
+  # --- Persona C: Codebase Patterns Reviewer ---
+  pat_log="$LOG_DIR/final-review-patterns-$(date '+%H%M%S').log"
+  claude_as "$FINAL_REVIEW_MODEL" --output-format stream-json -p "$(
+    export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" BEAD_LABELS_FLAG="$bead_labels_flag"
+    export TEST_CONTEXT="$test_context" CALIBRATION_BLOCK="$calibration_block"
+    render_prompt "$PROMPTS_DIR/final-review-patterns.md" PRE_LOOP_HEAD BEAD_LABELS_FLAG TEST_CONTEXT CALIBRATION_BLOCK
+  )" 2>&1 | tee "$pat_log" | ralph_stream_filter &
+  pat_pid=$!
+
+  # --- Persona D: Plan Adherence Reviewer (conditional) ---
+  plan_pid=""
+  plan_log=""
+  if [[ -n "$plan_context" ]]; then
+    plan_log="$LOG_DIR/final-review-plan-$(date '+%H%M%S').log"
+    claude_as "$FINAL_REVIEW_MODEL" --output-format stream-json -p "$(
+      export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" BEAD_LABELS_FLAG="$bead_labels_flag"
+      export TEST_CONTEXT="$test_context" CALIBRATION_BLOCK="$calibration_block"
+      export PLAN_CONTEXT="$plan_context"
+      render_prompt "$PROMPTS_DIR/final-review-plan.md" PRE_LOOP_HEAD BEAD_LABELS_FLAG TEST_CONTEXT CALIBRATION_BLOCK PLAN_CONTEXT
+    )" 2>&1 | tee "$plan_log" | ralph_stream_filter &
+    plan_pid=$!
+  fi
+
+  # Wait for all final reviewers
+  wait "$sec_pid" "$int_pid" "$pat_pid" ${plan_pid:+"$plan_pid"} 2>/dev/null || true
+
+  # Collect results
+  for logvar in sec_log int_log pat_log ${plan_context:+plan_log}; do
+    logfile="${!logvar}"
+    [[ -z "$logfile" || ! -f "$logfile" ]] && continue
+    label=$(basename "$logfile" .log | sed 's/final-review-//' | sed 's/-[0-9]*//')
+    extract_cost "final-$label" "$logfile"
+    result=$(jq -r 'select(.type == "assistant") | .message.content[]? | select(.type == "text") | .text' "$logfile" 2>/dev/null | tail -1)
+    if [[ "$result" == *"_PASS"* ]]; then
+      log "  ${C_GREEN}${label}: PASS${C_RESET}"
+    elif [[ "$result" == *"_ISSUES"* ]]; then
+      log "  ${C_YELLOW}${label}: ISSUES FILED${C_RESET}"
+      final_review_failed=true
+    else
+      log "  ${label}: ${result:-(no verdict)}"
+    fi
+  done
+fi
+
+# ---------------------------------------------------------------------------
 # Post-run summary — read all work logs and extract learnings
 # ---------------------------------------------------------------------------
 if [[ $iteration -gt 0 ]]; then
@@ -643,30 +740,10 @@ if [[ $iteration -gt 0 ]]; then
   done
 
   if [[ -n "$log_list" ]]; then
-    claude_as "$SUMMARY_MODEL" -p "$(cat <<EOF
-Read each of the following log files. They are outputs from autonomous coding
-agents that each worked on a single task.
-
-Log files: ${log_list}
-
-Write a concise run summary to stdout. Start with a line: "Generated: $(date '+%Y-%m-%d %H:%M:%S')"
-Then include these sections:
-
-## Completed
-One-line per bead: what was done.
-
-## Learnings & Surprises
-Extract anything from the agents' "## Learnings" sections (or from the body
-of their output) that was unexpected — spec inaccuracies, pivots, edge cases,
-dependency quirks, code structure that differed from expectations.
-Group related items. Skip anything that was "None — task matched spec."
-
-## Skipped / Failed
-List any beads that failed (if the skip file at ${SKIP_FILE} is non-empty,
-read it). Briefly note what went wrong if visible in the logs.
-
-Keep it tight — this is a debrief, not a novel.
-EOF
+    claude_as "$SUMMARY_MODEL" -p "$(
+      export LOG_LIST="$log_list" SKIP_FILE="$SKIP_FILE"
+      export GENERATED_TS="$(date '+%Y-%m-%d %H:%M:%S')"
+      render_prompt "$PROMPTS_DIR/summary.md" LOG_LIST SKIP_FILE GENERATED_TS
     )" > "$summary_file" 2>&1
 
     echo ""
@@ -674,4 +751,26 @@ EOF
     echo ""
     log "(saved to $summary_file)"
   fi
+fi
+
+# ---------------------------------------------------------------------------
+# Cost report
+# ---------------------------------------------------------------------------
+if [[ ${#AGENT_COSTS[@]} -gt 0 ]]; then
+  echo ""
+  log "Cost breakdown:"
+  total=0
+  for agent_type in "${!AGENT_COSTS[@]}"; do
+    cost="${AGENT_COSTS[$agent_type]}"
+    printf "  %-20s \$%s\n" "$agent_type" "$cost"
+    total=$(echo "$total + $cost" | bc 2>/dev/null || echo "$total")
+  done
+  printf "  %-20s \$%s\n" "TOTAL" "$total"
+fi
+
+# ---------------------------------------------------------------------------
+# Exit code — non-zero if final review found issues or tests failed
+# ---------------------------------------------------------------------------
+if [[ "${final_review_failed:-false}" == true ]] || [[ "${test_passed:-true}" == false ]]; then
+  exit 1
 fi
