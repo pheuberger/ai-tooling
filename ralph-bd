@@ -444,6 +444,7 @@ while true; do
   bead_show_json=$(bd show "$bead_id" --json 2>/dev/null) || bead_show_json="[]"
   acceptance=$(echo "$bead_show_json" | jq -r '.[0].acceptance_criteria // empty')
   bead_parent=$(echo "$bead_show_json" | jq -r '.[0].parent // empty')
+  bead_labels=$(echo "$bead_show_json" | jq -r '.[0].labels // [] | map("-l " + .) | join(" ")') || bead_labels=""
   prompt_file=$(mktemp /tmp/ralph-prompt.XXXXXX)
 
   cat > "$prompt_file" <<__RALPH_PROMPT__
@@ -457,7 +458,7 @@ State lives in the filesystem and git, not in your memory (Ralph Loop pattern).
 - Do NOT use TodoWrite or TaskCreate for tracking.
 - Focus ONLY on the task below. Do not work on anything else.
 - If you are genuinely blocked (missing dependency, wrong spec, file doesn't exist), file a blocker and stop:
-    NEW_ID=\$(bd create "Blocker: <description>" -t bug -p 1 --parent ${bead_parent:-$PARENT_ID} --silent)
+    NEW_ID=\$(bd create "Blocker: <description>" -t bug -p 1 --parent ${bead_parent:-$PARENT_ID} ${bead_labels} --silent)
     bd dep "\$NEW_ID" --blocks ${bead_id}
   Then explain what blocked you and stop working.
 ${project_rules:+
@@ -564,7 +565,7 @@ ${bead_details}
 3. Are there bugs, missing edge cases, or security issues?
 4. If you find problems that need fixing, file each as a new bead:
    NEW_ID=\$(bd create "Fix: <problem> (from ${bead_id})" -t bug -p 2 \\
-     --parent ${bead_parent:-$PARENT_ID} \\
+     --parent ${bead_parent:-$PARENT_ID} ${bead_labels} \\
      -d "<what's wrong and how to fix it>" \\
      --acceptance "<how to verify the fix>" --silent)
    Then run: bd sync
