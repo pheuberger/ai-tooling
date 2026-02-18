@@ -47,7 +47,13 @@ All four must be on your `PATH`.
 │  8. Close bead (or release if reviewer filed blockers)   │
 │  9. Loop back to 1                                       │
 │                                                          │
-│  Post-run: generate summary from all work logs           │
+│  Post-run:                                                │
+│    a. Test gate (--test-cmd) — files bead on failure     │
+│    b. Diff stats                                          │
+│    c. 3-4 parallel Opus final reviewers (Security,       │
+│       Integration, Patterns, Plan Adherence)              │
+│    d. Summary from all work logs                          │
+│    e. Cost report                                         │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -90,10 +96,10 @@ If the coding agent fails after all retries, the bead is released (`bd update �
 | `--max-iterations N` | `50` | Maximum total loop iterations |
 | `--max-retries N` | `3` | Retries per bead on Claude failure |
 | `--model MODEL` | per-agent | Force ALL agents to this model (overrides per-agent defaults) |
-| `--beads ID[,ID,...]` | — | Process only these beads, in order. Skips `bd ready`. Mutually exclusive with `--parent`. |
-| `--parent ID` | — | Scope to children of this epic/feature (filters `bd ready` via `--label`). Mutually exclusive with `--beads`. |
+| `--beads ID[,ID,...]` | — | Process only these beads, in order. Skips `bd ready`. |
 | `--respect-deps` | off | With `--beads`: skip beads whose dependencies aren't closed yet. Blocked beads are re-queued at the end of the list. |
-| `--from-plan FILE` | — | Decompose a plan file into an epic + tasks, then work them. See [Plan mode](#plan-mode). |
+| `--from-plan FILE` | — | Decompose a plan file into label-grouped tasks, then work them. See [Plan mode](#plan-mode). |
+| `--test-cmd CMD` | — | Run `CMD` as a post-loop test gate. Files a bead and exits 1 on failure. |
 | `--type TYPE` | — | Filter `bd ready` by `issue_type` (`feature`, `bug`, `task`) |
 | `--priority N` | — | Only pick beads with `priority <= N` (0=critical, 1=high, 2=medium, 3=low, 4=backlog) |
 | `--owner NAME` | — | Only pick beads owned by `NAME` |
@@ -109,11 +115,11 @@ If the coding agent fails after all retries, the bead is released (`bd update �
 # Specific beads with dependency awareness
 ./ralph-bd --beads auth-1,auth-2,auth-3 --respect-deps
 
-# Process all children of an epic
-./ralph-bd --parent epic-42
-
 # Decompose a plan into beads and work them
 ./ralph-bd --from-plan PLAN.md
+
+# Run with a post-loop test gate
+./ralph-bd --from-plan PLAN.md --test-cmd 'npm test'
 
 # Force all agents to a single model, limit iterations
 ./ralph-bd --model claude-sonnet-4-6 --max-iterations 5
@@ -127,15 +133,15 @@ If the coding agent fails after all retries, the bead is released (`bd update �
 
 ## Plan mode
 
-`--from-plan FILE` runs a three-phase pipeline: a lead agent decomposes the plan into beads, a spec reviewer validates them, then the normal worker loop processes them all.
+`--from-plan FILE` runs a three-phase pipeline: a lead agent decomposes the plan into beads, a spec reviewer validates them, then the normal worker loop processes them all. Tasks are grouped by a label slug derived from the plan title.
 
 ```
 ┌──────────────────────────────────────────────────────────┐
 │  --from-plan PLAN.md                                     │
 │                                                          │
 │  Phase 1 — Lead agent (opus)                             │
-│    Reads plan file, creates an epic in bd, decomposes    │
-│    it into small child tasks with bd create.             │
+│    Reads plan file, derives a label slug from the title, │
+│    decomposes it into small tasks with bd create.        │
 │                                                          │
 │  Phase 2 — Spec reviewer (opus)                          │
 │    Validates each task is self-contained with file        │
@@ -143,7 +149,7 @@ If the coding agent fails after all retries, the bead is released (`bd update �
 │    Fixes or splits tasks that fail validation.           │
 │                                                          │
 │  Phase 3 — Worker loop (normal iteration)                │
-│    Processes all children of the epic via bd ready.      │
+│    Processes all tasks with the plan label via bd ready. │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -153,7 +159,7 @@ The plan file should be a markdown file with a title on the first line. Example:
 ./ralph-bd --from-plan PLAN.md
 ```
 
-The lead agent creates each task with `--parent <epic-id>` so they're scoped under the epic. The worker loop then picks them up via `bd ready --label <epic-id>`.
+The plan title is slugified into a label (e.g. "Add user auth" → `add-user-auth`). The lead agent tags each task with this label, and the worker loop picks them up via `bd ready --label <slug>`.
 
 ## Configuration files
 
@@ -173,8 +179,9 @@ MAX_ITERATIONS=30
 MAX_RETRIES=5
 
 # Per-agent model overrides (defaults shown below)
-# WORKER_MODEL="claude-sonnet-4-6"    # coding worker — well-specified tasks
-# REVIEWER_MODEL="claude-opus-4-6"             # code reviewer — catches subtle bugs
+# WORKER_MODEL="claude-sonnet-4-6"             # coding worker — well-specified tasks
+# REVIEWER_MODEL="claude-sonnet-4-6"           # intermittent code reviewer (per-bead)
+# FINAL_REVIEW_MODEL="claude-opus-4-6"         # parallel final review personas (post-loop)
 # COMMIT_MODEL="claude-haiku-4-5-20251001"     # commit agent — trivial mechanical task
 # LEAD_MODEL="claude-opus-4-6"                 # lead agent — plan decomposition
 # SPEC_MODEL="claude-opus-4-6"                 # spec reviewer — validates task specs
@@ -195,6 +202,9 @@ FILTER_OWNER="bitbeckers"
 
 # Filter beads by label (default: "" = all labels)
 FILTER_LABEL=""
+
+# Post-loop test command (default: "" = no test gate)
+# TEST_CMD="npm test"
 
 # Where to write logs (default: ".ralph-logs")
 LOG_DIR=".ralph-logs"
@@ -256,6 +266,11 @@ All output goes to `.ralph-logs/` (configurable via `LOG_DIR`):
 | `iter-<N>-<bead-id>-review.log` | Reviewer agent output |
 | `lead-<HHMMSS>.log` | Lead agent output (`--from-plan` only) |
 | `spec-review-<HHMMSS>.log` | Spec reviewer output (`--from-plan` only) |
+| `test-gate-<HHMMSS>.log` | Test gate output (`--test-cmd` only) |
+| `final-review-security-<HHMMSS>.log` | Security reviewer output |
+| `final-review-integration-<HHMMSS>.log` | Integration reviewer output |
+| `final-review-patterns-<HHMMSS>.log` | Codebase patterns reviewer output |
+| `final-review-plan-<HHMMSS>.log` | Plan adherence reviewer output (when plan context exists) |
 | `.skipped` | Bead IDs that failed after all retries |
 | `summary-<date>.md` | Post-run summary (generated by a final Claude instance) |
 
@@ -276,7 +291,10 @@ Ralph Loop starting (max_iterations=30, max_retries=5)
   Rules: .ralph-rules.md loaded
   Filter type: feature
   Filter priority: <= 2
-=================================================================
+  Models: worker=claude-sonnet-4-6  reviewer=claude-sonnet-4-6  commit=claude-haiku-4-5-20251001
+          final-review=claude-opus-4-6
+          summary=claude-haiku-4-5-20251001
+─────────────────────────────────────────────────────────────────
 ```
 
 ## How it interacts with Claude Code configuration
@@ -299,12 +317,13 @@ Each agent type has a default model matched to its cognitive demand:
 | Spec reviewer | opus | Catches ambiguity and missing context in task specs |
 | Worker | sonnet | Tasks are well-specified with file paths and acceptance criteria — Sonnet's sweet spot |
 | Commit | haiku | Mechanical: stage files, read diff, write message |
-| Reviewer | opus | Subtle bug detection, security issues, edge cases |
+| Reviewer | sonnet | Per-bead check with cumulative diff context — good enough for quick checks |
+| Final review | opus | 3-4 parallel personas (Security, Integration, Patterns, Plan Adherence) after all work is done |
 | Summary | haiku | Reading logs and writing a debrief |
 
-The Ralph Loop design deliberately front-loads reasoning (lead + spec review produce detailed, self-contained specs), which means workers can run on a faster, cheaper model without sacrificing quality. The reviewer runs on Opus as a safety net.
+The Ralph Loop design deliberately front-loads reasoning (lead + spec review produce detailed, self-contained specs), which means workers can run on a faster, cheaper model without sacrificing quality. Intermittent reviews run on Sonnet for cost efficiency; the post-loop final review personas run on Opus as a thorough safety net with cross-persona coverage.
 
-`--model` overrides everything to a single model, useful for testing or when you want uniform behavior. Per-agent models are configurable via `.ralphrc` (e.g. `WORKER_MODEL`, `REVIEWER_MODEL`).
+`--model` overrides everything to a single model, useful for testing or when you want uniform behavior. Per-agent models are configurable via `.ralphrc` (e.g. `WORKER_MODEL`, `REVIEWER_MODEL`, `FINAL_REVIEW_MODEL`).
 
 ## Tips
 
