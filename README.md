@@ -1,4 +1,4 @@
-# ralph-bd.sh
+# ralph-bd
 
 Autonomous coding loop powered by [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and [beads](https://github.com/snarktank/beads). Spawns a fresh Claude Code instance per ready bead — no conversation history carries over between iterations. State lives in the filesystem and git, not in the LLM's memory. This sidesteps context degradation by treating every iteration as a brand-new session.
 
@@ -19,31 +19,36 @@ All four must be on your `PATH`.
 
 ```bash
 # Process all ready beads in priority order
-./ralph-bd.sh
+./ralph-bd
 
 # Process specific beads
-./ralph-bd.sh --beads feat-12,feat-13,bug-7
+./ralph-bd --beads feat-12,feat-13,bug-7
 
 # Only bugs, max 10 iterations
-./ralph-bd.sh --type bug --max-iterations 10
+./ralph-bd --type bug --max-iterations 10
+
+# Decompose a plan into beads, then work them all
+./ralph-bd --from-plan PLAN.md
 ```
 
 ## How it works
 
 ```
-┌─────────────────────────────────────────────────────┐
-│  ralph-bd.sh                                        │
-│                                                     │
-│  1. Pick next ready bead (bd ready / --beads list)  │
-│  2. Claim it (bd update → in_progress)              │
-│  3. Build prompt from bead details + rules          │
-│  4. Spawn fresh Claude Code instance                │
-│  5. On success: spawn commit agent, close bead      │
-│  6. On failure: retry up to MAX_RETRIES, then skip  │
-│  7. Loop back to 1                                  │
-│                                                     │
-│  Post-run: generate summary from all work logs      │
-└─────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│  ralph-bd                                                │
+│                                                          │
+│  1. Pick next ready bead (bd ready / --beads list)       │
+│  2. Claim it (bd update → in_progress)                   │
+│  3. Build prompt from bead details + rules               │
+│  4. Spawn fresh Claude Code worker instance               │
+│  5. On failure: retry up to MAX_RETRIES, then skip       │
+│  6. On success: spawn commit agent (stages + commits)    │
+│  7. Spawn reviewer — files "Fix:" beads for any issues   │
+│  8. Close bead (or release if reviewer filed blockers)   │
+│  9. Loop back to 1                                       │
+│                                                          │
+│  Post-run: generate summary from all work logs           │
+└──────────────────────────────────────────────────────────┘
 ```
 
 Each Claude Code instance runs with `--print --dangerously-skip-permissions` (headless, no confirmation prompts). The agent is told:
@@ -51,6 +56,7 @@ Each Claude Code instance runs with `--print --dangerously-skip-permissions` (he
 - Do NOT create git commits (the outer loop handles that)
 - Do NOT run bead commands (`bd close`, `bd update`, etc.)
 - Focus only on the assigned task
+- If genuinely blocked, file a blocker bead and stop
 - End output with a `## Learnings` section
 
 After the coding agent finishes, a separate commit agent stages and commits the changes. It reviews the diff and writes a commit message that follows whatever conventions the project has (picked up from `CLAUDE.md` / `AGENTS.md`).
@@ -65,9 +71,10 @@ Before starting, ralph shelves any pre-existing untracked files (except `.beads/
 |------|-----|-------------|
 | Pick | ralph | Selects next bead from `bd ready` or `--beads` list |
 | Claim | ralph | `bd update <id> --status=in_progress` |
-| Work | Claude agent | Reads bead details, writes code |
-| Commit | Commit agent | `git add -A`, resets `.beads`/`.ralph-logs`, commits |
-| Close | ralph | `bd close <id>` |
+| Work | Worker agent | Reads bead details, writes code |
+| Commit | Commit agent | `git add -A`, resets `.ralph-logs`, commits with `(bead-id)` in body |
+| Review | Reviewer agent | Reads the diff; files "Fix:" beads for any issues found |
+| Close | ralph | `bd close <id>` (or release if open blockers exist) |
 | Sync | ralph | `bd sync` |
 
 If the coding agent fails after all retries, the bead is released (`bd update → open`) and added to the skip list.
@@ -75,7 +82,7 @@ If the coding agent fails after all retries, the bead is released (`bd update �
 ## CLI options
 
 ```
-./ralph-bd.sh [options]
+./ralph-bd [options]
 ```
 
 | Flag | Default | Description |
@@ -83,31 +90,70 @@ If the coding agent fails after all retries, the bead is released (`bd update �
 | `--max-iterations N` | `50` | Maximum total loop iterations |
 | `--max-retries N` | `3` | Retries per bead on Claude failure |
 | `--model MODEL` | per-agent | Force ALL agents to this model (overrides per-agent defaults) |
-| `--beads ID[,ID,...]` | — | Process only these beads, in order. Skips `bd ready`. |
+| `--beads ID[,ID,...]` | — | Process only these beads, in order. Skips `bd ready`. Mutually exclusive with `--parent`. |
+| `--parent ID` | — | Scope to children of this epic/feature (filters `bd ready` via `--label`). Mutually exclusive with `--beads`. |
 | `--respect-deps` | off | With `--beads`: skip beads whose dependencies aren't closed yet. Blocked beads are re-queued at the end of the list. |
+| `--from-plan FILE` | — | Decompose a plan file into an epic + tasks, then work them. See [Plan mode](#plan-mode). |
 | `--type TYPE` | — | Filter `bd ready` by `issue_type` (`feature`, `bug`, `task`) |
 | `--priority N` | — | Only pick beads with `priority <= N` (0=critical, 1=high, 2=medium, 3=low, 4=backlog) |
 | `--owner NAME` | — | Only pick beads owned by `NAME` |
+| `--label LABEL` | — | Filter `bd ready` by label |
 | `-h`, `--help` | — | Print usage and exit |
 
 ### Examples
 
 ```bash
 # Run only critical/high priority features
-./ralph-bd.sh --type feature --priority 1
+./ralph-bd --type feature --priority 1
 
 # Specific beads with dependency awareness
-./ralph-bd.sh --beads auth-1,auth-2,auth-3 --respect-deps
+./ralph-bd --beads auth-1,auth-2,auth-3 --respect-deps
+
+# Process all children of an epic
+./ralph-bd --parent epic-42
+
+# Decompose a plan into beads and work them
+./ralph-bd --from-plan PLAN.md
 
 # Force all agents to a single model, limit iterations
-./ralph-bd.sh --model claude-sonnet-4-6 --max-iterations 5
+./ralph-bd --model claude-sonnet-4-6 --max-iterations 5
 
 # Only beads owned by a specific person
-./ralph-bd.sh --owner bitbeckers
+./ralph-bd --owner bitbeckers
 
 # Maximum retries for flaky CI environments
-./ralph-bd.sh --max-retries 5
+./ralph-bd --max-retries 5
 ```
+
+## Plan mode
+
+`--from-plan FILE` runs a three-phase pipeline: a lead agent decomposes the plan into beads, a spec reviewer validates them, then the normal worker loop processes them all.
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  --from-plan PLAN.md                                     │
+│                                                          │
+│  Phase 1 — Lead agent (opus)                             │
+│    Reads plan file, creates an epic in bd, decomposes    │
+│    it into small child tasks with bd create.             │
+│                                                          │
+│  Phase 2 — Spec reviewer (opus)                          │
+│    Validates each task is self-contained with file        │
+│    paths, function names, and binary acceptance criteria. │
+│    Fixes or splits tasks that fail validation.           │
+│                                                          │
+│  Phase 3 — Worker loop (normal iteration)                │
+│    Processes all children of the epic via bd ready.      │
+└──────────────────────────────────────────────────────────┘
+```
+
+The plan file should be a markdown file with a title on the first line. Example:
+
+```bash
+./ralph-bd --from-plan PLAN.md
+```
+
+The lead agent creates each task with `--parent <epic-id>` so they're scoped under the epic. The worker loop then picks them up via `bd ready --label <epic-id>`.
 
 ## Configuration files
 
@@ -115,10 +161,10 @@ Both files are optional. Ralph works out of the box without them.
 
 ### `.ralphrc`
 
-Per-project configuration file. Place it in the project root (where you run `ralph-bd.sh`). It's sourced as a bash script before CLI arguments are parsed, so **CLI flags override `.ralphrc` values**.
+Per-project configuration file. Place it in the project root (where you run `ralph-bd`). It's sourced as a bash script before CLI arguments are parsed, so **CLI flags override `.ralphrc` values**.
 
 ```bash
-# .ralphrc — ralph-bd.sh project configuration
+# .ralphrc — ralph-bd project configuration
 
 # How many total iterations before ralph stops (default: 50)
 MAX_ITERATIONS=30
@@ -147,6 +193,9 @@ FILTER_PRIORITY=2
 # Only process beads owned by this name (default: "" = all owners)
 FILTER_OWNER="bitbeckers"
 
+# Filter beads by label (default: "" = all labels)
+FILTER_LABEL=""
+
 # Where to write logs (default: ".ralph-logs")
 LOG_DIR=".ralph-logs"
 
@@ -171,7 +220,7 @@ fi
 2. `.ralphrc` values
 3. Built-in defaults
 
-> **Note:** `BEAD_IDS`, `EXPLICIT_MODE`, and `RESPECT_DEPS` are not settable via `.ralphrc` — they only make sense as CLI arguments.
+> **Note:** `BEAD_IDS`, `EXPLICIT_MODE`, `RESPECT_DEPS`, and `PLAN_FILE` are not settable via `.ralphrc` — they only make sense as CLI arguments.
 
 ### `.ralph-rules.md`
 
@@ -202,10 +251,13 @@ All output goes to `.ralph-logs/` (configurable via `LOG_DIR`):
 
 | File | Contents |
 |------|----------|
-| `iter-<N>-<bead-id>.log` | Full Claude Code output for the coding agent |
+| `iter-<N>-<bead-id>.log` | Full Claude Code output for the worker agent |
 | `iter-<N>-<bead-id>-commit.log` | Commit agent output |
+| `iter-<N>-<bead-id>-review.log` | Reviewer agent output |
+| `lead-<HHMMSS>.log` | Lead agent output (`--from-plan` only) |
+| `spec-review-<HHMMSS>.log` | Spec reviewer output (`--from-plan` only) |
 | `.skipped` | Bead IDs that failed after all retries |
-| `summary.md` | Post-run summary (generated by a final Claude instance) |
+| `summary-<date>.md` | Post-run summary (generated by a final Claude instance) |
 
 Add `.ralph-logs` to your `.gitignore`:
 
