@@ -292,7 +292,7 @@ if [[ -n "$PLAN_FILE" ]]; then
   log "Lead: decomposing into tasks..."
   lead_log="$LOG_DIR/lead-$(date '+%H%M%S').log"
 
-  claude_as "$LEAD_MODEL" --output-format stream-json -p "$(
+  claude_as "$LEAD_MODEL" --output-format stream-json --verbose -p "$(
     export PLAN_TITLE="$plan_title" PLAN_BODY="$plan_body" PLAN_LABEL="$PLAN_LABEL"
     render_prompt "$PROMPTS_DIR/lead.md" PLAN_TITLE PLAN_BODY PLAN_LABEL
   )" 2>&1 | tee "$lead_log" | ralph_stream_filter || true
@@ -305,7 +305,7 @@ if [[ -n "$PLAN_FILE" ]]; then
   spec_log="$LOG_DIR/spec-review-$(date '+%H%M%S').log"
   children_json=$(bd list --label "$PLAN_LABEL" --status open --json --limit 0 2>/dev/null) || children_json="[]"
 
-  claude_as "$SPEC_MODEL" --output-format stream-json -p "$(
+  claude_as "$SPEC_MODEL" --output-format stream-json --verbose -p "$(
     export CHILDREN_JSON="$children_json"
     render_prompt "$PROMPTS_DIR/spec-review.md" CHILDREN_JSON
   )" 2>&1 | tee "$spec_log" | ralph_stream_filter || true
@@ -519,7 +519,7 @@ while true; do
   phase "$C_MAGENTA" "REVIEW — $REVIEWER_MODEL"
   review_log="$LOG_DIR/iter-${iteration}-${bead_id}-review.log"
 
-  claude_as "$REVIEWER_MODEL" --output-format stream-json -p "$(
+  claude_as "$REVIEWER_MODEL" --output-format stream-json --verbose -p "$(
     export BEAD_DETAILS="$bead_details" BEAD_ID="$bead_id"
     export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" BEAD_LABELS="$bead_labels"
     render_prompt "$PROMPTS_DIR/review.md" BEAD_DETAILS BEAD_ID PRE_LOOP_HEAD BEAD_LABELS
@@ -666,7 +666,7 @@ Review logs: ${review_logs}"
 
   # --- Persona A: Security Reviewer ---
   sec_log="$LOG_DIR/final-review-security-$(date '+%H%M%S').log"
-  claude_as "$FINAL_REVIEW_MODEL" --output-format stream-json -p "$(
+  claude_as "$FINAL_REVIEW_MODEL" --output-format stream-json --verbose -p "$(
     export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" BEAD_LABELS_FLAG="$bead_labels_flag"
     export TEST_CONTEXT="$test_context" CALIBRATION_BLOCK="$calibration_block"
     render_prompt "$PROMPTS_DIR/final-review-security.md" PRE_LOOP_HEAD BEAD_LABELS_FLAG TEST_CONTEXT CALIBRATION_BLOCK
@@ -675,7 +675,7 @@ Review logs: ${review_logs}"
 
   # --- Persona B: Integration Reviewer ---
   int_log="$LOG_DIR/final-review-integration-$(date '+%H%M%S').log"
-  claude_as "$FINAL_REVIEW_MODEL" --output-format stream-json -p "$(
+  claude_as "$FINAL_REVIEW_MODEL" --output-format stream-json --verbose -p "$(
     export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" BEAD_LABELS_FLAG="$bead_labels_flag"
     export TEST_CONTEXT="$test_context" CALIBRATION_BLOCK="$calibration_block"
     render_prompt "$PROMPTS_DIR/final-review-integration.md" PRE_LOOP_HEAD BEAD_LABELS_FLAG TEST_CONTEXT CALIBRATION_BLOCK
@@ -684,7 +684,7 @@ Review logs: ${review_logs}"
 
   # --- Persona C: Codebase Patterns Reviewer ---
   pat_log="$LOG_DIR/final-review-patterns-$(date '+%H%M%S').log"
-  claude_as "$FINAL_REVIEW_MODEL" --output-format stream-json -p "$(
+  claude_as "$FINAL_REVIEW_MODEL" --output-format stream-json --verbose -p "$(
     export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" BEAD_LABELS_FLAG="$bead_labels_flag"
     export TEST_CONTEXT="$test_context" CALIBRATION_BLOCK="$calibration_block"
     render_prompt "$PROMPTS_DIR/final-review-patterns.md" PRE_LOOP_HEAD BEAD_LABELS_FLAG TEST_CONTEXT CALIBRATION_BLOCK
@@ -696,7 +696,7 @@ Review logs: ${review_logs}"
   plan_log=""
   if [[ -n "$plan_context" ]]; then
     plan_log="$LOG_DIR/final-review-plan-$(date '+%H%M%S').log"
-    claude_as "$FINAL_REVIEW_MODEL" --output-format stream-json -p "$(
+    claude_as "$FINAL_REVIEW_MODEL" --output-format stream-json --verbose -p "$(
       export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" BEAD_LABELS_FLAG="$bead_labels_flag"
       export TEST_CONTEXT="$test_context" CALIBRATION_BLOCK="$calibration_block"
       export PLAN_CONTEXT="$plan_context"
