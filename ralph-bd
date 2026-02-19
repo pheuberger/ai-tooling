@@ -281,10 +281,11 @@ if [[ -n "$PLAN_FILE" ]]; then
   log "Lead: decomposing into tasks..."
   lead_log="$LOG_DIR/lead-$(date '+%H%M%S').log"
 
-  claude_as "$LEAD_MODEL" -p "$(
+  claude_as "$LEAD_MODEL" --output-format stream-json -p "$(
     export PLAN_TITLE="$plan_title" PLAN_BODY="$plan_body" PLAN_LABEL="$PLAN_LABEL"
     render_prompt "$PROMPTS_DIR/lead.md" PLAN_TITLE PLAN_BODY PLAN_LABEL
-  )" > "$lead_log" 2>&1
+  )" 2>&1 | tee "$lead_log" | ralph_stream_filter || true
+  extract_cost "lead" "$lead_log"
   bd_sync
   log "Lead: done. See $lead_log"
 
@@ -293,10 +294,11 @@ if [[ -n "$PLAN_FILE" ]]; then
   spec_log="$LOG_DIR/spec-review-$(date '+%H%M%S').log"
   children_json=$(bd list --label "$PLAN_LABEL" --status open --json --limit 0 2>/dev/null) || children_json="[]"
 
-  claude_as "$SPEC_MODEL" -p "$(
+  claude_as "$SPEC_MODEL" --output-format stream-json -p "$(
     export CHILDREN_JSON="$children_json"
     render_prompt "$PROMPTS_DIR/spec-review.md" CHILDREN_JSON
-  )" > "$spec_log" 2>&1
+  )" 2>&1 | tee "$spec_log" | ralph_stream_filter || true
+  extract_cost "spec" "$spec_log"
   bd_sync
   log "Spec review: done. See $spec_log"
 
