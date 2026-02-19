@@ -264,6 +264,17 @@ divider
 project_rules=""
 [[ -f "$RALPH_RULES_FILE" ]] && project_rules=$(<"$RALPH_RULES_FILE")
 
+# Cost tracking — associative array by agent type
+declare -A AGENT_COSTS
+extract_cost() {
+  local agent_type="$1" log_file="$2"
+  local cost
+  cost=$(jq -r 'select(.type == "result") | .total_cost_usd // 0' "$log_file" 2>/dev/null | tail -1)
+  if [[ -n "$cost" && "$cost" != "0" && "$cost" != "null" ]]; then
+    AGENT_COSTS[$agent_type]=$(echo "${AGENT_COSTS[$agent_type]:-0} + $cost" | bc 2>/dev/null || echo "${AGENT_COSTS[$agent_type]:-0}")
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # --from-plan: decompose a plan file into beads, then fall through to loop
 # ---------------------------------------------------------------------------
@@ -306,17 +317,6 @@ if [[ -n "$PLAN_FILE" ]]; then
 fi
 
 PRE_LOOP_HEAD=$(git rev-parse HEAD)
-
-# Cost tracking — associative array by agent type
-declare -A AGENT_COSTS
-extract_cost() {
-  local agent_type="$1" log_file="$2"
-  local cost
-  cost=$(jq -r 'select(.type == "result") | .total_cost_usd // 0' "$log_file" 2>/dev/null | tail -1)
-  if [[ -n "$cost" && "$cost" != "0" && "$cost" != "null" ]]; then
-    AGENT_COSTS[$agent_type]=$(echo "${AGENT_COSTS[$agent_type]:-0} + $cost" | bc 2>/dev/null || echo "${AGENT_COSTS[$agent_type]:-0}")
-  fi
-}
 
 # ---------------------------------------------------------------------------
 # Main loop — runs as long as there are unblocked beads
@@ -758,7 +758,7 @@ fi
 # ---------------------------------------------------------------------------
 # Cost report
 # ---------------------------------------------------------------------------
-if [[ ${#AGENT_COSTS[@]} -gt 0 ]]; then
+if [[ "${AGENT_COSTS[@]+x}" ]]; then
   echo ""
   log "Cost breakdown:"
   total=0
