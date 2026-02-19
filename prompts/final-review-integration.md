@@ -17,5 +17,3 @@ Do NOT modify any code. Do NOT close or update bead status.
 4. Output EXACTLY one of: INTEGRATION_PASS or INTEGRATION_ISSUES
 
 ${TEST_CONTEXT}
-
-${CALIBRATION_BLOCK}

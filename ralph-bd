@@ -647,29 +647,14 @@ ${test_output}"
     fi
   fi
 
-  # Collect intermittent review logs for calibration
-  review_logs=""
-  for f in "$LOG_DIR"/iter-*-review.log; do
-    [[ -f "$f" ]] && review_logs="$review_logs $f"
-  done
-
   bead_labels_flag="${FILTER_LABEL:+-l $FILTER_LABEL}"
-
-  calibration_block="## Intermittent Review Calibration
-The following log files contain reviews performed by a lighter model
-(${REVIEWER_MODEL}) during the session. Scan them and note if the
-intermittent reviewer missed anything significant that you caught.
-Include a brief \"## Calibration\" section at the end of your output
-noting any gaps (or \"Intermittent reviews were adequate\").
-
-Review logs: ${review_logs}"
 
   # --- Persona A: Security Reviewer ---
   sec_log="$LOG_DIR/final-review-security-$(date '+%H%M%S').log"
   claude_as "$FINAL_REVIEW_MODEL" --output-format stream-json --verbose -p "$(
     export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" BEAD_LABELS_FLAG="$bead_labels_flag"
-    export TEST_CONTEXT="$test_context" CALIBRATION_BLOCK="$calibration_block"
-    render_prompt "$PROMPTS_DIR/final-review-security.md" PRE_LOOP_HEAD BEAD_LABELS_FLAG TEST_CONTEXT CALIBRATION_BLOCK
+    export TEST_CONTEXT="$test_context"
+    render_prompt "$PROMPTS_DIR/final-review-security.md" PRE_LOOP_HEAD BEAD_LABELS_FLAG TEST_CONTEXT
   )" 2>&1 | tee "$sec_log" | ralph_stream_filter &
   sec_pid=$!
 
@@ -677,8 +662,8 @@ Review logs: ${review_logs}"
   int_log="$LOG_DIR/final-review-integration-$(date '+%H%M%S').log"
   claude_as "$FINAL_REVIEW_MODEL" --output-format stream-json --verbose -p "$(
     export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" BEAD_LABELS_FLAG="$bead_labels_flag"
-    export TEST_CONTEXT="$test_context" CALIBRATION_BLOCK="$calibration_block"
-    render_prompt "$PROMPTS_DIR/final-review-integration.md" PRE_LOOP_HEAD BEAD_LABELS_FLAG TEST_CONTEXT CALIBRATION_BLOCK
+    export TEST_CONTEXT="$test_context"
+    render_prompt "$PROMPTS_DIR/final-review-integration.md" PRE_LOOP_HEAD BEAD_LABELS_FLAG TEST_CONTEXT
   )" 2>&1 | tee "$int_log" | ralph_stream_filter &
   int_pid=$!
 
@@ -686,8 +671,8 @@ Review logs: ${review_logs}"
   pat_log="$LOG_DIR/final-review-patterns-$(date '+%H%M%S').log"
   claude_as "$FINAL_REVIEW_MODEL" --output-format stream-json --verbose -p "$(
     export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" BEAD_LABELS_FLAG="$bead_labels_flag"
-    export TEST_CONTEXT="$test_context" CALIBRATION_BLOCK="$calibration_block"
-    render_prompt "$PROMPTS_DIR/final-review-patterns.md" PRE_LOOP_HEAD BEAD_LABELS_FLAG TEST_CONTEXT CALIBRATION_BLOCK
+    export TEST_CONTEXT="$test_context"
+    render_prompt "$PROMPTS_DIR/final-review-patterns.md" PRE_LOOP_HEAD BEAD_LABELS_FLAG TEST_CONTEXT
   )" 2>&1 | tee "$pat_log" | ralph_stream_filter &
   pat_pid=$!
 
@@ -698,9 +683,9 @@ Review logs: ${review_logs}"
     plan_log="$LOG_DIR/final-review-plan-$(date '+%H%M%S').log"
     claude_as "$FINAL_REVIEW_MODEL" --output-format stream-json --verbose -p "$(
       export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" BEAD_LABELS_FLAG="$bead_labels_flag"
-      export TEST_CONTEXT="$test_context" CALIBRATION_BLOCK="$calibration_block"
+      export TEST_CONTEXT="$test_context"
       export PLAN_CONTEXT="$plan_context"
-      render_prompt "$PROMPTS_DIR/final-review-plan.md" PRE_LOOP_HEAD BEAD_LABELS_FLAG TEST_CONTEXT CALIBRATION_BLOCK PLAN_CONTEXT
+      render_prompt "$PROMPTS_DIR/final-review-plan.md" PRE_LOOP_HEAD BEAD_LABELS_FLAG TEST_CONTEXT PLAN_CONTEXT
     )" 2>&1 | tee "$plan_log" | ralph_stream_filter &
     plan_pid=$!
   fi
