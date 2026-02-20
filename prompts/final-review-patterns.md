@@ -14,6 +14,17 @@ Do NOT modify any code. Do NOT close or update bead status.
      ${BEAD_LABELS_FLAG} -d "<what's wrong and how to fix it>" \
      --acceptance "<how to verify the fix>" --silent)
    Then run: bd sync
-4. Output EXACTLY one of: PATTERNS_PASS or PATTERNS_ISSUES
+4. **Kaizen tickets** — if you notice pre-existing pattern/convention issues in the
+   surrounding code (not introduced by this session), file kaizen beads. Good kaizen:
+   code that increases cognitive load, duplicated logic that should be extracted,
+   things that break established codebase norms, real readability problems.
+   NOT kaizen: missing latest language syntax sugar, cosmetic preferences,
+   minor style differences that don't hurt comprehension. Only genuinely useful improvements.
+   bd create "Kaizen: <improvement>" -t task -p 4 -l kaizen \
+     -d "<what's wrong and why it matters>" \
+     --acceptance "<how to verify the improvement>" --silent
+   Then run: bd sync
+   Kaizen beads do NOT affect your verdict.
+5. Output EXACTLY one of: PATTERNS_PASS or PATTERNS_ISSUES
 
 ${TEST_CONTEXT}

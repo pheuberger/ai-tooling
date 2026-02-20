@@ -15,6 +15,15 @@ Do NOT modify any code. Do NOT close or update bead status.
      ${BEAD_LABELS_FLAG} -d "<what's wrong and how to fix it>" \
      --acceptance "<how to verify the fix>" --silent)
    Then run: bd sync
-4. Output EXACTLY one of: SECURITY_PASS or SECURITY_ISSUES
+4. **Kaizen tickets** — if you notice pre-existing security concerns or hardening
+   opportunities in the surrounding code (not introduced by this session's changes),
+   file kaizen beads. Only file genuinely useful improvements — not theoretical risks
+   or stylistic preferences.
+   bd create "Kaizen: <improvement>" -t task -p 4 -l kaizen \
+     -d "<what's wrong and why it matters>" \
+     --acceptance "<how to verify the improvement>" --silent
+   Then run: bd sync
+   Kaizen beads do NOT affect your verdict.
+5. Output EXACTLY one of: SECURITY_PASS or SECURITY_ISSUES
 
 ${TEST_CONTEXT}

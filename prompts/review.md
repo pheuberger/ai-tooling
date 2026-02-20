@@ -16,5 +16,17 @@ ${BEAD_DETAILS}
      ${BEAD_LABELS} -d "<what's wrong and how to fix it>" \
      --acceptance "<how to verify the fix>" --silent)
    Then run: bd sync
-6. If everything looks good, output: REVIEW_PASS
-7. If you filed fix beads, output: REVIEW_ISSUES_FILED
+6. **Kaizen tickets** — while reviewing, if you notice out-of-scope issues in the
+   surrounding code (not caused by this bead) that are worth addressing, file kaizen beads.
+   Good kaizen: real bugs in existing code, meaningful readability improvements,
+   performance issues, security concerns, unnecessary cognitive load, things that break
+   established codebase conventions.
+   NOT kaizen: stylistic nits with no functional impact, missing latest language syntax sugar,
+   cosmetic preferences. Only file genuinely useful improvements.
+   bd create "Kaizen: <improvement>" -t task -p 4 -l kaizen \
+     -d "<what's wrong and why it matters>" \
+     --acceptance "<how to verify the improvement>" --silent
+   Then run: bd sync
+   Kaizen beads do NOT affect your verdict — they are separate from Fix beads.
+7. If everything looks good, output: REVIEW_PASS
+8. If you filed fix beads, output: REVIEW_ISSUES_FILED

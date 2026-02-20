@@ -16,6 +16,17 @@ ${PLAN_CONTEXT}
      ${BEAD_LABELS_FLAG} -d "<what's missing or wrong vs the plan>" \
      --acceptance "<how to verify it matches the plan>" --silent)
    Then run: bd sync
-4. Output EXACTLY one of: PLAN_PASS or PLAN_ISSUES
+4. **Kaizen tickets** — if you notice pre-existing issues in the surrounding code
+   (not introduced by this session) that are worth addressing, file kaizen beads.
+   Good kaizen: real bugs, meaningful readability improvements, performance issues,
+   security concerns, unnecessary cognitive load, things that break established norms.
+   NOT kaizen: stylistic nits, cosmetic preferences, missing latest syntax sugar.
+   Only genuinely useful improvements.
+   bd create "Kaizen: <improvement>" -t task -p 4 -l kaizen \
+     -d "<what's wrong and why it matters>" \
+     --acceptance "<how to verify the improvement>" --silent
+   Then run: bd sync
+   Kaizen beads do NOT affect your verdict.
+5. Output EXACTLY one of: PLAN_PASS or PLAN_ISSUES
 
 ${TEST_CONTEXT}
