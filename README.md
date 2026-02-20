@@ -391,3 +391,63 @@ The Ralph Loop design deliberately front-loads reasoning (lead + spec review pro
 - **Use `.ralph-rules.md` for guardrails.** If agents keep doing something you don't want (skipping tests, editing the wrong files), add a rule.
 - **Check the logs.** If a bead fails or the commit looks wrong, the answer is in `.ralph-logs/`.
 - **Commit conventions are automatic.** Put your preferred commit format in `AGENTS.md` and the commit agent will follow it. No need to configure ralph.
+
+## Claude Code skills
+
+User-level [Claude Code skills](https://docs.anthropic.com/en/docs/claude-code/skills) live in `claude-home/.claude/skills/` and are symlinked to `~/.claude/skills/` via [GNU Stow](https://www.gnu.org/software/stow/). A hook script in `claude-home/.claude/hooks/` is managed the same way.
+
+These skills are available in any Claude Code session (not just ralph-bd runs) and form the interactive counterpart to ralph's automated loop. Where ralph processes beads autonomously, these skills are invoked manually via `/skill-name` in a Claude Code conversation.
+
+### Setup
+
+Skills and hooks are stored in `claude-home/.claude/` and need to be symlinked into `~/.claude/` so Claude Code can find them. [GNU Stow](https://www.gnu.org/software/stow/) manages the symlinks.
+
+```bash
+# 1. Install stow
+sudo apt install stow        # Debian/Ubuntu
+brew install stow             # macOS
+
+# 2. Clone this repo (if you haven't already)
+git clone git@github.com:pheuberger/ai-tooling.git
+cd ai-tooling
+
+# 3. Stow the claude-home package into your home directory
+stow -t ~ claude-home
+```
+
+This creates symlinks so that `~/.claude/skills/<name>` points back into this repo. Edits in either location update the same files, and changes are tracked in git.
+
+To remove the symlinks (without deleting the repo files):
+
+```bash
+stow -t ~ -D claude-home
+```
+
+### Skills reference
+
+Skills are invoked in Claude Code with `/skill-name` (e.g. `/create-plan`). They are listed below in the order you'd typically use them during a feature lifecycle.
+
+| Skill | When to use |
+|-------|-------------|
+| `/start-issue` | Beginning work on a Linear issue. Fetches the spec, marks it in progress, checks out the branch, and runs an interactive questioning phase to refine requirements before any code is written. |
+| `/research-codebase` | You need to understand how something works before planning. Spawns parallel sub-agents to explore the codebase and produces a timestamped research document in `.claude/research/`. |
+| `/create-plan` | After research and requirements are clear. Interactive multi-step process: gathers context, asks questions, explores code, and writes a phased implementation plan to `.claude/plans/`. |
+| `/plan-to-beads` | After a plan is approved. Decomposes it into granular, self-contained beads (bd issues) with file paths, code snippets, and acceptance criteria. Every bead gets a shared feature label. |
+| `/review-beads` | Quality gate before running ralph-bd. Audits beads for completeness, splits oversized ones, enriches vague descriptions with actual code from the codebase. |
+| `/create-issue` | Mid-session, you notice out-of-scope work. Captures it as a Linear issue with a quick refinement loop — keeps you focused on the current task. |
+
+### Typical workflow
+
+```
+/start-issue MA-123          # fetch spec, question requirements (untested, optional)
+/create-plan                  # write phased implementation plan
+/plan-to-beads                # decompose plan into bd tasks
+/review-beads                 # quality-check the beads
+./ralph-bd --label feat-slug  # let ralph work them autonomously
+```
+
+### Hooks
+
+| File | Trigger | What it does |
+|------|---------|--------------|
+| `on-file-write.sh` | Every file save | Runs [UBS](https://github.com/snarktank/ubs) bug scanner on supported languages (JS/TS, Python, C/C++, Rust, Go, Java, Ruby). Skips silently if `ubs` is not installed. |
