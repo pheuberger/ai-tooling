@@ -497,21 +497,32 @@ while true; do
   fi
 
   # -----------------------------------------------------------------------
+  # Skip commit & review if worker made no code changes
+  # -----------------------------------------------------------------------
+  if ! has_code_changes; then
+    log "  ${C_DIM}No code changes — skipping commit & review.${C_RESET}"
+    bd close "$bead_id" --reason="No changes needed (iteration $iteration)" 2>/dev/null || true
+    log "  ${C_GREEN}Closed $bead_id.${C_RESET}"
+    bd_sync
+    divider
+    log "${C_GREEN}${C_BOLD}DONE: $bead_id${C_RESET}"
+    divider
+    sleep 2
+    continue
+  fi
+
+  # -----------------------------------------------------------------------
   # Commit code + beads changes together.
-  # .ralph-logs/ is script-internal and excluded.
+  # .ralph-logs/ and .beads/ are script-internal and excluded.
   # Exclude pathspecs (:!) don't play well with git add, so we use
   # add-then-reset instead.
   # -----------------------------------------------------------------------
-  if has_code_changes; then
-    phase "$C_YELLOW" "COMMIT — $COMMIT_MODEL"
-    commit_log="$LOG_DIR/iter-${iteration}-${bead_id}-commit.log"
-    claude_as "$COMMIT_MODEL" -p "$(
-      export BEAD_ID="$bead_id"
-      render_prompt "$PROMPTS_DIR/commit.md" BEAD_ID
-    )" 2>&1 | tee "$commit_log" && log "  ${C_GREEN}Committed.${C_RESET}" || log "  ${C_RED}Commit agent failed.${C_RESET} See $commit_log"
-  else
-    log "  ${C_DIM}No code changes to commit.${C_RESET}"
-  fi
+  phase "$C_YELLOW" "COMMIT — $COMMIT_MODEL"
+  commit_log="$LOG_DIR/iter-${iteration}-${bead_id}-commit.log"
+  claude_as "$COMMIT_MODEL" -p "$(
+    export BEAD_ID="$bead_id"
+    render_prompt "$PROMPTS_DIR/commit.md" BEAD_ID
+  )" 2>&1 | tee "$commit_log" && log "  ${C_GREEN}Committed.${C_RESET}" || log "  ${C_RED}Commit agent failed.${C_RESET} See $commit_log"
 
   # -----------------------------------------------------------------------
   # Review the work — fresh Claude instance, read-only
