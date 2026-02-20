@@ -94,11 +94,11 @@ render_prompt() {
   echo "$content" | envsubst "$varlist"
 }
 
-# True if there are unstaged, staged, or untracked changes outside .ralph-logs/
+# True if there are unstaged, staged, or untracked changes outside .ralph-logs/ and .beads/
 has_code_changes() {
-  git diff --quiet -- ':!.ralph-logs' 2>/dev/null            || return 0
-  git diff --cached --quiet -- ':!.ralph-logs' 2>/dev/null   || return 0
-  [[ -z "$(git ls-files --others --exclude-standard -- ':!.ralph-logs' 2>/dev/null)" ]] || return 0
+  git diff --quiet -- ':!.ralph-logs' ':!.beads' 2>/dev/null            || return 0
+  git diff --cached --quiet -- ':!.ralph-logs' ':!.beads' 2>/dev/null   || return 0
+  [[ -z "$(git ls-files --others --exclude-standard -- ':!.ralph-logs' ':!.beads' 2>/dev/null)" ]] || return 0
   return 1
 }
 

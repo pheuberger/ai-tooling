@@ -9,7 +9,11 @@ Do NOT modify any code. Do NOT close or update bead status.
    - Library reuse vs rolling own (are there existing deps that should have been used?)
    - Conflicting or redundant dependencies added
    - Style consistency with the rest of the codebase
-3. For each pattern issue found, file a bead:
+3. For each pattern issue found, file a bead.
+   **Before creating any bead**, check for duplicates:
+   bd list --json | jq -r '.[].title'
+   If a bead already covers the same issue (even with different wording), do NOT file a duplicate.
+   Only when no existing bead matches:
    NEW_ID=$(bd create "Fix: <pattern issue>" -t task -p 3 \
      ${BEAD_LABELS_FLAG} -d "<what's wrong and how to fix it>" \
      --acceptance "<how to verify the fix>" --silent)
@@ -20,6 +24,8 @@ Do NOT modify any code. Do NOT close or update bead status.
    things that break established codebase norms, real readability problems.
    NOT kaizen: missing latest language syntax sugar, cosmetic preferences,
    minor style differences that don't hurt comprehension. Only genuinely useful improvements.
+   Again, check `bd list --json | jq -r '.[].title'` first — do NOT file if a
+   similar bead already exists.
    bd create "Kaizen: <improvement>" -t task -p 4 -l kaizen \
      -d "<what's wrong and why it matters>" \
      --acceptance "<how to verify the improvement>" --silent

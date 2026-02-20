@@ -11,7 +11,11 @@ ${PLAN_CONTEXT}
    - Is there scope creep (work done that wasn't in the plan)?
    - Were there requirement misinterpretations?
    - Were deviations from the plan beneficial and justified?
-3. For each plan adherence issue found, file a bead:
+3. For each plan adherence issue found, file a bead.
+   **Before creating any bead**, check for duplicates:
+   bd list --json | jq -r '.[].title'
+   If a bead already covers the same issue (even with different wording), do NOT file a duplicate.
+   Only when no existing bead matches:
    NEW_ID=$(bd create "Fix: <plan adherence issue>" -t task -p 2 \
      ${BEAD_LABELS_FLAG} -d "<what's missing or wrong vs the plan>" \
      --acceptance "<how to verify it matches the plan>" --silent)
@@ -22,6 +26,8 @@ ${PLAN_CONTEXT}
    security concerns, unnecessary cognitive load, things that break established norms.
    NOT kaizen: stylistic nits, cosmetic preferences, missing latest syntax sugar.
    Only genuinely useful improvements.
+   Again, check `bd list --json | jq -r '.[].title'` first — do NOT file if a
+   similar bead already exists.
    bd create "Kaizen: <improvement>" -t task -p 4 -l kaizen \
      -d "<what's wrong and why it matters>" \
      --acceptance "<how to verify the improvement>" --silent

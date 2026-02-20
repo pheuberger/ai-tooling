@@ -11,7 +11,11 @@ ${BEAD_DETAILS}
    Check whether this bead's changes conflict with or duplicate earlier work.
 3. Does the implementation match the spec and acceptance criteria?
 4. Are there bugs, missing edge cases, or security issues?
-5. If you find problems that need fixing, file each as a new bead:
+5. If you find problems that need fixing, file each as a new bead.
+   **Before creating any bead**, check for duplicates:
+   bd list --json | jq -r '.[].title'
+   If a bead already covers the same issue (even with different wording), do NOT file a duplicate.
+   Only when no existing bead matches:
    NEW_ID=$(bd create "Fix: <problem> (from ${BEAD_ID})" -t bug -p 2 \
      ${BEAD_LABELS} -d "<what's wrong and how to fix it>" \
      --acceptance "<how to verify the fix>" --silent)
@@ -23,6 +27,8 @@ ${BEAD_DETAILS}
    established codebase conventions.
    NOT kaizen: stylistic nits with no functional impact, missing latest language syntax sugar,
    cosmetic preferences. Only file genuinely useful improvements.
+   Again, check `bd list --json | jq -r '.[].title'` first — do NOT file if a
+   similar bead already exists.
    bd create "Kaizen: <improvement>" -t task -p 4 -l kaizen \
      -d "<what's wrong and why it matters>" \
      --acceptance "<how to verify the improvement>" --silent
