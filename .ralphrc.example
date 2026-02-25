@@ -44,6 +44,19 @@
 # RALPH_RULES_FILE=".ralph-rules.md"
 
 # ---------------------------------------------------------------------------
+# ralph-plan — plan refinement pipeline
+# ---------------------------------------------------------------------------
+# PLAN_REVIEW_ITERATIONS=5
+# PLAN_REVIEW_MODEL=""                     # override for all critic/integration/final passes
+# PLAN_REVIEW_OUTPUT="PLAN-REFINED.md"
+# PLAN_REVIEW_QUESTIONS="PLAN-QUESTIONS.md"
+# PLAN_REVIEW_LOG_DIR=".ralph-logs/plan-review"
+# PLAN_REVIEW_MAX_RETRIES=3
+# PLAN_REVIEW_SPARRING_CMD=""              # single command; use CLI flag for multiple
+# PLAN_REVIEW_SPARRING_ITERATIONS=1
+# PLAN_REVIEW_SPARRING_TIMEOUT=300         # seconds
+
+# ---------------------------------------------------------------------------
 # Conditional example — different settings per environment
 # ---------------------------------------------------------------------------
 # if [[ -n "$CI" ]]; then

@@ -1,0 +1,570 @@
+#!/usr/bin/env bash
+# ralph-plan — Self-healing plan refinement loop
+#
+# Runs N fresh Claude Code sessions that each find problems AND fix them
+# in the plan, progressively hardening it. Only genuinely ambiguous decisions
+# get surfaced at the end.
+#
+# Three-phase pipeline:
+#   1. Critic-patch loop — N sequential passes, each through a different lens
+#   2. Sparring phase (optional) — external models critique; Claude integrates
+#   3. Final polish — one pass to fix contradictions, clean up questions
+#
+# Usage: ./ralph-plan [options] [PLAN_FILE]
+#   PLAN_FILE                Path to plan document (default: PLAN.md)
+#   --iterations N           Number of critic passes (default: 5)
+#   --model MODEL            Override Claude model (default: claude-opus-4-6)
+#   --output FILE            Refined plan output (default: PLAN-REFINED.md)
+#   --questions FILE         Open questions output (default: PLAN-QUESTIONS.md)
+#   --context FILE           Additional context files (repeatable)
+#   --sparring-cmd CMD       External model CLI for sparring (repeatable)
+#   --sparring-iterations N  Passes per sparring partner (default: 1)
+#   --log-dir DIR            Log directory (default: .ralph-logs/plan-review)
+#   --lenses L1,L2,...       Override default lens list
+#   --resume-from N          Skip passes 1..N-1, resume from pass N
+#   --no-codebase            Skip codebase access (plan-only review)
+#   -h, --help               Show usage
+#
+# Requires: claude (Claude Code CLI), jq, envsubst
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROMPTS_DIR="${PROMPTS_DIR:-$SCRIPT_DIR/prompts}"
+
+# ---------------------------------------------------------------------------
+# Shared utilities (from ralph-bd)
+# ---------------------------------------------------------------------------
+
+# Colors
+C_RESET='\033[0m'
+C_BOLD='\033[1m'
+C_DIM='\033[2m'
+C_CYAN='\033[36m'
+C_GREEN='\033[32m'
+C_YELLOW='\033[33m'
+C_MAGENTA='\033[35m'
+C_BLUE='\033[34m'
+C_RED='\033[31m'
+C_WHITE='\033[97m'
+
+ts()         { printf '%s' "$(date '+%Y-%m-%d %H:%M:%S')"; }
+log()        { echo -e "${C_DIM}[$(ts)]${C_RESET} $*"; }
+phase()      { echo -e "\n${C_BOLD}${1}--- ${2} ---${C_RESET}"; }
+divider()    { echo -e "${C_DIM}$(printf '%.0s─' {1..65})${C_RESET}"; }
+
+# render_prompt <template_file> [VAR1 VAR2 ...]
+render_prompt() {
+  local template="$1"; shift
+  [[ -f "$template" ]] || { echo "Missing prompt template: $template" >&2; return 1; }
+
+  local content
+  content=$(<"$template")
+
+  while [[ "$content" =~ \{\{#IF\ ([A-Z_]+)\}\} ]]; do
+    local var_name="${BASH_REMATCH[1]}"
+    local var_val="${!var_name:-}"
+    if [[ -n "$var_val" ]]; then
+      content=$(echo "$content" | sed "/{{#IF ${var_name}}}/d; /{{\/IF ${var_name}}}/d")
+    else
+      content=$(echo "$content" | sed "/{{#IF ${var_name}}}/,/{{\/IF ${var_name}}}/d")
+    fi
+  done
+
+  local varlist=""
+  for v in "$@"; do varlist="$varlist \${$v}"; done
+
+  echo "$content" | envsubst "$varlist"
+}
+
+# Stream filter — extracts readable progress from stream-json output
+ralph_stream_filter() {
+  jq --unbuffered -r '
+    if .type == "assistant" then
+      [.message.content[]? |
+        if .type == "text" then .text
+        elif .type == "tool_use" then
+          (.input // {}) as $in |
+          (.name as $n |
+            if   $n == "Bash"   then $in.command // ""
+            elif $n == "Edit"   then $in.file_path // ""
+            elif $n == "Read"   then $in.file_path // ""
+            elif $n == "Write"  then $in.file_path // ""
+            elif $n == "Grep"   then ($in.pattern // "") + " " + ($in.path // "")
+            elif $n == "Glob"   then $in.pattern // ""
+            else "" end
+          ) as $detail |
+          "\u001b[36m>>> " + .name + "\u001b[2m " + ($detail | .[0:120]) + "\u001b[0m"
+        else empty end
+      ] | join("\n") | select(length > 0)
+    elif .type == "result" then
+      "\u001b[2m--- " + .subtype + " | " + (.duration_ms | tostring) + "ms | $" + (.total_cost_usd | tostring) + " ---\u001b[0m"
+    else empty end
+  ' 2>/dev/null
+}
+
+# Cost tracking
+declare -A AGENT_COSTS
+extract_cost() {
+  local agent_type="$1" log_file="$2"
+  local cost
+  cost=$(jq -r 'select(.type == "result") | .total_cost_usd // 0' "$log_file" 2>/dev/null | tail -1)
+  if [[ -n "$cost" && "$cost" != "0" && "$cost" != "null" ]]; then
+    AGENT_COSTS[$agent_type]=$(echo "${AGENT_COSTS[$agent_type]:-0} + $cost" | bc 2>/dev/null || echo "${AGENT_COSTS[$agent_type]:-0}")
+  fi
+}
+
+# Run claude with a specific model: claude_as <model> [extra-args...]
+claude_as() {
+  local model="$1"; shift
+  claude "${claude_flags[@]}" --model "$model" "$@"
+}
+
+# ---------------------------------------------------------------------------
+# Default lenses
+# ---------------------------------------------------------------------------
+declare -A LENS_INSTRUCTIONS
+LENS_INSTRUCTIONS[feasibility]="Can this be built as described? Look for technical impossibilities, unrealistic estimates, missing prerequisites, and dependencies that don't exist."
+LENS_INSTRUCTIONS[gaps-and-edge-cases]="What's missing? Look for unhandled error cases, race conditions, partial failures, unhandled workflows, missing validation, and implicit assumptions."
+LENS_INSTRUCTIONS[security-and-risk]="Look for injection vectors, secrets handling issues, auth gaps, blast radius concerns, supply chain risks, and insufficient input validation."
+LENS_INSTRUCTIONS[maintainability]="Evaluate testability, abstraction quality, coupling, observability, and future-proofing. Look for code that will be hard to debug, extend, or operate."
+LENS_INSTRUCTIONS[scope-and-priorities]="Is the scope bounded? Separate MVP from nice-to-have. Look for contradictions, premature decisions, gold-plating, and features that should be deferred."
+
+DEFAULT_LENSES=(feasibility gaps-and-edge-cases security-and-risk maintainability scope-and-priorities)
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+# Source per-project config first (CLI flags override)
+if [[ -f ".ralphrc" ]]; then
+  # shellcheck source=/dev/null
+  source ".ralphrc"
+fi
+
+# Defaults — .ralphrc values take precedence via PLAN_REVIEW_* vars
+PLAN_FILE=""
+ITERATIONS="${PLAN_REVIEW_ITERATIONS:-5}"
+REVIEW_MODEL=""
+OUTPUT_FILE="${PLAN_REVIEW_OUTPUT:-PLAN-REFINED.md}"
+QUESTIONS_FILE="${PLAN_REVIEW_QUESTIONS:-PLAN-QUESTIONS.md}"
+LOG_DIR="${PLAN_REVIEW_LOG_DIR:-.ralph-logs/plan-review}"
+MAX_RETRIES="${PLAN_REVIEW_MAX_RETRIES:-3}"
+SPARRING_CMDS=()
+SPARRING_ITERATIONS="${PLAN_REVIEW_SPARRING_ITERATIONS:-1}"
+SPARRING_TIMEOUT="${PLAN_REVIEW_SPARRING_TIMEOUT:-300}"
+CONTEXT_FILES=()
+CUSTOM_LENSES=""
+RESUME_FROM=""
+NO_CODEBASE_FLAG=false
+
+# Pick up single sparring cmd from .ralphrc if set
+if [[ -n "${PLAN_REVIEW_SPARRING_CMD:-}" ]]; then
+  SPARRING_CMDS+=("$PLAN_REVIEW_SPARRING_CMD")
+fi
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --iterations)          ITERATIONS="$2"; shift 2 ;;
+    --model)               REVIEW_MODEL="$2"; shift 2 ;;
+    --output)              OUTPUT_FILE="$2"; shift 2 ;;
+    --questions)           QUESTIONS_FILE="$2"; shift 2 ;;
+    --context)             CONTEXT_FILES+=("$2"); shift 2 ;;
+    --sparring-cmd)        SPARRING_CMDS+=("$2"); shift 2 ;;
+    --sparring-iterations) SPARRING_ITERATIONS="$2"; shift 2 ;;
+    --log-dir)             LOG_DIR="$2"; shift 2 ;;
+    --lenses)              CUSTOM_LENSES="$2"; shift 2 ;;
+    --resume-from)         RESUME_FROM="$2"; shift 2 ;;
+    --no-codebase)         NO_CODEBASE_FLAG=true; shift ;;
+    -h|--help)             sed -n '/^# Usage/,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    -*)                    echo "Unknown option: $1" >&2; exit 1 ;;
+    *)
+      # Positional arg = plan file
+      if [[ -z "$PLAN_FILE" ]]; then
+        PLAN_FILE="$1"
+      else
+        echo "Unexpected argument: $1" >&2; exit 1
+      fi
+      shift ;;
+  esac
+done
+
+# Default plan file
+PLAN_FILE="${PLAN_FILE:-PLAN.md}"
+
+# Resolve model
+REVIEW_MODEL="${REVIEW_MODEL:-${PLAN_REVIEW_MODEL:-claude-opus-4-6}}"
+
+# Common claude flags
+claude_flags=(--print --dangerously-skip-permissions)
+
+# ---------------------------------------------------------------------------
+# Build lens list
+# ---------------------------------------------------------------------------
+LENSES=()
+if [[ -n "$CUSTOM_LENSES" ]]; then
+  IFS=',' read -ra LENSES <<< "$CUSTOM_LENSES"
+  for lens in "${LENSES[@]}"; do
+    if [[ -z "${LENS_INSTRUCTIONS[$lens]:-}" ]]; then
+      LENS_INSTRUCTIONS[$lens]="Focus on ${lens}. Identify issues, gaps, and risks related to ${lens} in the plan."
+      log "Custom lens '$lens' — using generic instructions."
+    fi
+  done
+else
+  LENSES=("${DEFAULT_LENSES[@]}")
+fi
+
+# ---------------------------------------------------------------------------
+# Preflight
+# ---------------------------------------------------------------------------
+for cmd in claude jq envsubst; do
+  command -v "$cmd" >/dev/null 2>&1 || { echo "Required: $cmd" >&2; exit 1; }
+done
+
+if [[ ! -f "$PLAN_FILE" ]]; then
+  echo "Plan file not found: $PLAN_FILE" >&2; exit 1
+fi
+
+# Validate context files
+for f in "${CONTEXT_FILES[@]}"; do
+  [[ -f "$f" ]] || { echo "Context file not found: $f" >&2; exit 1; }
+done
+
+# Resume validation
+if [[ -n "$RESUME_FROM" ]]; then
+  if [[ ! -f "$OUTPUT_FILE" ]]; then
+    echo "Cannot --resume-from $RESUME_FROM: $OUTPUT_FILE does not exist." >&2; exit 1
+  fi
+  if [[ ! -f "$QUESTIONS_FILE" ]]; then
+    echo "Cannot --resume-from $RESUME_FROM: $QUESTIONS_FILE does not exist." >&2; exit 1
+  fi
+  log "${C_YELLOW}Resuming from pass $RESUME_FROM — skipping passes 1..$((RESUME_FROM - 1)).${C_RESET}"
+fi
+
+mkdir -p "$LOG_DIR"
+
+# ---------------------------------------------------------------------------
+# Startup banner
+# ---------------------------------------------------------------------------
+echo ""
+phase "$C_CYAN" "ralph-plan — Plan Refinement Pipeline"
+log "Plan:       $PLAN_FILE"
+log "Output:     $OUTPUT_FILE"
+log "Questions:  $QUESTIONS_FILE"
+log "Model:      $REVIEW_MODEL"
+log "Iterations: $ITERATIONS"
+log "Lenses:     ${LENSES[*]}"
+[[ ${#SPARRING_CMDS[@]} -gt 0 ]] && log "Sparring:   ${#SPARRING_CMDS[@]} partner(s), $SPARRING_ITERATIONS iteration(s) each"
+[[ ${#CONTEXT_FILES[@]} -gt 0 ]] && log "Context:    ${CONTEXT_FILES[*]}"
+[[ "$NO_CODEBASE_FLAG" == true ]] && log "Codebase:   disabled (--no-codebase)"
+[[ -n "$RESUME_FROM" ]] && log "Resume:     from pass $RESUME_FROM"
+divider
+
+# ---------------------------------------------------------------------------
+# extract_sparring_name — derive a short name from a sparring command
+# ---------------------------------------------------------------------------
+extract_sparring_name() {
+  local cmd="$1" index="$2"
+  local name=""
+
+  # Try --model <X>
+  if [[ "$cmd" =~ --model[[:space:]]+([^[:space:]]+) ]]; then
+    name="${BASH_REMATCH[1]}"
+  else
+    # Last whitespace-delimited token
+    name="${cmd##* }"
+  fi
+
+  # Slugify: lowercase, strip special chars, max 30 chars
+  name=$(echo "$name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9.-]/-/g; s/--*/-/g; s/^-//; s/-$//' | cut -c1-30)
+
+  # Fallback
+  if [[ -z "$name" ]]; then
+    name="sparring-$index"
+  fi
+
+  echo "$name"
+}
+
+# =========================================================================
+# Phase 1: Critic-Patch Loop
+# =========================================================================
+phase "$C_BLUE" "PHASE 1: Critic-Patch Loop ($ITERATIONS passes)"
+
+# Setup
+if [[ -z "$RESUME_FROM" ]]; then
+  cp "$PLAN_FILE" "$OUTPUT_FILE"
+  : > "$QUESTIONS_FILE"
+fi
+
+start_pass=${RESUME_FROM:-1}
+total_passes=0
+
+for (( i=start_pass; i<=ITERATIONS; i++ )); do
+  # Round-robin lens selection
+  lens_index=$(( (i - 1) % ${#LENSES[@]} ))
+  lens="${LENSES[$lens_index]}"
+
+  echo ""
+  log "${C_BOLD}Pass $i/$ITERATIONS — lens: ${lens}${C_RESET}"
+
+  # --- Snapshot before this pass ---
+  cp "$OUTPUT_FILE" "$LOG_DIR/snapshot-before-pass-${i}.md"
+
+  # --- Build prompt ---
+  prior_questions=$(<"$QUESTIONS_FILE")
+
+  extra_context=""
+  for f in "${CONTEXT_FILES[@]}"; do
+    extra_context+="### $(basename "$f")
+$(<"$f")
+
+"
+  done
+
+  prompt_file=$(mktemp /tmp/ralph-plan-prompt.XXXXXX)
+  (
+    export REFINED_FILE="$(realpath "$OUTPUT_FILE")"
+    export QUESTIONS_FILE="$(realpath "$QUESTIONS_FILE")"
+    export LENS_NAME="$lens"
+    export LENS_INSTRUCTIONS="${LENS_INSTRUCTIONS[$lens]}"
+    export PRIOR_QUESTIONS="$prior_questions"
+    export EXTRA_CONTEXT="$extra_context"
+    export ITERATION_NUM="$i"
+    export TOTAL_ITERATIONS="$ITERATIONS"
+    export CODEBASE_ACCESS="" NO_CODEBASE=""
+    [[ "$NO_CODEBASE_FLAG" != true ]] && CODEBASE_ACCESS="yes"
+    [[ "$NO_CODEBASE_FLAG" == true ]] && NO_CODEBASE="yes"
+    render_prompt "$PROMPTS_DIR/plan-critic.md" \
+      REFINED_FILE QUESTIONS_FILE LENS_NAME LENS_INSTRUCTIONS \
+      PRIOR_QUESTIONS EXTRA_CONTEXT ITERATION_NUM TOTAL_ITERATIONS \
+      CODEBASE_ACCESS NO_CODEBASE
+  ) > "$prompt_file"
+
+  # --- Run critic (with retry) ---
+  log_file="$LOG_DIR/pass-${i}-${lens}.log"
+  retries=0; success=false
+
+  while [[ $retries -lt $MAX_RETRIES ]]; do
+    # Restore snapshot before retry (undo partial edits from failed attempt)
+    [[ $retries -gt 0 ]] && cp "$LOG_DIR/snapshot-before-pass-${i}.md" "$OUTPUT_FILE"
+
+    phase "$C_BLUE" "CRITIC pass $i — $lens (attempt $((retries + 1))/$MAX_RETRIES)"
+
+    claude_as "$REVIEW_MODEL" --output-format stream-json --verbose \
+      < "$prompt_file" 2>&1 \
+      | tee "$log_file" \
+      | ralph_stream_filter || true
+
+    extract_cost "pass-$i-$lens" "$log_file"
+
+    if jq -e 'select(.type == "result" and .subtype == "success")' "$log_file" > /dev/null 2>&1; then
+      success=true; break
+    fi
+
+    retries=$((retries + 1))
+    [[ $retries -lt $MAX_RETRIES ]] && log "  Retry in 5s..." && sleep 5
+  done
+
+  rm -f "$prompt_file"
+
+  if [[ "$success" == false ]]; then
+    cp "$LOG_DIR/snapshot-before-pass-${i}.md" "$OUTPUT_FILE"
+    log "  ${C_RED}Pass $i ($lens) failed after $MAX_RETRIES attempts. Skipping.${C_RESET}"
+    continue
+  fi
+
+  # --- Corruption guard ---
+  line_count_before=$(wc -l < "$LOG_DIR/snapshot-before-pass-${i}.md")
+  line_count_after=$(wc -l < "$OUTPUT_FILE")
+  threshold=$(( line_count_before * 70 / 100 ))
+  if [[ $line_count_after -lt $threshold ]]; then
+    log "  ${C_RED}Plan shrank from $line_count_before to $line_count_after lines — reverting pass $i.${C_RESET}"
+    cp "$LOG_DIR/snapshot-before-pass-${i}.md" "$OUTPUT_FILE"
+    continue
+  fi
+
+  # --- Snapshot after successful pass ---
+  cp "$OUTPUT_FILE" "$LOG_DIR/snapshot-after-pass-${i}.md"
+  total_passes=$((total_passes + 1))
+
+  # --- Log what changed ---
+  changes=$(diff "$LOG_DIR/snapshot-before-pass-${i}.md" "$LOG_DIR/snapshot-after-pass-${i}.md" | head -20 || true)
+  if [[ -n "$changes" ]]; then
+    log "  ${C_GREEN}Plan edited.${C_RESET} Diff in $LOG_DIR/snapshot-before-pass-${i}.md vs after."
+  else
+    log "  ${C_DIM}No plan edits this pass.${C_RESET}"
+  fi
+done
+
+# =========================================================================
+# Phase 2: External Sparring (optional)
+# =========================================================================
+if [[ ${#SPARRING_CMDS[@]} -gt 0 ]]; then
+  echo ""
+  phase "$C_MAGENTA" "PHASE 2: External Sparring (${#SPARRING_CMDS[@]} partner(s))"
+
+  sparring_index=0
+  for sparring_cmd in "${SPARRING_CMDS[@]}"; do
+    sparring_index=$((sparring_index + 1))
+    sparring_name=$(extract_sparring_name "$sparring_cmd" "$sparring_index")
+
+    log "Sparring partner $sparring_index: ${C_CYAN}$sparring_name${C_RESET} ($sparring_cmd)"
+
+    # Preflight: verify command exists
+    base_cmd=$(echo "$sparring_cmd" | awk '{print $1}')
+    if ! command -v "$base_cmd" >/dev/null 2>&1; then
+      log "  ${C_RED}Command not found: $base_cmd. Skipping partner.${C_RESET}"
+      continue
+    fi
+
+    for (( j=1; j<=SPARRING_ITERATIONS; j++ )); do
+      echo ""
+      log "  ${C_BOLD}Sparring round $j/$SPARRING_ITERATIONS — $sparring_name${C_RESET}"
+
+      # --- Snapshot before sparring ---
+      cp "$OUTPUT_FILE" "$LOG_DIR/snapshot-before-sparring-${sparring_index}-${j}.md"
+
+      # --- Run external model (with timeout) ---
+      plan_content=$(<"$OUTPUT_FILE")
+      sparring_log="$LOG_DIR/sparring-${sparring_index}-${sparring_name}-${j}.log"
+
+      sparring_failed=false
+      (
+        export PLAN_CONTENT="$plan_content"
+        render_prompt "$PROMPTS_DIR/plan-sparring.md" PLAN_CONTENT
+      ) | timeout "${SPARRING_TIMEOUT}" $sparring_cmd \
+        > "$sparring_log" 2>&1 || {
+          exit_code=$?
+          if [[ $exit_code -eq 124 ]]; then
+            log "  ${C_RED}Sparring partner timed out (${SPARRING_TIMEOUT}s). Skipping.${C_RESET}"
+          else
+            log "  ${C_RED}Sparring partner exited $exit_code. Skipping.${C_RESET}"
+          fi
+          sparring_failed=true
+        }
+
+      if [[ "$sparring_failed" == true ]]; then
+        continue
+      fi
+
+      # --- Validate output ---
+      sparring_output=$(<"$sparring_log")
+      sparring_bytes=${#sparring_output}
+
+      if [[ $sparring_bytes -eq 0 ]]; then
+        log "  ${C_DIM}Empty response from $sparring_name. Skipping integration.${C_RESET}"
+        continue
+      fi
+
+      # Truncate if over 50k chars
+      if [[ $sparring_bytes -gt 50000 ]]; then
+        log "  ${C_YELLOW}Truncating $sparring_name output from $sparring_bytes to 50000 chars.${C_RESET}"
+        sparring_output="${sparring_output:0:50000}
+
+[... truncated at 50000 chars ...]"
+      fi
+
+      # --- Claude integration pass (with retry) ---
+      log "  Integrating feedback..."
+      integrate_log="$LOG_DIR/integrate-${sparring_index}-${sparring_name}-${j}.log"
+      int_retries=0; int_success=false
+
+      while [[ $int_retries -lt $MAX_RETRIES ]]; do
+        # Restore snapshot before retry
+        [[ $int_retries -gt 0 ]] && cp "$LOG_DIR/snapshot-before-sparring-${sparring_index}-${j}.md" "$OUTPUT_FILE"
+
+        claude_as "$REVIEW_MODEL" --output-format stream-json --verbose -p "$(
+          export SPARRING_FEEDBACK="$sparring_output"
+          export SPARRING_SOURCE="$sparring_name"
+          export REFINED_FILE="$(realpath "$OUTPUT_FILE")"
+          export QUESTIONS_FILE="$(realpath "$QUESTIONS_FILE")"
+          render_prompt "$PROMPTS_DIR/plan-integrate.md" \
+            SPARRING_FEEDBACK SPARRING_SOURCE REFINED_FILE QUESTIONS_FILE
+        )" 2>&1 | tee "$integrate_log" | ralph_stream_filter || true
+
+        extract_cost "integrate-$sparring_name" "$integrate_log"
+
+        if jq -e 'select(.type == "result" and .subtype == "success")' "$integrate_log" > /dev/null 2>&1; then
+          int_success=true; break
+        fi
+
+        int_retries=$((int_retries + 1))
+        [[ $int_retries -lt $MAX_RETRIES ]] && log "  Retry in 5s..." && sleep 5
+      done
+
+      if [[ "$int_success" == false ]]; then
+        cp "$LOG_DIR/snapshot-before-sparring-${sparring_index}-${j}.md" "$OUTPUT_FILE"
+        log "  ${C_RED}Integration failed after $MAX_RETRIES attempts. Skipping.${C_RESET}"
+        continue
+      fi
+
+      total_passes=$((total_passes + 1))
+
+      # --- Corruption guard ---
+      line_count_before=$(wc -l < "$LOG_DIR/snapshot-before-sparring-${sparring_index}-${j}.md")
+      line_count_after=$(wc -l < "$OUTPUT_FILE")
+      threshold=$(( line_count_before * 70 / 100 ))
+      if [[ $line_count_after -lt $threshold ]]; then
+        log "  ${C_RED}Plan shrank — reverting sparring integration.${C_RESET}"
+        cp "$LOG_DIR/snapshot-before-sparring-${sparring_index}-${j}.md" "$OUTPUT_FILE"
+      fi
+    done
+  done
+fi
+
+# =========================================================================
+# Phase 3: Final Polish
+# =========================================================================
+echo ""
+phase "$C_GREEN" "PHASE 3: Final Polish"
+
+final_log="$LOG_DIR/final-polish.log"
+
+claude_as "$REVIEW_MODEL" --output-format stream-json --verbose -p "$(
+  export REFINED_FILE="$(realpath "$OUTPUT_FILE")"
+  export QUESTIONS_FILE="$(realpath "$QUESTIONS_FILE")"
+  export TOTAL_PASSES="$total_passes"
+  render_prompt "$PROMPTS_DIR/plan-final.md" \
+    REFINED_FILE QUESTIONS_FILE TOTAL_PASSES
+)" 2>&1 | tee "$final_log" | ralph_stream_filter || true
+
+extract_cost "final-polish" "$final_log"
+
+# =========================================================================
+# Summary
+# =========================================================================
+echo ""
+divider
+log "${C_GREEN}${C_BOLD}Plan refinement complete.${C_RESET}"
+log "  Refined plan: $OUTPUT_FILE"
+log "  Open questions: $QUESTIONS_FILE"
+log "  Logs: $LOG_DIR/"
+
+# Question count
+if [[ -s "$QUESTIONS_FILE" ]]; then
+  q_count=$(grep -c '^Q:' "$QUESTIONS_FILE" 2>/dev/null || echo "0")
+  log "  ${C_YELLOW}$q_count open question(s) for human review.${C_RESET}"
+else
+  log "  ${C_GREEN}No open questions.${C_RESET}"
+fi
+
+# ---------------------------------------------------------------------------
+# Cost report
+# ---------------------------------------------------------------------------
+if [[ "${AGENT_COSTS[@]+x}" ]]; then
+  echo ""
+  log "Cost breakdown:"
+  total=0
+  for agent_type in "${!AGENT_COSTS[@]}"; do
+    cost="${AGENT_COSTS[$agent_type]}"
+    printf "  %-30s \$%s\n" "$agent_type" "$cost"
+    total=$(echo "$total + $cost" | bc 2>/dev/null || echo "$total")
+  done
+  printf "  %-30s \$%s\n" "TOTAL" "$total"
+fi
+
+divider
