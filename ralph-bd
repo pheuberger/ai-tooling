@@ -190,6 +190,24 @@ if [[ -n "$untracked" ]]; then
 fi
 
 mkdir -p "$LOG_DIR"
+
+# Warn if stale logs exist from a previous run
+existing=()
+for f in "$LOG_DIR"/iter-* "$LOG_DIR"/final-review-*; do
+  [[ -f "$f" ]] && existing+=("$f")
+done
+
+if [[ ${#existing[@]} -gt 0 ]]; then
+  log "${C_YELLOW}Found ${#existing[@]} log file(s) from a previous run in $LOG_DIR${C_RESET}"
+  read -r -p "  Clear old logs before starting? [Y/n] " answer </dev/tty
+  if [[ "${answer:-Y}" =~ ^[Yy]$ ]]; then
+    rm -f "${existing[@]}"
+    log "Cleared old logs."
+  else
+    log "Keeping old logs — summary will include results from prior run(s)."
+  fi
+fi
+
 : > "$SKIP_FILE"
 
 # Stream filter — extracts readable progress from stream-json output
