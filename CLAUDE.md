@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-Single-file bash tool (`ralph-bd`). Autonomous coding loop: spawns a fresh headless Claude Code instance per [beads](https://github.com/snarktank/beads) task, with a separate commit agent after each. Based on the [Ralph Loop](https://github.com/snarktank/ralph) pattern.
+Single-file bash tool (`ralph-bd`). Autonomous coding loop: spawns a fresh headless Claude Code instance per [beads](https://github.com/steveyegge/beads) task, with a separate commit agent after each. Based on the [Ralph Loop](https://github.com/snarktank/ralph) pattern.
 
 Runtime deps: `claude`, `bd`, `jq`, `git`
 
