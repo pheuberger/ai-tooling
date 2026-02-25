@@ -62,7 +62,25 @@ If any results are returned, choose a different label (e.g., append a version: `
 
 ### 6. Create Beads
 
-For each approved bead, run `bd create` with a full description following the template below. **Every bead must** carry the feature label: `--labels <feature-slug>`
+For each approved bead, create it using `--body-file -` to pipe the multi-line description. **Every bead must** carry the feature label.
+
+**Do NOT heredoc into `bd create` directly — it does not read stdin without `--body-file -`.**
+
+```bash
+cat << 'BEAD_EOF' | bd create "Bead title" --type task --priority 2 --labels <feature-slug> --body-file -
+## Context
+...
+
+## Task
+...
+
+## Files
+...
+
+## Acceptance Criteria
+...
+BEAD_EOF
+```
 
 Then set dependencies with `bd dep add`.
 

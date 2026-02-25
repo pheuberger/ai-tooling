@@ -105,13 +105,34 @@ Every enriched bead must have these sections:
 ## Commands
 
 ```bash
-bd ready              # List open, unblocked beads
-bd show <id>          # View bead details
-bd update <id>        # Update bead description
-bd delete <id> --force  # Delete a bead (auto-removes dependency links)
-bd dep                # Visualize dependency graph
-bd dep add <a> <b>    # a depends on b
-bd dep rm <a> <b>     # Remove dependency
+bd ready                          # List open, unblocked beads
+bd show <id>                      # View bead details
+bd delete <id> --force            # Delete a bead (auto-removes dependency links)
+bd dep                            # Visualize dependency graph
+bd dep add <a> <b>                # a depends on b
+bd dep rm <a> <b>                 # Remove dependency
+```
+
+### Updating Beads
+
+Use `--body-file -` to pipe multi-line descriptions. **Do NOT heredoc into `bd update` directly — it does not read stdin without this flag.**
+
+```bash
+cat << 'BEAD_EOF' | bd update <id> --body-file -
+## Context
+...
+
+## Task
+...
+BEAD_EOF
+```
+
+For short field updates, use flags directly:
+
+```bash
+bd update <id> --title "New title"
+bd update <id> --acceptance "New acceptance criteria"
+bd update <id> --add-label <feature-slug>
 ```
 
 ## Output
