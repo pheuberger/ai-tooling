@@ -10,9 +10,9 @@ You are taking an approved implementation plan and decomposing it into beads (bd
 
 ### 1. Find the Active Plan
 
-Look for the most recent plan file in `.claude/plans/`. Read it thoroughly.
+Look for `PLAN-REFINED.md` first (output of `ralph-plan`), then fall back to `PLAN.md`. If the user provided a specific file as an argument, use that instead. Read it thoroughly.
 
-If no plan file exists, ask the user to provide one or run `/start-issue` first.
+If no plan file exists, ask the user to provide one or run `/create-plan` first.
 
 ### 2. Explore the Codebase
 

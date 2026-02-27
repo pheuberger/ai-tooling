@@ -8,7 +8,7 @@ Quality gate: a bead passes only if ANY agent can implement it WITHOUT reading o
 
 ## Workflow
 
-1. **Gather** — Read plan from `.claude/plans/`. Identify the feature label (ask user if unclear). List beads: `bd list --label <label> --status open`. Verify all carry the label; fix with `bd update <id> --add-label <label>`.
+1. **Gather** — Read plan: prefer `PLAN-REFINED.md`, fall back to `PLAN.md` (or whatever the user provided as an argument). Identify the feature label (ask user if unclear). List beads: `bd list --label <label> --status open`. Verify all carry the label; fix with `bd update <id> --add-label <label>`.
 2. **Audit** — Review each bead (dependency order: unblocked first) against quality criteria below.
 3. **Split** — Decompose oversized beads per Split Protocol.
 4. **Enrich** — Read actual source files, add missing code snippets inline.

@@ -159,14 +159,8 @@ Once aligned on approach:
 
 After structure approval:
 
-1. **Write the plan** to `.claude/plans/YYYY-MM-DD-description.md`
-   - Format: `YYYY-MM-DD-description.md` where:
-     - YYYY-MM-DD is today's date
-     - description is a brief kebab-case description
-     - Include a ticket identifier in the name if one exists
-   - Examples:
-     - With ticket: `2025-01-08-MA-1478-parent-child-tracking.md`
-     - Without ticket: `2025-01-08-improve-error-handling.md`
+1. **Write the plan** to `PLAN.md` in the project root.
+   This is the standard location that `ralph-plan` and `ralph-bd --from-plan` expect.
 
 2. **Use this template structure**:
 
@@ -270,14 +264,15 @@ After structure approval:
 
 1. **Present the draft plan location**:
    ```
-   I've created the initial implementation plan at:
-   `.claude/plans/YYYY-MM-DD-description.md`
+   I've created the initial implementation plan at PLAN.md.
 
    Please review it and let me know:
    - Are the phases properly scoped?
    - Are the success criteria specific enough?
    - Any technical details that need adjustment?
    - Missing edge cases or considerations?
+
+   Next step: run `./ralph-plan` to refine the plan through multiple critic passes.
    ```
 
 2. **Iterate based on feedback** - be ready to:

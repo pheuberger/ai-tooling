@@ -62,7 +62,7 @@ This is the core of the command. Read the Linear issue description as a spec and
 
 ### 5. Write the Plan
 
-Once the user is satisfied with the questioning, synthesize everything into a plan file:
+Once the user is satisfied with the questioning, synthesize everything into `PLAN.md` in the project root:
 - The original spec from Linear
 - All clarifications from the questioning phase
 - Proposed approach
@@ -81,7 +81,9 @@ If Linear has no branch name set, **ask the user** — do not generate one.
 
 Call `ExitPlanMode` for the user to approve the plan.
 
-After approval, suggest running `/plan-to-beads` to decompose the plan into trackable implementation tasks.
+After approval, suggest the next steps:
+1. Run `./ralph-plan` to refine `PLAN.md` through multiple critic passes (produces `PLAN-REFINED.md`)
+2. Run `/plan-to-beads` to decompose the refined plan into trackable implementation tasks
 
 ## Rules
 

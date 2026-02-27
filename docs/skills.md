@@ -37,7 +37,7 @@ Skills are invoked in Claude Code with `/skill-name` (e.g. `/create-plan`). They
 |-------|-------------|
 | `/start-issue` | Beginning work on a Linear issue. Fetches the spec, marks it in progress, checks out the branch, and runs an interactive questioning phase to refine requirements before any code is written. |
 | `/research-codebase` | You need to understand how something works before planning. Spawns parallel sub-agents to explore the codebase and produces a timestamped research document in `.claude/research/`. |
-| `/create-plan` | After research and requirements are clear. Interactive multi-step process: gathers context, asks questions, explores code, and writes a phased implementation plan to `.claude/plans/`. |
+| `/create-plan` | After research and requirements are clear. Interactive multi-step process: gathers context, asks questions, explores code, and writes a phased implementation plan to `PLAN.md` in the project root. |
 | `/plan-to-beads` | After a plan is approved. Decomposes it into granular, self-contained beads (bd issues) with file paths, code snippets, and acceptance criteria. Every bead gets a shared feature label. |
 | `/review-beads` | Quality gate before running ralph-bd. Audits beads for completeness, splits oversized ones, enriches vague descriptions with actual code from the codebase. |
 | `/create-issue` | Mid-session, you notice out-of-scope work. Captures it as a Linear issue with a quick refinement loop — keeps you focused on the current task. |
@@ -45,8 +45,9 @@ Skills are invoked in Claude Code with `/skill-name` (e.g. `/create-plan`). They
 ## Typical workflow
 
 ```
-/start-issue MA-123          # fetch spec, question requirements (untested, optional)
-/create-plan                  # write phased implementation plan
+/start-issue MA-123          # fetch spec, question requirements, write PLAN.md
+/create-plan                  # (alternative) write PLAN.md interactively
+./ralph-plan                  # refine PLAN.md → PLAN-REFINED.md
 /plan-to-beads                # decompose plan into bd tasks
 /review-beads                 # quality-check the beads
 ./ralph-bd --label feat-slug  # let ralph work them autonomously
