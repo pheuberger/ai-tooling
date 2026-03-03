@@ -1,2 +1,2 @@
 import { createApp } from './app.ts'
-await createApp()
+await createApp('.ralph-logs')
