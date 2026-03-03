@@ -2,6 +2,8 @@ import { createCliRenderer, BoxRenderable, TextRenderable, TextAttributes } from
 import { SIDEBAR_WIDTH } from './constants.ts'
 import { createContent } from './content.ts'
 import { createStatusBar } from './statusbar.ts'
+import { createSidebar } from './sidebar.ts'
+import type { LogFile } from './types.ts'
 
 export async function createApp() {
   const renderer = await createCliRenderer({ exitOnCtrlC: true })
@@ -22,7 +24,30 @@ export async function createApp() {
     borderStyle: 'single',
     border: true,
   })
-  sidebarBox.add(new TextRenderable(renderer, { content: 'Sidebar' }))
+
+  const testFiles: LogFile[] = [
+    {
+      path: 'a',
+      filename: 'a',
+      phase: 'plan',
+      agentType: 'lead',
+      format: 'stream-json',
+      groupKey: 'plan',
+      displayLabel: 'lead',
+    },
+    {
+      path: 'b',
+      filename: 'b',
+      phase: 'iteration',
+      agentType: 'worker',
+      format: 'stream-json',
+      groupKey: 'iter-1',
+      beadId: 'auth-1',
+      iterationNumber: 1,
+      displayLabel: 'auth-1 worker',
+    },
+  ]
+  const sidebar = createSidebar(sidebarBox, testFiles)
 
   const contentBox = new BoxRenderable(renderer, {
     flexGrow: 1,
@@ -75,5 +100,5 @@ export async function createApp() {
   rootBox.add(statusBarBox)
   renderer.root.add(rootBox)
 
-  return { renderer, sidebarBox, contentBox, statusBarBox, content }
+  return { renderer, sidebarBox, contentBox, statusBarBox, content, sidebar }
 }
