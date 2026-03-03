@@ -69,7 +69,20 @@ export async function createApp(logDir: string): Promise<void> {
   // Parse cache
   const cache = new Map<string, ParsedLog>()
 
+  // View state memory: scroll position + collapse states per file
+  type FileViewState = { scrollY: number; collapseStates: boolean[] }
+  const viewStates = new Map<string, FileViewState>()
+  let currentFilePath: string | null = null
+
   async function loadFile(file: LogFile) {
+    // Save current view state before switching away
+    if (currentFilePath !== null) {
+      viewStates.set(currentFilePath, {
+        scrollY: content.getScrollY(),
+        collapseStates: content.getCollapseStates(),
+      })
+    }
+
     let parsedLog = cache.get(file.path)
     if (!parsedLog) {
       if (file.format === 'stream-json') {
@@ -81,11 +94,43 @@ export async function createApp(logDir: string): Promise<void> {
     }
     content.loadBlocks(parsedLog.blocks)
     statusBar.update(file, parsedLog.metadata)
+
+    // Restore or reset view state
+    const savedState = viewStates.get(file.path)
+    if (savedState) {
+      content.setCollapseStates(savedState.collapseStates)
+      content.setScrollY(savedState.scrollY)
+    } else {
+      content.setScrollY(0)
+    }
+
+    currentFilePath = file.path
   }
 
   sidebar.setOnSelect((file) => {
     loadFile(file).catch(() => {})
   })
+
+  // Mark errored files in sidebar by reading last line of each stream-json file
+  async function markErrorFiles() {
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i]
+      if (file.format !== 'stream-json') continue
+      try {
+        const text = await Bun.file(file.path).text()
+        const lines = text.split('\n').filter((l: string) => l.trim())
+        if (lines.length === 0) continue
+        const lastLine = lines[lines.length - 1]
+        const parsed = JSON.parse(lastLine)
+        if (parsed && parsed.type === 'result' && parsed.subtype === 'error') {
+          sidebar.setFileError(i)
+        }
+      } catch {
+        // ignore unreadable or non-JSON files
+      }
+    }
+  }
+  markErrorFiles().catch(() => {})
 
   // Auto-select first file
   const firstFile = sidebar.getSelectedFile()

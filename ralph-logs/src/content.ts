@@ -304,6 +304,21 @@ export function createContent(parentBox: any) {
     scrollToBottom() {
       scrollBox.scrollTo(Number.MAX_SAFE_INTEGER)
     },
+    getScrollY(): number {
+      return scrollBox.scrollTop
+    },
+    setScrollY(y: number) {
+      scrollBox.scrollTo(y)
+    },
+    getCollapseStates(): boolean[] {
+      return collapsibleStates.map((s) => s.collapsed)
+    },
+    setCollapseStates(states: boolean[]) {
+      for (let i = 0; i < Math.min(states.length, collapsibleStates.length); i++) {
+        collapsibleStates[i].collapsed = states[i]
+      }
+      rerenderAllHeaders()
+    },
     clear() {
       clearChildren()
     },

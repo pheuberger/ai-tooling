@@ -13,8 +13,8 @@ function getGroupHeader(groupKey: string): string {
   return '── Other ──'
 }
 
-function truncateLabel(label: string): string {
-  const maxLen = SIDEBAR_WIDTH - 2
+function truncateLabel(label: string, prefixLen = 0): string {
+  const maxLen = SIDEBAR_WIDTH - 2 - prefixLen
   if (label.length > maxLen) {
     return label.slice(0, maxLen - 1) + '…'
   }
@@ -29,11 +29,13 @@ export function createSidebar(
   getSelectedIndex(): number
   moveSelection(delta: number): void
   setOnSelect(cb: (file: LogFile) => void): void
+  setFileError(fileIndex: number): void
 } {
   const ctx = parentBox.ctx
 
   let selectedIndex = files.length > 0 ? 0 : -1
   let onSelectCallback: ((file: LogFile) => void) | null = null
+  const erroredFiles = new Set<number>()
 
   // Build group structure (maintaining insertion order)
   const groupOrder: string[] = []
@@ -88,14 +90,32 @@ export function createSidebar(
       currentY++
 
       for (const file of groupFiles) {
-        const label = truncateLabel(file.displayLabel)
+        const isError = erroredFiles.has(flatFileIndex)
         const isSelected = flatFileIndex === selectedIndex
 
-        const fileText = new TextRenderable(ctx, {
-          content: label,
-          attributes: isSelected ? TextAttributes.INVERSE : 0,
-        })
-        scrollBox.add(fileText)
+        if (isError) {
+          const label = truncateLabel(file.displayLabel, 2)
+          const rowBox = new BoxRenderable(ctx, { flexDirection: 'row', width: '100%' })
+          const errorMark = new TextRenderable(ctx, {
+            content: '✗ ',
+            fg: '#ff0000',
+            attributes: isSelected ? TextAttributes.INVERSE : 0,
+          })
+          const labelText = new TextRenderable(ctx, {
+            content: label,
+            attributes: isSelected ? TextAttributes.INVERSE : 0,
+          })
+          rowBox.add(errorMark)
+          rowBox.add(labelText)
+          scrollBox.add(rowBox)
+        } else {
+          const label = truncateLabel(file.displayLabel)
+          const fileText = new TextRenderable(ctx, {
+            content: label,
+            attributes: isSelected ? TextAttributes.INVERSE : 0,
+          })
+          scrollBox.add(fileText)
+        }
 
         entryPositions[flatFileIndex] = currentY
         currentY++
@@ -129,6 +149,10 @@ export function createSidebar(
     },
     setOnSelect(cb: (file: LogFile) => void) {
       onSelectCallback = cb
+    },
+    setFileError(fileIndex: number) {
+      erroredFiles.add(fileIndex)
+      render()
     },
   }
 }
