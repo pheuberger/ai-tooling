@@ -56,12 +56,23 @@ C_RED='\033[31m'
 C_WHITE='\033[97m'
 
 ts()         { printf '%s' "$(date '+%Y-%m-%d %H:%M:%S')"; }
-log()        { echo -e "${C_DIM}[$(ts)]${C_RESET} $*"; }
-bd_sync()    { bd sync 2>/dev/null || true; }
+log_ts()     { echo -e "${C_DIM}[$(ts)]${C_RESET} $*"; }
+bd_sync()    { bd sync > /dev/null 2>&1 || true; }
 bead_field() { echo "$1" | jq -r ".[0].$2 // \"$3\""; }
-phase()      { echo -e "\n${C_BOLD}${1}--- ${2} ---${C_RESET}"; }
-divider()    { echo -e "${C_DIM}$(printf '%.0s─' {1..65})${C_RESET}"; }
 slugify()    { echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g; s/--*/-/g; s/^-//; s/-$//' | cut -c1-50; }
+
+# Output helpers — clean, scannable terminal output
+out()        { echo -e "  $1 $2"; }
+detail()     { echo -e "    ${C_DIM}$1${C_RESET}"; }
+section()    { echo -e "\n${C_BOLD}$1${C_RESET}"; }
+phase_hdr()  { echo -e "  ${1}●${C_RESET} ${C_BOLD}${2}${C_RESET}"; }
+
+fmt_duration() {
+  local secs=$((${1:-0} / 1000))
+  if [[ $secs -ge 60 ]]; then printf '%dm %ds' "$((secs/60))" "$((secs%60))"
+  else printf '%ds' "$secs"; fi
+}
+fmt_cost() { printf '%.2f' "${1:-0}"; }
 
 # render_prompt <template_file> [VAR1 VAR2 ...]
 # Reads a markdown template, processes {{#IF VAR}}/{{/IF VAR}} conditionals,
@@ -186,7 +197,7 @@ if [[ -n "$untracked" ]]; then
     mkdir -p "$STASH_DIR/$(dirname "$f")"
     mv "$f" "$STASH_DIR/$f"
   done
-  log "Shelved $(echo "$untracked" | wc -l | tr -d ' ') untracked file(s) to $STASH_DIR"
+  log_ts "Shelved $(echo "$untracked" | wc -l | tr -d ' ') untracked file(s)"
 fi
 
 mkdir -p "$LOG_DIR"
@@ -198,13 +209,13 @@ for f in "$LOG_DIR"/iter-* "$LOG_DIR"/final-review-*; do
 done
 
 if [[ ${#existing[@]} -gt 0 ]]; then
-  log "${C_YELLOW}Found ${#existing[@]} log file(s) from a previous run in $LOG_DIR${C_RESET}"
+  log_ts "${C_YELLOW}Found ${#existing[@]} log file(s) from a previous run${C_RESET}"
   read -r -p "  Clear old logs before starting? [Y/n] " answer </dev/tty
   if [[ "${answer:-Y}" =~ ^[Yy]$ ]]; then
     rm -f "${existing[@]}"
-    log "Cleared old logs."
+    detail "cleared"
   else
-    log "Keeping old logs — summary will include results from prior run(s)."
+    detail "keeping — summary will include prior run(s)"
   fi
 fi
 
@@ -215,8 +226,7 @@ ralph_stream_filter() {
   jq --unbuffered -r '
     if .type == "assistant" then
       [.message.content[]? |
-        if .type == "text" then .text
-        elif .type == "tool_use" then
+        if .type == "tool_use" then
           (.input // {}) as $in |
           (.name as $n |
             if   $n == "Bash"   then $in.command // ""
@@ -227,13 +237,23 @@ ralph_stream_filter() {
             elif $n == "Glob"   then $in.pattern // ""
             else "" end
           ) as $detail |
-          "\u001b[36m>>> " + .name + "\u001b[2m " + ($detail | .[0:120]) + "\u001b[0m"
+          "    \u001b[36m>>> " + .name + "\u001b[2m " + ($detail | .[0:120]) + "\u001b[0m"
         else empty end
       ] | join("\n") | select(length > 0)
-    elif .type == "result" then
-      "\u001b[2m--- " + .subtype + " | " + (.duration_ms | tostring) + "ms | $" + (.total_cost_usd | tostring) + " ---\u001b[0m"
     else empty end
   ' 2>/dev/null
+}
+
+# Extract titles of beads filed via `bd create` in a review log
+extract_filed_beads() {
+  jq -r 'select(.type == "assistant") | .message.content[]? | select(.type == "tool_use" and .name == "Bash") | .input.command // ""' "$1" 2>/dev/null \
+    | grep -oP 'bd create "\K[^"]+' \
+    | while IFS= read -r title; do detail "⎿ $title"; done
+}
+
+# Extract duration_ms and total_cost_usd from a stream-json log file
+extract_result() {
+  jq -r 'select(.type == "result") | "\(.duration_ms // 0) \(.total_cost_usd // 0)"' "$1" 2>/dev/null | tail -1
 }
 
 iteration=0
@@ -256,27 +276,29 @@ claude_as() {
   claude "${claude_flags[@]}" --model "$model" "$@"
 }
 
-log "Ralph Loop starting (max_iterations=$MAX_ITERATIONS, max_retries=$MAX_RETRIES)"
-log_opt() { [[ -n "${2:-}" ]] && log "  $1: $2" || true; }
-[[ -f ".ralphrc" ]]          && log "  Config: .ralphrc loaded"
-[[ -f "$RALPH_RULES_FILE" ]] && log "  Rules: $RALPH_RULES_FILE loaded"
-log_opt "Plan"            "$PLAN_FILE"
-log_opt "Beads"           "$BEAD_IDS"
-log_opt "Filter type"     "$FILTER_TYPE"
-log_opt "Filter priority" "${FILTER_PRIORITY:+<= $FILTER_PRIORITY}"
-log_opt "Filter owner"    "$FILTER_OWNER"
-log_opt "Filter label"    "$FILTER_LABEL"
-log_opt "Test cmd"        "$TEST_CMD"
-[[ "$RESPECT_DEPS" == true ]] && log "  Respect deps: yes (blocked beads deferred)" || true
+# Short model name for display: claude-sonnet-4-6 → sonnet
+short_model() { echo "$1" | sed 's/^claude-//; s/-[0-9].*//'; }
+
+section "Ralph Loop"
+detail "iterations: $MAX_ITERATIONS  retries: $MAX_RETRIES"
+cfg_opt() { [[ -n "${2:-}" ]] && detail "$1: $2" || true; }
+[[ -f ".ralphrc" ]]          && detail ".ralphrc loaded"
+[[ -f "$RALPH_RULES_FILE" ]] && detail "$RALPH_RULES_FILE loaded"
+cfg_opt "plan"     "$PLAN_FILE"
+cfg_opt "beads"    "$BEAD_IDS"
+cfg_opt "type"     "$FILTER_TYPE"
+cfg_opt "priority" "${FILTER_PRIORITY:+<= $FILTER_PRIORITY}"
+cfg_opt "owner"    "$FILTER_OWNER"
+cfg_opt "label"    "$FILTER_LABEL"
+cfg_opt "test"     "$TEST_CMD"
+[[ "$RESPECT_DEPS" == true ]] && detail "respect-deps: yes" || true
 if [[ -n "$MODEL" ]]; then
-  log "  Model (all agents): $MODEL"
+  detail "model (all): $(short_model "$MODEL")"
 else
-  log "  Models: worker=$WORKER_MODEL  reviewer=$REVIEWER_MODEL  commit=$COMMIT_MODEL"
-  log "          final-review=$FINAL_REVIEW_MODEL"
-  [[ -n "$PLAN_FILE" ]] && log "          lead=$LEAD_MODEL  spec=$SPEC_MODEL" || true
-  log "          summary=$SUMMARY_MODEL"
+  detail "models: worker=$(short_model "$WORKER_MODEL")  review=$(short_model "$REVIEWER_MODEL")  commit=$(short_model "$COMMIT_MODEL")"
+  detail "        final=$(short_model "$FINAL_REVIEW_MODEL")  summary=$(short_model "$SUMMARY_MODEL")"
+  [[ -n "$PLAN_FILE" ]] && detail "        lead=$(short_model "$LEAD_MODEL")  spec=$(short_model "$SPEC_MODEL")" || true
 fi
-divider
 
 # Load project-specific rules once (injected into worker prompts)
 project_rules=""
@@ -302,12 +324,12 @@ if [[ -n "$PLAN_FILE" ]]; then
   # Derive a label slug from the plan title for grouping
   PLAN_LABEL=$(slugify "$plan_title")
   [[ -z "$PLAN_LABEL" ]] && { echo "Could not generate label from plan title: $plan_title" >&2; exit 1; }
-  [[ -n "$FILTER_LABEL" ]] && log "  Note: --label '$FILTER_LABEL' overridden by plan label '$PLAN_LABEL'"
+  [[ -n "$FILTER_LABEL" ]] && detail "note: --label '$FILTER_LABEL' overridden by plan label '$PLAN_LABEL'"
   FILTER_LABEL="$PLAN_LABEL"
-  log "Plan label: $PLAN_LABEL"
+  detail "label: $PLAN_LABEL"
 
   # --- Phase 1: Decompose epic into tasks ---
-  log "Lead: decomposing into tasks..."
+  phase_hdr "$C_BLUE" "Lead — $(short_model "$LEAD_MODEL")"
   lead_log="$LOG_DIR/lead-$(date '+%H%M%S').log"
 
   claude_as "$LEAD_MODEL" --output-format stream-json --verbose -p "$(
@@ -316,10 +338,11 @@ if [[ -n "$PLAN_FILE" ]]; then
   )" 2>&1 | tee "$lead_log" | ralph_stream_filter || true
   extract_cost "lead" "$lead_log"
   bd_sync
-  log "Lead: done. See $lead_log"
+  read -r dur cost <<< "$(extract_result "$lead_log")"
+  out "${C_GREEN}✓${C_RESET}" "${C_DIM}$(fmt_duration "$dur") · \$$(fmt_cost "$cost")${C_RESET}"
 
   # --- Phase 2: Validate specs ---
-  log "Validating specs..."
+  phase_hdr "$C_MAGENTA" "Spec review — $(short_model "$SPEC_MODEL")"
   spec_log="$LOG_DIR/spec-review-$(date '+%H%M%S').log"
   children_json=$(bd list --label "$PLAN_LABEL" --status open --json --limit 0 2>/dev/null) || children_json="[]"
 
@@ -329,7 +352,8 @@ if [[ -n "$PLAN_FILE" ]]; then
   )" 2>&1 | tee "$spec_log" | ralph_stream_filter || true
   extract_cost "spec" "$spec_log"
   bd_sync
-  log "Spec review: done. See $spec_log"
+  read -r dur cost <<< "$(extract_result "$spec_log")"
+  out "${C_GREEN}✓${C_RESET}" "${C_DIM}$(fmt_duration "$dur") · \$$(fmt_cost "$cost")${C_RESET}"
 
   # FILTER_LABEL is set — fall through into the main worker+reviewer loop
 fi
@@ -392,9 +416,8 @@ while true; do
 
       if [[ "$found" == false ]]; then
         if [[ -n "$remaining" ]]; then
-          echo ""
-          log "All remaining beads are blocked. Stopping."
-          log "  Blocked: ${remaining//,/, }"
+          section "${C_YELLOW}All remaining beads are blocked${C_RESET}"
+          detail "${remaining//,/, }"
         fi
         break
       fi
@@ -422,12 +445,10 @@ while true; do
     [[ -n "$FILTER_PRIORITY" ]] && ready_args+=(--priority "$FILTER_PRIORITY")
     [[ -n "$FILTER_OWNER" ]]    && ready_args+=(--assignee "$FILTER_OWNER")
 
-    log "  bd ready ${ready_args[*]}"
     ready_json=$(bd ready "${ready_args[@]}" 2>/dev/null) || ready_json="[]"
 
     # Pick first not already skipped
     count=$(echo "$ready_json" | jq 'length')
-    log "  Found $count candidate(s)"
     for i in $(seq 0 $((count - 1))); do
       candidate=$(echo "$ready_json" | jq -r ".[$i].id")
       if ! grep -qxF "$candidate" "$SKIP_FILE" 2>/dev/null; then
@@ -440,25 +461,21 @@ while true; do
   fi
 
   if [[ -z "$bead_id" ]]; then
-    echo ""
-    log "${C_GREEN}${C_BOLD}No more ready beads. Ralph is done.${C_RESET}"
+    section "${C_GREEN}No more ready beads — done${C_RESET}"
     break
   fi
 
   iteration=$((iteration + 1))
   if [[ $iteration -gt $MAX_ITERATIONS ]]; then
-    echo ""
-    log "Reached max iterations ($MAX_ITERATIONS). Stopping."
+    section "${C_YELLOW}Reached max iterations ($MAX_ITERATIONS)${C_RESET}"
     exit 1
   fi
 
-  echo ""
-  divider
-  log "${C_BOLD}${C_WHITE}ITERATION $iteration: $bead_id${C_RESET} — ${C_CYAN}$bead_title${C_RESET}"
-  divider
+  section "Iteration $iteration — $bead_id"
+  detail "$bead_title"
 
   # Claim the bead
-  bd update "$bead_id" --status=in_progress 2>/dev/null || true
+  bd update "$bead_id" --status=in_progress > /dev/null 2>&1 || true
 
   # -----------------------------------------------------------------------
   # Build the prompt — fresh context each time (core Ralph insight)
@@ -484,8 +501,12 @@ while true; do
   success=false
 
   while [[ $retries -lt $MAX_RETRIES ]]; do
-    phase "$C_BLUE" "WORKER (attempt $((retries + 1))/$MAX_RETRIES) — $WORKER_MODEL"
-    log "  ${C_DIM}Log: $log_file${C_RESET}"
+    echo ""
+    if [[ $MAX_RETRIES -gt 1 ]]; then
+      phase_hdr "$C_BLUE" "Worker (attempt $((retries + 1))/$MAX_RETRIES) — $(short_model "$WORKER_MODEL")"
+    else
+      phase_hdr "$C_BLUE" "Worker — $(short_model "$WORKER_MODEL")"
+    fi
     claude_as "$WORKER_MODEL" --output-format stream-json --verbose \
       < "$prompt_file" 2>&1 \
       | tee "$log_file" \
@@ -494,13 +515,15 @@ while true; do
     # Check success from the stream-json result event (not pipeline exit code)
     extract_cost "worker" "$log_file"
     if jq -e 'select(.type == "result" and .subtype == "success")' "$log_file" > /dev/null 2>&1; then
+      read -r dur cost <<< "$(extract_result "$log_file")"
+      out "${C_GREEN}✓${C_RESET}" "${C_DIM}$(fmt_duration "$dur") · \$$(fmt_cost "$cost")${C_RESET}"
       success=true
       break
     fi
 
     retries=$((retries + 1))
     if [[ $retries -lt $MAX_RETRIES ]]; then
-      log "  ${C_YELLOW}Worker failed. Retrying in 5s...${C_RESET}"
+      out "${C_YELLOW}✗${C_RESET}" "failed, retrying in 5s..."
       sleep 5
     fi
   done
@@ -508,9 +531,9 @@ while true; do
   rm -f "$prompt_file"
 
   if [[ "$success" == false ]]; then
-    log "  ${C_RED}Failed after $MAX_RETRIES attempts. Skipping $bead_id.${C_RESET}"
+    out "${C_RED}✗${C_RESET}" "failed after $MAX_RETRIES attempts — skipping $bead_id"
     echo "$bead_id" >> "$SKIP_FILE"
-    bd update "$bead_id" --status=open 2>/dev/null || true   # release claim
+    bd update "$bead_id" --status=open > /dev/null 2>&1 || true   # release claim
     continue
   fi
 
@@ -518,13 +541,10 @@ while true; do
   # Skip commit & review if worker made no code changes
   # -----------------------------------------------------------------------
   if ! has_code_changes; then
-    log "  ${C_DIM}No code changes — skipping commit & review.${C_RESET}"
-    bd close "$bead_id" --reason="No changes needed (iteration $iteration)" 2>/dev/null || true
-    log "  ${C_GREEN}Closed $bead_id.${C_RESET}"
+    detail "no code changes — skipping commit & review"
+    bd close "$bead_id" --reason="No changes needed (iteration $iteration)" > /dev/null 2>&1 || true
+    out "${C_GREEN}✓${C_RESET}" "Closed $bead_id"
     bd_sync
-    divider
-    log "${C_GREEN}${C_BOLD}DONE: $bead_id${C_RESET}"
-    divider
     sleep 2
     continue
   fi
@@ -535,33 +555,37 @@ while true; do
   # Exclude pathspecs (:!) don't play well with git add, so we use
   # add-then-reset instead.
   # -----------------------------------------------------------------------
-  phase "$C_YELLOW" "COMMIT — $COMMIT_MODEL"
+  echo ""
   commit_log="$LOG_DIR/iter-${iteration}-${bead_id}-commit.log"
   claude_as "$COMMIT_MODEL" -p "$(
     export BEAD_ID="$bead_id"
     render_prompt "$PROMPTS_DIR/commit.md" BEAD_ID
-  )" 2>&1 | tee "$commit_log" && log "  ${C_GREEN}Committed.${C_RESET}" || log "  ${C_RED}Commit agent failed.${C_RESET} See $commit_log"
+  )" > "$commit_log" 2>&1 \
+    && phase_hdr "$C_YELLOW" "Commit ${C_GREEN}✓${C_RESET}" \
+    || phase_hdr "$C_YELLOW" "Commit ${C_RED}✗${C_RESET}"
 
   # -----------------------------------------------------------------------
   # Review the work — fresh Claude instance, read-only
   # -----------------------------------------------------------------------
-  phase "$C_MAGENTA" "REVIEW — $REVIEWER_MODEL"
+  echo ""
+  phase_hdr "$C_MAGENTA" "Review — $(short_model "$REVIEWER_MODEL")"
   review_log="$LOG_DIR/iter-${iteration}-${bead_id}-review.log"
 
   claude_as "$REVIEWER_MODEL" --output-format stream-json --verbose -p "$(
     export BEAD_DETAILS="$bead_details" BEAD_ID="$bead_id"
     export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" BEAD_LABELS="$bead_labels"
     render_prompt "$PROMPTS_DIR/review.md" BEAD_DETAILS BEAD_ID PRE_LOOP_HEAD BEAD_LABELS
-  )" 2>&1 | tee "$review_log" | ralph_stream_filter || log "  ${C_RED}Review failed.${C_RESET} See $review_log"
+  )" > "$review_log" 2>&1 || true
 
   extract_cost "reviewer" "$review_log"
   review_result=$(jq -r 'select(.type == "assistant") | .message.content[]? | select(.type == "text") | .text' "$review_log" 2>/dev/null | tail -1)
   if [[ "$review_result" == *"REVIEW_PASS"* ]]; then
-    log "  ${C_GREEN}Review: PASS${C_RESET}"
+    out "${C_GREEN}✓${C_RESET}" "pass"
   elif [[ "$review_result" == *"REVIEW_ISSUES_FILED"* ]]; then
-    log "  ${C_YELLOW}Review: ISSUES FILED${C_RESET}"
+    extract_filed_beads "$review_log"
+    out "${C_MAGENTA}●${C_RESET}" "issues filed"
   else
-    log "  Review: ${review_result:-(no verdict)}"
+    out "${C_DIM}?${C_RESET}" "${review_result:-(no verdict)}"
   fi
 
   # -----------------------------------------------------------------------
@@ -571,18 +595,15 @@ while true; do
     | jq '[.[] | select(.status != "closed")] | length' 2>/dev/null) || open_blockers=0
 
   if [[ "$open_blockers" -gt 0 ]]; then
-    log "  ${C_YELLOW}$bead_id has $open_blockers open blocker(s) — releasing claim.${C_RESET}"
-    bd update "$bead_id" --status=open 2>/dev/null || true
+    out "${C_YELLOW}●${C_RESET}" "$bead_id has $open_blockers open blocker(s) — released"
+    bd update "$bead_id" --status=open > /dev/null 2>&1 || true
   else
-    bd close "$bead_id" --reason="Completed by ralph (iteration $iteration)" 2>/dev/null || true
-    log "  ${C_GREEN}Closed $bead_id.${C_RESET}"
+    bd close "$bead_id" --reason="Completed by ralph (iteration $iteration)" > /dev/null 2>&1 || true
+    echo ""
+    out "${C_GREEN}✓${C_RESET}" "Closed $bead_id"
   fi
 
   bd_sync
-
-  divider
-  log "${C_GREEN}${C_BOLD}DONE: $bead_id${C_RESET}"
-  divider
   sleep 2
 done
 
@@ -595,18 +616,14 @@ bd_sync
 if [[ -n "$STASH_DIR" && -d "$STASH_DIR" ]]; then
   cp -a "$STASH_DIR"/. . 2>/dev/null || true
   rm -rf "$STASH_DIR"
-  log "Restored shelved untracked files."
+  detail "restored shelved untracked files"
 fi
 
-echo ""
-divider
-log "Ralph Loop completed after $iteration iteration(s)."
+section "Completed — $iteration iteration(s)"
 if [[ -s "$SKIP_FILE" ]]; then
-  echo ""
-  log "Skipped beads (failed after retries):"
-  while IFS= read -r id; do echo "  - $id"; done < "$SKIP_FILE"
+  detail "skipped (failed after retries):"
+  while IFS= read -r id; do detail "  - $id"; done < "$SKIP_FILE"
 fi
-log "Logs: $LOG_DIR/"
 
 # ---------------------------------------------------------------------------
 # Post-loop test gate
@@ -615,20 +632,19 @@ test_output=""
 test_passed=true
 if [[ -n "$TEST_CMD" && $iteration -gt 0 ]]; then
   echo ""
-  phase "$C_CYAN" "TEST GATE"
+  phase_hdr "$C_CYAN" "Test gate"
   test_log="$LOG_DIR/test-gate-$(date '+%H%M%S').log"
-  log "Running: $TEST_CMD"
 
   if eval "$TEST_CMD" > "$test_log" 2>&1; then
-    log "  ${C_GREEN}Tests: PASS${C_RESET}"
+    out "${C_GREEN}✓${C_RESET}" "passed"
   else
     test_passed=false
-    log "  ${C_RED}Tests: FAIL${C_RESET} See $test_log"
+    out "${C_RED}✗${C_RESET}" "failed"
     bd create "Fix: test suite failures after ralph session" -t bug -p 1 \
       ${FILTER_LABEL:+-l "$FILTER_LABEL"} \
       -d "Test command '$TEST_CMD' failed after ralph session. See log: $test_log" \
-      --acceptance "Running '$TEST_CMD' passes" --silent 2>/dev/null || true
-    bd sync 2>/dev/null || true
+      --acceptance "Running '$TEST_CMD' passes" --silent > /dev/null 2>&1 || true
+    bd sync > /dev/null 2>&1 || true
   fi
   test_output=$(tail -100 "$test_log" 2>/dev/null)
 fi
@@ -640,8 +656,8 @@ final_review_failed=false
 
 if [[ $iteration -gt 0 ]]; then
   echo ""
-  log "Session diff stats:"
-  git diff --stat "$PRE_LOOP_HEAD"..HEAD
+  detail "diff stats:"
+  git diff --stat "$PRE_LOOP_HEAD"..HEAD | while IFS= read -r line; do detail "  $line"; done
 
   # Build plan context — from --from-plan flag or PLAN.md in repo
   plan_context=""
@@ -654,8 +670,12 @@ ${plan_body}"
 $(cat PLAN.md)"
   fi
 
+  # Count active personas
+  persona_count=3
+  [[ -n "$plan_context" ]] && persona_count=4
+
   echo ""
-  phase "$C_MAGENTA" "FINAL REVIEW — parallel personas ($FINAL_REVIEW_MODEL)"
+  phase_hdr "$C_MAGENTA" "Final review ($persona_count personas) — $(short_model "$FINAL_REVIEW_MODEL")"
 
   closed_beads=""
   if [[ -n "${FILTER_LABEL:-}" ]]; then
@@ -684,7 +704,7 @@ ${test_output}"
     export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" BEAD_LABELS_FLAG="$bead_labels_flag"
     export TEST_CONTEXT="$test_context"
     render_prompt "$PROMPTS_DIR/final-review-security.md" PRE_LOOP_HEAD BEAD_LABELS_FLAG TEST_CONTEXT
-  )" 2>&1 | tee "$sec_log" | ralph_stream_filter &
+  )" > "$sec_log" 2>&1 &
   sec_pid=$!
 
   # --- Persona B: Integration Reviewer ---
@@ -693,7 +713,7 @@ ${test_output}"
     export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" BEAD_LABELS_FLAG="$bead_labels_flag"
     export TEST_CONTEXT="$test_context"
     render_prompt "$PROMPTS_DIR/final-review-integration.md" PRE_LOOP_HEAD BEAD_LABELS_FLAG TEST_CONTEXT
-  )" 2>&1 | tee "$int_log" | ralph_stream_filter &
+  )" > "$int_log" 2>&1 &
   int_pid=$!
 
   # --- Persona C: Codebase Patterns Reviewer ---
@@ -702,7 +722,7 @@ ${test_output}"
     export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" BEAD_LABELS_FLAG="$bead_labels_flag"
     export TEST_CONTEXT="$test_context"
     render_prompt "$PROMPTS_DIR/final-review-patterns.md" PRE_LOOP_HEAD BEAD_LABELS_FLAG TEST_CONTEXT
-  )" 2>&1 | tee "$pat_log" | ralph_stream_filter &
+  )" > "$pat_log" 2>&1 &
   pat_pid=$!
 
   # --- Persona D: Plan Adherence Reviewer (conditional) ---
@@ -715,7 +735,7 @@ ${test_output}"
       export TEST_CONTEXT="$test_context"
       export PLAN_CONTEXT="$plan_context"
       render_prompt "$PROMPTS_DIR/final-review-plan.md" PRE_LOOP_HEAD BEAD_LABELS_FLAG TEST_CONTEXT PLAN_CONTEXT
-    )" 2>&1 | tee "$plan_log" | ralph_stream_filter &
+    )" > "$plan_log" 2>&1 &
     plan_pid=$!
   fi
 
@@ -730,12 +750,13 @@ ${test_output}"
     extract_cost "final-$label" "$logfile"
     result=$(jq -r 'select(.type == "assistant") | .message.content[]? | select(.type == "text") | .text' "$logfile" 2>/dev/null | tail -1)
     if [[ "$result" == *"_PASS"* ]]; then
-      log "  ${C_GREEN}${label}: PASS${C_RESET}"
+      out "${C_GREEN}✓${C_RESET}" "${label}: pass"
     elif [[ "$result" == *"_ISSUES"* ]]; then
-      log "  ${C_YELLOW}${label}: ISSUES FILED${C_RESET}"
+      out "${C_MAGENTA}●${C_RESET}" "${label}: issues filed"
+      extract_filed_beads "$logfile"
       final_review_failed=true
     else
-      log "  ${label}: ${result:-(no verdict)}"
+      out "${C_DIM}?${C_RESET}" "${label}: ${result:-(no verdict)}"
     fi
   done
 fi
@@ -745,7 +766,7 @@ fi
 # ---------------------------------------------------------------------------
 if [[ $iteration -gt 0 ]]; then
   echo ""
-  log "Generating run summary..."
+  detail "generating summary..."
   summary_file="$LOG_DIR/summary-$(date '+%Y%m%d-%H%M%S').md"
 
   # Collect work logs (skip commit logs)
@@ -764,8 +785,6 @@ if [[ $iteration -gt 0 ]]; then
 
     echo ""
     cat "$summary_file"
-    echo ""
-    log "(saved to $summary_file)"
   fi
 fi
 
@@ -773,15 +792,14 @@ fi
 # Cost report
 # ---------------------------------------------------------------------------
 if [[ "${AGENT_COSTS[@]+x}" ]]; then
-  echo ""
-  log "Cost breakdown:"
+  section "Cost"
   total=0
   for agent_type in "${!AGENT_COSTS[@]}"; do
     cost="${AGENT_COSTS[$agent_type]}"
-    printf "  %-20s \$%s\n" "$agent_type" "$cost"
+    printf "    %-20s \$%s\n" "$agent_type" "$(fmt_cost "$cost")"
     total=$(echo "$total + $cost" | bc 2>/dev/null || echo "$total")
   done
-  printf "  %-20s \$%s\n" "TOTAL" "$total"
+  printf "    ${C_BOLD}%-20s \$%s${C_RESET}\n" "total" "$(fmt_cost "$total")"
 fi
 
 # ---------------------------------------------------------------------------
