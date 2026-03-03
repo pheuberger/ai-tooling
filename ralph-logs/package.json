@@ -1,0 +1,9 @@
+{
+  "name": "ralph-logs",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": { "ralph-logs": "./ralph-logs" },
+  "scripts": { "check": "bunx tsc --noEmit" },
+  "dependencies": { "@opentui/core": "latest" },
+  "devDependencies": { "typescript": "latest" }
+}

@@ -1,0 +1,7 @@
+export const SIDEBAR_WIDTH = 25
+export const AUTO_EXPAND_THRESHOLD = 12
+export const TOOL_OUTPUT_CAP = 1000
+export const BASH_DETAIL_TRUNCATE = 80
+export const LARGE_FILE_THRESHOLD = 10 * 1024 * 1024
+export const MAX_JSON_LINE_SIZE = 10 * 1024 * 1024
+export const FOLLOW_POLL_INTERVAL = 1000
