@@ -3,6 +3,7 @@ import { SIDEBAR_WIDTH } from './constants.ts'
 import { createContent } from './content.ts'
 import { createStatusBar } from './statusbar.ts'
 import { createSidebar } from './sidebar.ts'
+import { createHelpOverlay } from './help.ts'
 import { discoverLogFiles } from './parser/discovery.ts'
 import { parseStreamJson } from './parser/stream-json.ts'
 import { parsePlainText } from './parser/plaintext.ts'
@@ -145,9 +146,43 @@ export async function createApp(logDir: string): Promise<void> {
     sidebarBox.borderColor = focus === 'sidebar' ? 'white' : '#555555'
   }
 
+  const helpOverlay = createHelpOverlay(renderer)
+
+  // 'gg' sequence state
+  let pendingG = false
+  let pendingGTimer: ReturnType<typeof setTimeout> | null = null
+
+  function clearPendingG() {
+    pendingG = false
+    if (pendingGTimer !== null) {
+      clearTimeout(pendingGTimer)
+      pendingGTimer = null
+    }
+  }
+
+  function triggerSelectFile(delta: number) {
+    sidebar.moveSelection(delta)
+    // onSelect callback is already triggered inside moveSelection
+  }
+
   renderer.keyInput.on('keypress', (key) => {
+    // Help overlay: when visible only allow ? and Escape
+    if (helpOverlay.isVisible()) {
+      if (key.name === '?' || (key.sequence === '?' )) {
+        helpOverlay.toggle()
+      } else if (key.name === 'escape') {
+        helpOverlay.toggle()
+      }
+      return
+    }
+
     if (key.name === 'q') {
       process.exit(0)
+    }
+
+    if (key.name === '?') {
+      helpOverlay.toggle()
+      return
     }
 
     if (key.name === 'tab') {
@@ -181,6 +216,55 @@ export async function createApp(logDir: string): Promise<void> {
 
     if (key.name === 'u' && key.ctrl) {
       content.scrollByPage(-1)
+      return
+    }
+
+    // gg → scroll to top
+    if (key.name === 'g' && !key.shift && !key.ctrl) {
+      if (pendingG) {
+        clearPendingG()
+        content.scrollToTop()
+      } else {
+        pendingG = true
+        pendingGTimer = setTimeout(() => {
+          pendingG = false
+          pendingGTimer = null
+        }, 500)
+      }
+      return
+    }
+
+    // Clear pending g if any other key pressed
+    if (pendingG) {
+      clearPendingG()
+    }
+
+    // G → scroll to bottom
+    if (key.name === 'G' || (key.name === 'g' && key.shift)) {
+      content.scrollToBottom()
+      return
+    }
+
+    // [ / ] → prev/next file (works from either panel)
+    if (key.name === '[' || key.sequence === '[') {
+      triggerSelectFile(-1)
+      return
+    }
+
+    if (key.name === ']' || key.sequence === ']') {
+      triggerSelectFile(+1)
+      return
+    }
+
+    // e → expand all
+    if (key.name === 'e') {
+      content.expandAll()
+      return
+    }
+
+    // c → collapse all
+    if (key.name === 'c') {
+      content.collapseAll()
       return
     }
 
