@@ -1,6 +1,7 @@
 import { createCliRenderer, BoxRenderable, TextRenderable, TextAttributes } from '@opentui/core'
 import { SIDEBAR_WIDTH } from './constants.ts'
 import { createContent } from './content.ts'
+import { createStatusBar } from './statusbar.ts'
 
 export async function createApp() {
   const renderer = await createCliRenderer({ exitOnCtrlC: true })
@@ -49,10 +50,26 @@ export async function createApp() {
     height: 1,
     width: '100%',
   })
-  statusBarBox.add(new TextRenderable(renderer, {
-    content: 'Status bar',
-    attributes: TextAttributes.INVERSE,
-  }))
+  const statusBar = createStatusBar(statusBarBox)
+  statusBar.update(
+    {
+      path: '',
+      filename: '',
+      phase: 'iteration',
+      agentType: 'worker',
+      format: 'stream-json',
+      groupKey: 'auth-1',
+      beadId: 'auth-1',
+      iterationNumber: 1,
+      displayLabel: 'auth-1 worker',
+    },
+    {
+      model: 'opus-4',
+      durationMs: 154000,
+      totalCostUsd: 0.12,
+      subtype: 'success',
+    },
+  )
 
   rootBox.add(mainBox)
   rootBox.add(statusBarBox)
