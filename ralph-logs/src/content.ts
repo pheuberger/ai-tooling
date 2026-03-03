@@ -1,5 +1,5 @@
 import { BoxRenderable, TextRenderable, ScrollBoxRenderable, TextAttributes } from '@opentui/core'
-import type { ConversationBlock, ToolUseBlock, ToolResultBlock } from './types.ts'
+import type { ConversationBlock, ToolUseBlock, ToolResultBlock, ThinkingBlock } from './types.ts'
 import { AUTO_EXPAND_THRESHOLD, TOOL_OUTPUT_CAP, BASH_DETAIL_TRUNCATE } from './constants.ts'
 import { darkTheme } from './theme.ts'
 
@@ -49,6 +49,14 @@ export function createContent(parentBox: any) {
     lineCount: number
   }
   const toolBlockRenderInfos: ToolBlockRenderInfo[] = []
+
+  type ThinkingBlockRenderInfo = {
+    stateIndex: number
+    thinkingBlock: ThinkingBlock
+    container: any
+    lineCount: number
+  }
+  const thinkingBlockRenderInfos: ThinkingBlockRenderInfo[] = []
 
   function clearChildren() {
     const children = [...scrollBox.getChildren()]
@@ -179,10 +187,87 @@ export function createContent(parentBox: any) {
     }
   }
 
+  function renderThinkingBlockContent(
+    container: any,
+    thinkingBlock: ThinkingBlock,
+    stateIndex: number,
+    lineCount: number,
+  ) {
+    const existing = [...container.getChildren()]
+    for (const child of existing) {
+      container.remove(child.id)
+    }
+
+    const isTargeted = stateIndex === targetedIndex
+    const state = collapsibleStates[stateIndex]
+
+    // Header line: ─── Thinking ───
+    const headerBox = new BoxRenderable(ctx, {
+      flexDirection: 'row',
+      width: '100%',
+    })
+    const headerText = new TextRenderable(ctx, {
+      content: '─── Thinking ───',
+      attributes: TextAttributes.DIM | (isTargeted ? TextAttributes.INVERSE : 0),
+    })
+    headerBox.add(headerText)
+    container.add(headerBox)
+
+    if (state.collapsed) {
+      // Collapsed view: ▸ (N lines)
+      const collapsedLine = new TextRenderable(ctx, {
+        content: `▸ (${lineCount} lines)`,
+        fg: darkTheme.collapsedLineCount.fg,
+      })
+      container.add(collapsedLine)
+    } else {
+      // Expanded view: ▾ (N lines) + content + footer
+      const toggleLine = new TextRenderable(ctx, {
+        content: `▾ (${lineCount} lines)`,
+        fg: darkTheme.collapsedLineCount.fg,
+      })
+      container.add(toggleLine)
+
+      const lines = thinkingBlock.thinking.split('\n')
+      const displayLines = lines.length > TOOL_OUTPUT_CAP ? lines.slice(0, TOOL_OUTPUT_CAP) : lines
+
+      for (const line of displayLines) {
+        const lineRow = new BoxRenderable(ctx, { flexDirection: 'row' })
+        const borderChar = new TextRenderable(ctx, {
+          content: '│ ',
+          attributes: TextAttributes.DIM,
+        })
+        const lineContent = new TextRenderable(ctx, {
+          content: line,
+          attributes: TextAttributes.DIM | TextAttributes.ITALIC,
+        })
+        lineRow.add(borderChar)
+        lineRow.add(lineContent)
+        container.add(lineRow)
+      }
+
+      if (lines.length > TOOL_OUTPUT_CAP) {
+        const truncMsg = new TextRenderable(ctx, {
+          content: `... truncated (${lines.length} total lines)`,
+          attributes: TextAttributes.DIM,
+        })
+        container.add(truncMsg)
+      }
+
+      // Footer separator
+      const footer = new TextRenderable(ctx, {
+        content: '──────────────────────────────',
+        attributes: TextAttributes.DIM,
+      })
+      container.add(footer)
+    }
+  }
+
   function loadBlocks(blocks: ConversationBlock[]) {
     clearChildren()
     collapsibleStates.length = 0
     toolBlockRenderInfos.length = 0
+    thinkingBlockRenderInfos.length = 0
     targetedIndex = 0
 
     if (blocks.length === 0) {
@@ -268,12 +353,26 @@ export function createContent(parentBox: any) {
       } else if (block.type === 'tool_result') {
         // handled above via forward scan from tool_use
       } else if (block.type === 'thinking') {
-        const lines = block.thinking.split('\n').length
-        const placeholder = new TextRenderable(ctx, {
-          content: `[Thinking - ${lines} lines]`,
-          attributes: TextAttributes.DIM,
+        const lineCount = block.thinking.split('\n').length
+        const collapsed = lineCount > AUTO_EXPAND_THRESHOLD
+
+        const stateIndex = collapsibleStates.length
+        collapsibleStates.push({ collapsed, blockIndex: i })
+
+        const container = new BoxRenderable(ctx, {
+          flexDirection: 'column',
+          width: '100%',
         })
-        scrollBox.add(placeholder)
+
+        renderThinkingBlockContent(container, block, stateIndex, lineCount)
+        scrollBox.add(container)
+
+        thinkingBlockRenderInfos.push({
+          stateIndex,
+          thinkingBlock: block,
+          container,
+          lineCount,
+        })
       }
     }
   }
@@ -287,6 +386,9 @@ export function createContent(parentBox: any) {
         info.stateIndex,
         info.lineCount,
       )
+    }
+    for (const info of thinkingBlockRenderInfos) {
+      renderThinkingBlockContent(info.container, info.thinkingBlock, info.stateIndex, info.lineCount)
     }
   }
 
@@ -327,14 +429,24 @@ export function createContent(parentBox: any) {
       const state = collapsibleStates[targetedIndex]
       if (!state) return
       state.collapsed = !state.collapsed
-      const info = toolBlockRenderInfos.find((r) => r.stateIndex === targetedIndex)
-      if (info) {
+      const toolInfo = toolBlockRenderInfos.find((r) => r.stateIndex === targetedIndex)
+      if (toolInfo) {
         renderToolBlockContent(
-          info.container,
-          info.useBlock,
-          info.resultBlock,
-          info.stateIndex,
-          info.lineCount,
+          toolInfo.container,
+          toolInfo.useBlock,
+          toolInfo.resultBlock,
+          toolInfo.stateIndex,
+          toolInfo.lineCount,
+        )
+        return
+      }
+      const thinkingInfo = thinkingBlockRenderInfos.find((r) => r.stateIndex === targetedIndex)
+      if (thinkingInfo) {
+        renderThinkingBlockContent(
+          thinkingInfo.container,
+          thinkingInfo.thinkingBlock,
+          thinkingInfo.stateIndex,
+          thinkingInfo.lineCount,
         )
       }
     },

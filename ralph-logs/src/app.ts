@@ -7,7 +7,7 @@ import { createHelpOverlay } from './help.ts'
 import { discoverLogFiles } from './parser/discovery.ts'
 import { parseStreamJson } from './parser/stream-json.ts'
 import { parsePlainText } from './parser/plaintext.ts'
-import type { LogFile, ParsedLog } from './types.ts'
+import type { LogFile, ParsedLog, ConversationBlock } from './types.ts'
 
 export async function createApp(logDir: string): Promise<void> {
   const renderer = await createCliRenderer({ exitOnCtrlC: true })
@@ -93,7 +93,12 @@ export async function createApp(logDir: string): Promise<void> {
       }
       cache.set(file.path, parsedLog)
     }
-    content.loadBlocks(parsedLog.blocks)
+    // Test thinking blocks for development verification
+    const testThinkingBlocks: ConversationBlock[] = [
+      { type: 'thinking', thinking: Array(50).fill('I need to analyze this carefully...').join('\n') },
+      { type: 'thinking', thinking: 'Short thought.' },
+    ]
+    content.loadBlocks([...parsedLog.blocks, ...testThinkingBlocks])
     statusBar.update(file, parsedLog.metadata)
 
     // Restore or reset view state
