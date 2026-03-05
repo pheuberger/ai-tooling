@@ -34,5 +34,3 @@ ${PLAN_CONTEXT}
    Then run: bd sync
    Kaizen beads do NOT affect your verdict.
 5. Output EXACTLY one of: PLAN_PASS or PLAN_ISSUES
-
-${TEST_CONTEXT}

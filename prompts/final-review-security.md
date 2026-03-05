@@ -31,5 +31,3 @@ Do NOT modify any code. Do NOT close or update bead status.
    Then run: bd sync
    Kaizen beads do NOT affect your verdict.
 5. Output EXACTLY one of: SECURITY_PASS or SECURITY_ISSUES
-
-${TEST_CONTEXT}

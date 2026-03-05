@@ -17,7 +17,7 @@
 #   --owner NAME         Only pick beads owned by NAME
 #   --label LABEL        Filter ready beads by label
 #   --from-plan FILE     Decompose a plan file into label-grouped tasks, then work them
-#   --test-cmd CMD       Run CMD as post-loop test gate; files bead + exits 1 on failure
+#   --test-cmd CMD       Run CMD as pre-commit test gate; retries worker on failure
 #
 # Configuration files (optional):
 #   .ralphrc             Sourced from project root before CLI args are parsed.
@@ -135,7 +135,7 @@ FILTER_PRIORITY=""    # only beads with priority <= this value (0=critical … 4
 FILTER_OWNER=""       # only beads owned by this name
 FILTER_LABEL=""       # filter by label
 PLAN_FILE=""          # --from-plan: plan file to decompose into beads
-TEST_CMD=""           # --test-cmd: command to run as post-loop test gate
+TEST_CMD=""           # --test-cmd: command to run as pre-commit test gate
 LOG_DIR=".ralph-logs"
 RALPH_RULES_FILE=".ralph-rules.md"
 
@@ -517,6 +517,39 @@ while true; do
     if jq -e 'select(.type == "result" and .subtype == "success")' "$log_file" > /dev/null 2>&1; then
       read -r dur cost <<< "$(extract_result "$log_file")"
       out "${C_GREEN}✓${C_RESET}" "${C_DIM}$(fmt_duration "$dur") · \$$(fmt_cost "$cost")${C_RESET}"
+      # --- Pre-commit test gate ---
+      if [[ -n "$TEST_CMD" ]]; then
+        echo ""
+        phase_hdr "$C_CYAN" "Test gate"
+        test_gate_log="$LOG_DIR/iter-${iteration}-${bead_id}-test-${retries}.log"
+        if eval "$TEST_CMD" > "$test_gate_log" 2>&1; then
+          out "${C_GREEN}✓${C_RESET}" "passed"
+        else
+          out "${C_RED}✗${C_RESET}" "failed"
+          retries=$((retries + 1))
+          if [[ $retries -lt $MAX_RETRIES ]]; then
+            # Augment prompt with test failure output for next worker attempt
+            test_snippet=$(tail -80 "$test_gate_log")
+            cat >> "$prompt_file" <<TESTFAIL
+
+## Test Failures (attempt $retries)
+
+Your previous changes cause test/typecheck failures. You MUST fix these.
+
+Command: $TEST_CMD
+Output (last 80 lines):
+\`\`\`
+$test_snippet
+\`\`\`
+TESTFAIL
+            out "${C_YELLOW}↻${C_RESET}" "retrying worker with test output..."
+            sleep 2
+            continue
+          fi
+          # Exhausted retries on test failure
+          break
+        fi
+      fi
       success=true
       break
     fi
@@ -626,30 +659,6 @@ if [[ -s "$SKIP_FILE" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Post-loop test gate
-# ---------------------------------------------------------------------------
-test_output=""
-test_passed=true
-if [[ -n "$TEST_CMD" && $iteration -gt 0 ]]; then
-  echo ""
-  phase_hdr "$C_CYAN" "Test gate"
-  test_log="$LOG_DIR/test-gate-$(date '+%H%M%S').log"
-
-  if eval "$TEST_CMD" > "$test_log" 2>&1; then
-    out "${C_GREEN}✓${C_RESET}" "passed"
-  else
-    test_passed=false
-    out "${C_RED}✗${C_RESET}" "failed"
-    bd create "Fix: test suite failures after ralph session" -t bug -p 1 \
-      ${FILTER_LABEL:+-l "$FILTER_LABEL"} \
-      -d "Test command '$TEST_CMD' failed after ralph session. See log: $test_log" \
-      --acceptance "Running '$TEST_CMD' passes" --silent > /dev/null 2>&1 || true
-    bd sync > /dev/null 2>&1 || true
-  fi
-  test_output=$(tail -100 "$test_log" 2>/dev/null)
-fi
-
-# ---------------------------------------------------------------------------
 # Diff stats + final review personas
 # ---------------------------------------------------------------------------
 final_review_failed=false
@@ -683,27 +692,13 @@ $(cat PLAN.md)"
   fi
   skipped=""; [[ -s "$SKIP_FILE" ]] && skipped=$(cat "$SKIP_FILE")
 
-  test_context=""
-  if [[ -n "$TEST_CMD" ]]; then
-    if [[ "$test_passed" == true ]]; then
-      test_context="## Test Results
-Tests passed ('$TEST_CMD')."
-    else
-      test_context="## Test Results — FAILED
-Command: $TEST_CMD
-Output (last 100 lines):
-${test_output}"
-    fi
-  fi
-
   bead_labels_flag="${FILTER_LABEL:+-l $FILTER_LABEL}"
 
   # --- Persona A: Security Reviewer ---
   sec_log="$LOG_DIR/final-review-security-$(date '+%H%M%S').log"
   claude_as "$FINAL_REVIEW_MODEL" --output-format stream-json --verbose -p "$(
     export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" BEAD_LABELS_FLAG="$bead_labels_flag"
-    export TEST_CONTEXT="$test_context"
-    render_prompt "$PROMPTS_DIR/final-review-security.md" PRE_LOOP_HEAD BEAD_LABELS_FLAG TEST_CONTEXT
+    render_prompt "$PROMPTS_DIR/final-review-security.md" PRE_LOOP_HEAD BEAD_LABELS_FLAG
   )" > "$sec_log" 2>&1 &
   sec_pid=$!
 
@@ -711,8 +706,7 @@ ${test_output}"
   int_log="$LOG_DIR/final-review-integration-$(date '+%H%M%S').log"
   claude_as "$FINAL_REVIEW_MODEL" --output-format stream-json --verbose -p "$(
     export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" BEAD_LABELS_FLAG="$bead_labels_flag"
-    export TEST_CONTEXT="$test_context"
-    render_prompt "$PROMPTS_DIR/final-review-integration.md" PRE_LOOP_HEAD BEAD_LABELS_FLAG TEST_CONTEXT
+    render_prompt "$PROMPTS_DIR/final-review-integration.md" PRE_LOOP_HEAD BEAD_LABELS_FLAG
   )" > "$int_log" 2>&1 &
   int_pid=$!
 
@@ -720,8 +714,7 @@ ${test_output}"
   pat_log="$LOG_DIR/final-review-patterns-$(date '+%H%M%S').log"
   claude_as "$FINAL_REVIEW_MODEL" --output-format stream-json --verbose -p "$(
     export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" BEAD_LABELS_FLAG="$bead_labels_flag"
-    export TEST_CONTEXT="$test_context"
-    render_prompt "$PROMPTS_DIR/final-review-patterns.md" PRE_LOOP_HEAD BEAD_LABELS_FLAG TEST_CONTEXT
+    render_prompt "$PROMPTS_DIR/final-review-patterns.md" PRE_LOOP_HEAD BEAD_LABELS_FLAG
   )" > "$pat_log" 2>&1 &
   pat_pid=$!
 
@@ -732,9 +725,8 @@ ${test_output}"
     plan_log="$LOG_DIR/final-review-plan-$(date '+%H%M%S').log"
     claude_as "$FINAL_REVIEW_MODEL" --output-format stream-json --verbose -p "$(
       export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" BEAD_LABELS_FLAG="$bead_labels_flag"
-      export TEST_CONTEXT="$test_context"
       export PLAN_CONTEXT="$plan_context"
-      render_prompt "$PROMPTS_DIR/final-review-plan.md" PRE_LOOP_HEAD BEAD_LABELS_FLAG TEST_CONTEXT PLAN_CONTEXT
+      render_prompt "$PROMPTS_DIR/final-review-plan.md" PRE_LOOP_HEAD BEAD_LABELS_FLAG PLAN_CONTEXT
     )" > "$plan_log" 2>&1 &
     plan_pid=$!
   fi
@@ -803,8 +795,8 @@ if [[ "${AGENT_COSTS[@]+x}" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Exit code — non-zero if final review found issues or tests failed
+# Exit code — non-zero if final review found issues
 # ---------------------------------------------------------------------------
-if [[ "${final_review_failed:-false}" == true ]] || [[ "${test_passed:-true}" == false ]]; then
+if [[ "${final_review_failed:-false}" == true ]]; then
   exit 1
 fi
