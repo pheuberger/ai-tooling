@@ -7,10 +7,15 @@ import { createHelpOverlay } from './help.ts'
 import { discoverLogFiles } from './parser/discovery.ts'
 import { parseStreamJson } from './parser/stream-json.ts'
 import { parsePlainText } from './parser/plaintext.ts'
+import { detectPalette } from './theme.ts'
 import type { LogFile, ParsedLog } from './types.ts'
 
 export async function createApp(logDir: string): Promise<void> {
   const renderer = await createCliRenderer({ exitOnCtrlC: true })
+
+  // Detect the user's terminal colors (OSC query → ANSI palette → theme mode → fallback)
+  const palette = await detectPalette(renderer)
+  renderer.setBackgroundColor(palette.bg)
 
   const files = await discoverLogFiles(logDir)
 
@@ -24,6 +29,7 @@ export async function createApp(logDir: string): Promise<void> {
     })
     const emptyText = new TextRenderable(renderer, {
       content: `No log files found in ${logDir}`,
+      fg: palette.fg,
     })
     rootBox.add(emptyText)
     renderer.root.add(rootBox)
@@ -45,21 +51,22 @@ export async function createApp(logDir: string): Promise<void> {
     width: SIDEBAR_WIDTH,
     borderStyle: 'single',
     border: true,
-    borderColor: 'white',
+    borderColor: palette.borderFocused,
   })
 
-  const sidebar = createSidebar(sidebarBox, files)
+  const sidebar = createSidebar(sidebarBox, files, palette)
 
   const contentBox = new BoxRenderable(renderer, {
     flexGrow: 1,
+    paddingX: 1,
   })
-  const content = createContent(contentBox)
+  const content = createContent(contentBox, palette)
 
   const statusBarBox = new BoxRenderable(renderer, {
     height: 1,
     width: '100%',
   })
-  const statusBar = createStatusBar(statusBarBox)
+  const statusBar = createStatusBar(statusBarBox, palette)
 
   mainBox.add(sidebarBox)
   mainBox.add(contentBox)
@@ -143,10 +150,10 @@ export async function createApp(logDir: string): Promise<void> {
   let focus: 'sidebar' | 'content' = 'sidebar'
 
   function updateFocusVisual() {
-    sidebarBox.borderColor = focus === 'sidebar' ? 'white' : '#555555'
+    sidebarBox.borderColor = focus === 'sidebar' ? palette.borderFocused : palette.borderBlurred
   }
 
-  const helpOverlay = createHelpOverlay(renderer)
+  const helpOverlay = createHelpOverlay(renderer, palette)
 
   // 'gg' sequence state
   let pendingG = false

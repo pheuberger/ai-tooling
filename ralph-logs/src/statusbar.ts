@@ -1,6 +1,6 @@
 import { BoxRenderable, TextRenderable, TextAttributes } from '@opentui/core'
 import type { LogFile, SessionMetadata } from './types.ts'
-import { darkTheme } from './theme.ts'
+import type { TerminalPalette } from './theme.ts'
 
 function formatDuration(ms: number | undefined): string {
   if (ms === undefined) return 'unknown'
@@ -12,7 +12,7 @@ function formatDuration(ms: number | undefined): string {
   return `${Math.floor(ms / 1000)}s`
 }
 
-export function createStatusBar(parentBox: any): {
+export function createStatusBar(parentBox: any, palette: TerminalPalette): {
   update(file: LogFile, metadata: SessionMetadata): void
   clear(): void
 } {
@@ -39,8 +39,8 @@ export function createStatusBar(parentBox: any): {
     if (metadata.subtype === 'error') {
       const errorMark = new TextRenderable(ctx, {
         content: '✗ ',
-        fg: darkTheme.error.fg,
-        attributes: TextAttributes.INVERSE,
+        fg: '#d75f5f',
+        bg: palette.fg,
       })
       rowBox.add(errorMark)
     }
@@ -74,15 +74,17 @@ export function createStatusBar(parentBox: any): {
     )
 
     const leftText = new TextRenderable(ctx, {
-      content: parts.join(' · '),
-      attributes: TextAttributes.INVERSE,
+      content: ' ' + parts.join('  ·  '),
+      fg: palette.bg,
+      bg: palette.fg,
       flexGrow: 1,
     })
     rowBox.add(leftText)
 
     const hintsText = new TextRenderable(ctx, {
-      content: 'j/k ↑↓  ?',
-      attributes: TextAttributes.INVERSE | TextAttributes.DIM,
+      content: ' j/k ↑↓  ? ',
+      fg: palette.dimFg,
+      bg: palette.fg,
     })
     rowBox.add(hintsText)
   }
@@ -91,7 +93,8 @@ export function createStatusBar(parentBox: any): {
     clearChildren()
     const emptyText = new TextRenderable(ctx, {
       content: '',
-      attributes: TextAttributes.INVERSE,
+      fg: palette.bg,
+      bg: palette.fg,
       flexGrow: 1,
     })
     rowBox.add(emptyText)

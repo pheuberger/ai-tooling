@@ -1,4 +1,4 @@
-export const SIDEBAR_WIDTH = 25
+export const SIDEBAR_WIDTH = 28
 export const AUTO_EXPAND_THRESHOLD = 12
 export const TOOL_OUTPUT_CAP = 1000
 export const BASH_DETAIL_TRUNCATE = 80

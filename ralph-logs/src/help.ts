@@ -1,4 +1,5 @@
 import { BoxRenderable, TextRenderable, TextAttributes } from '@opentui/core'
+import type { TerminalPalette } from './theme.ts'
 
 const OVERLAY_WIDTH = 52
 const OVERLAY_HEIGHT = 22
@@ -20,7 +21,7 @@ const KEYBINDINGS: Array<[string, string]> = [
   ['q', 'Quit'],
 ]
 
-export function createHelpOverlay(renderer: any): {
+export function createHelpOverlay(renderer: any, palette: TerminalPalette): {
   toggle(): void
   isVisible(): boolean
 } {
@@ -45,8 +46,8 @@ export function createHelpOverlay(renderer: any): {
       flexDirection: 'column',
       border: true,
       borderStyle: 'rounded',
-      borderColor: '#888888',
-      backgroundColor: '#1a1a1a',
+      borderColor: palette.borderFocused,
+      backgroundColor: palette.bg,
       paddingX: 1,
       paddingY: 0,
       zIndex: 100,
@@ -55,6 +56,7 @@ export function createHelpOverlay(renderer: any): {
     // Title
     const titleText = new TextRenderable(ctx, {
       content: 'Keyboard Shortcuts',
+      fg: palette.fg,
       attributes: TextAttributes.BOLD,
       alignSelf: 'center',
     })
@@ -73,13 +75,14 @@ export function createHelpOverlay(renderer: any): {
 
       const keyText = new TextRenderable(ctx, {
         content: key.padEnd(14),
+        fg: palette.fg,
         attributes: TextAttributes.BOLD,
         width: 14,
       })
 
       const descText = new TextRenderable(ctx, {
         content: desc,
-        attributes: TextAttributes.DIM,
+        fg: palette.dimFg,
       })
 
       rowBox.add(keyText)
@@ -94,7 +97,7 @@ export function createHelpOverlay(renderer: any): {
     // Footer
     const footerText = new TextRenderable(ctx, {
       content: 'Press ? or Esc to close',
-      attributes: TextAttributes.DIM,
+      fg: palette.dimFg,
       alignSelf: 'center',
     })
     box.add(footerText)

@@ -1,20 +1,20 @@
 import { BoxRenderable, TextRenderable, ScrollBoxRenderable, TextAttributes } from '@opentui/core'
 import type { LogFile } from './types.ts'
 import { SIDEBAR_WIDTH } from './constants.ts'
-import { darkTheme } from './theme.ts'
+import type { TerminalPalette } from './theme.ts'
 
 function getGroupHeader(groupKey: string): string {
-  if (groupKey === 'plan') return '── Plan ──'
+  if (groupKey === 'plan') return 'Plan'
   if (groupKey.startsWith('iter-')) {
     const n = groupKey.slice(5)
-    return `── Iteration ${n} ──`
+    return `Iteration ${n}`
   }
-  if (groupKey === 'post-run') return '── Post-run ──'
-  return '── Other ──'
+  if (groupKey === 'post-run') return 'Post-run'
+  return 'Other'
 }
 
 function truncateLabel(label: string, prefixLen = 0): string {
-  const maxLen = SIDEBAR_WIDTH - 2 - prefixLen
+  const maxLen = SIDEBAR_WIDTH - 4 - prefixLen  // account for border + indent
   if (label.length > maxLen) {
     return label.slice(0, maxLen - 1) + '…'
   }
@@ -24,6 +24,7 @@ function truncateLabel(label: string, prefixLen = 0): string {
 export function createSidebar(
   parentBox: any,
   files: LogFile[],
+  palette: TerminalPalette,
 ): {
   getSelectedFile(): LogFile | null
   getSelectedIndex(): number
@@ -77,13 +78,23 @@ export function createSidebar(
     entryPositions.length = 0
     let currentY = 0
     let flatFileIndex = 0
+    let isFirstGroup = true
 
     for (const groupKey of groupOrder) {
       const groupFiles = groupMap.get(groupKey)!
       if (groupFiles.length === 0) continue
 
+      // Blank line between groups (except before first)
+      if (!isFirstGroup) {
+        const groupSpacer = new TextRenderable(ctx, { content: '' })
+        scrollBox.add(groupSpacer)
+        currentY++
+      }
+      isFirstGroup = false
+
       const header = new TextRenderable(ctx, {
-        content: getGroupHeader(groupKey),
+        content: ` ${getGroupHeader(groupKey)}`,
+        fg: palette.dimFg,
         attributes: TextAttributes.BOLD,
       })
       scrollBox.add(header)
@@ -94,27 +105,43 @@ export function createSidebar(
         const isSelected = flatFileIndex === selectedIndex
 
         if (isError) {
-          const label = truncateLabel(file.displayLabel, 2)
+          const label = truncateLabel(file.displayLabel, 4)
           const rowBox = new BoxRenderable(ctx, { flexDirection: 'row', width: '100%' })
+          const indent = new TextRenderable(ctx, {
+            content: '  ',
+            fg: isSelected ? palette.bg : palette.fg,
+            bg: isSelected ? palette.fg : undefined,
+          })
           const errorMark = new TextRenderable(ctx, {
             content: '✗ ',
-            fg: '#ff0000',
-            attributes: isSelected ? TextAttributes.INVERSE : 0,
+            fg: '#d75f5f',
+            bg: isSelected ? palette.fg : undefined,
           })
           const labelText = new TextRenderable(ctx, {
             content: label,
-            attributes: isSelected ? TextAttributes.INVERSE : 0,
+            fg: isSelected ? palette.bg : palette.fg,
+            bg: isSelected ? palette.fg : undefined,
           })
+          rowBox.add(indent)
           rowBox.add(errorMark)
           rowBox.add(labelText)
           scrollBox.add(rowBox)
         } else {
-          const label = truncateLabel(file.displayLabel)
-          const fileText = new TextRenderable(ctx, {
-            content: label,
-            attributes: isSelected ? TextAttributes.INVERSE : 0,
+          const label = truncateLabel(file.displayLabel, 2)
+          const rowBox = new BoxRenderable(ctx, { flexDirection: 'row', width: '100%' })
+          const indent = new TextRenderable(ctx, {
+            content: '  ',
+            fg: isSelected ? palette.bg : palette.fg,
+            bg: isSelected ? palette.fg : undefined,
           })
-          scrollBox.add(fileText)
+          const labelText = new TextRenderable(ctx, {
+            content: label,
+            fg: isSelected ? palette.bg : palette.fg,
+            bg: isSelected ? palette.fg : undefined,
+          })
+          rowBox.add(indent)
+          rowBox.add(labelText)
+          scrollBox.add(rowBox)
         }
 
         entryPositions[flatFileIndex] = currentY

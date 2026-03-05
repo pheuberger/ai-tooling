@@ -1,7 +1,7 @@
 import { BoxRenderable, TextRenderable, ScrollBoxRenderable, TextAttributes } from '@opentui/core'
 import type { ConversationBlock, ToolUseBlock, ToolResultBlock, ThinkingBlock } from './types.ts'
 import { AUTO_EXPAND_THRESHOLD, TOOL_OUTPUT_CAP, BASH_DETAIL_TRUNCATE } from './constants.ts'
-import { darkTheme } from './theme.ts'
+import type { TerminalPalette } from './theme.ts'
 
 type CollapsibleState = { collapsed: boolean; blockIndex: number }
 
@@ -26,7 +26,7 @@ function getToolDetail(block: ToolUseBlock): string {
   }
 }
 
-export function createContent(parentBox: any) {
+export function createContent(parentBox: any, palette: TerminalPalette) {
   const ctx = parentBox.ctx
 
   const scrollBox = new ScrollBoxRenderable(ctx, {
@@ -65,6 +65,11 @@ export function createContent(parentBox: any) {
     }
   }
 
+  function addSpacer() {
+    const spacer = new TextRenderable(ctx, { content: '' })
+    scrollBox.add(spacer)
+  }
+
   function renderToolBlockContent(
     container: any,
     useBlock: ToolUseBlock,
@@ -83,74 +88,65 @@ export function createContent(parentBox: any) {
     const state = collapsibleStates[stateIndex]
     const detail = getToolDetail(useBlock)
 
-    // Header line: ─── ToolName detail ───
+    const chevron = (resultBlock === null)
+      ? '  '
+      : state.collapsed ? '▸ ' : '▾ '
+
+    // Header line: ▸ ToolName detail
     const headerBox = new BoxRenderable(ctx, {
       flexDirection: 'row',
       width: '100%',
     })
 
-    const prefix = new TextRenderable(ctx, {
-      content: '─── ',
-      fg: darkTheme.toolHeader.fg,
+    const chevronText = new TextRenderable(ctx, {
+      content: chevron,
+      fg: palette.dimFg,
+      bg: isTargeted ? palette.fg : undefined,
       attributes: isTargeted ? TextAttributes.INVERSE : 0,
     })
-    headerBox.add(prefix)
+    headerBox.add(chevronText)
 
     const nameText = new TextRenderable(ctx, {
       content: useBlock.name,
-      fg: darkTheme.toolHeaderBold.fg,
-      attributes: (isTargeted ? TextAttributes.INVERSE : 0) | TextAttributes.BOLD,
+      fg: isTargeted ? palette.bg : palette.fg,
+      bg: isTargeted ? palette.fg : undefined,
+      attributes: TextAttributes.BOLD,
     })
     headerBox.add(nameText)
 
     if (detail) {
       const space = new TextRenderable(ctx, {
         content: ' ',
-        attributes: isTargeted ? TextAttributes.INVERSE : 0,
+        fg: isTargeted ? palette.bg : palette.fg,
+        bg: isTargeted ? palette.fg : undefined,
       })
       headerBox.add(space)
 
       const detailText = new TextRenderable(ctx, {
         content: detail,
-        attributes: (isTargeted ? TextAttributes.INVERSE : 0) | TextAttributes.DIM,
+        fg: isTargeted ? palette.bg : palette.dimFg,
+        bg: isTargeted ? palette.fg : undefined,
       })
       headerBox.add(detailText)
     }
 
-    const suffix = new TextRenderable(ctx, {
-      content: ' ───',
-      fg: darkTheme.toolHeader.fg,
-      attributes: isTargeted ? TextAttributes.INVERSE : 0,
-    })
-    headerBox.add(suffix)
+    if (resultBlock !== null && state.collapsed) {
+      const countText = new TextRenderable(ctx, {
+        content: `  ${lineCount} lines`,
+        fg: isTargeted ? palette.bg : palette.dimFg,
+        bg: isTargeted ? palette.fg : undefined,
+      })
+      headerBox.add(countText)
+    }
 
     container.add(headerBox)
 
     if (resultBlock === null) {
-      // No result — not collapsible
-      const noResult = new TextRenderable(ctx, {
-        content: '(no result)',
-        attributes: TextAttributes.DIM,
-      })
-      container.add(noResult)
       return
     }
 
-    if (state.collapsed) {
-      // Collapsed view: ▸ (N lines)
-      const collapsedLine = new TextRenderable(ctx, {
-        content: `▸ (${lineCount} lines)`,
-        fg: darkTheme.collapsedLineCount.fg,
-      })
-      container.add(collapsedLine)
-    } else {
-      // Expanded view: toggle indicator + content lines + footer
-      const toggleLine = new TextRenderable(ctx, {
-        content: `▾ (${lineCount} lines)`,
-        fg: darkTheme.collapsedLineCount.fg,
-      })
-      container.add(toggleLine)
-
+    if (!state.collapsed) {
+      // Expanded view: content lines
       const content = resultBlock.content
       const lines = content.split('\n')
       const displayLines = lines.length > TOOL_OUTPUT_CAP ? lines.slice(0, TOOL_OUTPUT_CAP) : lines
@@ -158,12 +154,12 @@ export function createContent(parentBox: any) {
       for (const line of displayLines) {
         const lineRow = new BoxRenderable(ctx, { flexDirection: 'row' })
         const borderChar = new TextRenderable(ctx, {
-          content: '│ ',
-          attributes: TextAttributes.DIM,
+          content: '  │ ',
+          fg: palette.dimFg,
         })
         const lineContent = new TextRenderable(ctx, {
           content: line,
-          fg: resultBlock.isError ? darkTheme.error.fg : undefined,
+          fg: resultBlock.isError ? '#d75f5f' : palette.fg,
         })
         lineRow.add(borderChar)
         lineRow.add(lineContent)
@@ -172,18 +168,11 @@ export function createContent(parentBox: any) {
 
       if (lines.length > TOOL_OUTPUT_CAP) {
         const truncMsg = new TextRenderable(ctx, {
-          content: `... truncated (${lines.length} total lines)`,
-          attributes: TextAttributes.DIM,
+          content: `  … truncated (${lines.length} total lines)`,
+          fg: palette.dimFg,
         })
         container.add(truncMsg)
       }
-
-      // Footer separator
-      const footer = new TextRenderable(ctx, {
-        content: '──────────────────────────────',
-        attributes: TextAttributes.DIM,
-      })
-      container.add(footer)
     }
   }
 
@@ -200,46 +189,55 @@ export function createContent(parentBox: any) {
 
     const isTargeted = stateIndex === targetedIndex
     const state = collapsibleStates[stateIndex]
+    const chevron = state.collapsed ? '▸ ' : '▾ '
 
-    // Header line: ─── Thinking ───
+    // Header line: ▸ Thinking
     const headerBox = new BoxRenderable(ctx, {
       flexDirection: 'row',
       width: '100%',
     })
-    const headerText = new TextRenderable(ctx, {
-      content: '─── Thinking ───',
-      attributes: TextAttributes.DIM | (isTargeted ? TextAttributes.INVERSE : 0),
+
+    const chevronText = new TextRenderable(ctx, {
+      content: chevron,
+      fg: palette.dimFg,
+      bg: isTargeted ? palette.fg : undefined,
+      attributes: isTargeted ? TextAttributes.INVERSE : 0,
     })
-    headerBox.add(headerText)
-    container.add(headerBox)
+    headerBox.add(chevronText)
+
+    const labelText = new TextRenderable(ctx, {
+      content: 'Thinking',
+      fg: isTargeted ? palette.bg : palette.dimFg,
+      bg: isTargeted ? palette.fg : undefined,
+      attributes: TextAttributes.ITALIC,
+    })
+    headerBox.add(labelText)
 
     if (state.collapsed) {
-      // Collapsed view: ▸ (N lines)
-      const collapsedLine = new TextRenderable(ctx, {
-        content: `▸ (${lineCount} lines)`,
-        fg: darkTheme.collapsedLineCount.fg,
+      const countText = new TextRenderable(ctx, {
+        content: `  ${lineCount} lines`,
+        fg: isTargeted ? palette.bg : palette.dimFg,
+        bg: isTargeted ? palette.fg : undefined,
       })
-      container.add(collapsedLine)
-    } else {
-      // Expanded view: ▾ (N lines) + content + footer
-      const toggleLine = new TextRenderable(ctx, {
-        content: `▾ (${lineCount} lines)`,
-        fg: darkTheme.collapsedLineCount.fg,
-      })
-      container.add(toggleLine)
+      headerBox.add(countText)
+    }
 
+    container.add(headerBox)
+
+    if (!state.collapsed) {
       const lines = thinkingBlock.thinking.split('\n')
       const displayLines = lines.length > TOOL_OUTPUT_CAP ? lines.slice(0, TOOL_OUTPUT_CAP) : lines
 
       for (const line of displayLines) {
         const lineRow = new BoxRenderable(ctx, { flexDirection: 'row' })
         const borderChar = new TextRenderable(ctx, {
-          content: '│ ',
-          attributes: TextAttributes.DIM,
+          content: '  │ ',
+          fg: palette.dimFg,
         })
         const lineContent = new TextRenderable(ctx, {
           content: line,
-          attributes: TextAttributes.DIM | TextAttributes.ITALIC,
+          fg: palette.dimFg,
+          attributes: TextAttributes.ITALIC,
         })
         lineRow.add(borderChar)
         lineRow.add(lineContent)
@@ -248,18 +246,11 @@ export function createContent(parentBox: any) {
 
       if (lines.length > TOOL_OUTPUT_CAP) {
         const truncMsg = new TextRenderable(ctx, {
-          content: `... truncated (${lines.length} total lines)`,
-          attributes: TextAttributes.DIM,
+          content: `  … truncated (${lines.length} total lines)`,
+          fg: palette.dimFg,
         })
         container.add(truncMsg)
       }
-
-      // Footer separator
-      const footer = new TextRenderable(ctx, {
-        content: '──────────────────────────────',
-        attributes: TextAttributes.DIM,
-      })
-      container.add(footer)
     }
   }
 
@@ -273,11 +264,15 @@ export function createContent(parentBox: any) {
     if (blocks.length === 0) {
       const emptyText = new TextRenderable(ctx, {
         content: '(empty)',
+        fg: palette.dimFg,
         alignSelf: 'center',
       })
       scrollBox.add(emptyText)
       return
     }
+
+    // Add top spacing
+    addSpacer()
 
     for (let i = 0; i < blocks.length; i++) {
       const block = blocks[i]
@@ -286,22 +281,30 @@ export function createContent(parentBox: any) {
         if (!block.text) continue
         const textNode = new TextRenderable(ctx, {
           content: block.text,
+          fg: palette.fg,
           wrapMode: 'word',
         })
         scrollBox.add(textNode)
+        addSpacer()
       } else if (block.type === 'error') {
         const errorBox = new BoxRenderable(ctx, {
-          borderStyle: 'single',
-          border: true,
-          borderColor: '#ff0000',
+          flexDirection: 'row',
+          width: '100%',
+        })
+        const errorPrefix = new TextRenderable(ctx, {
+          content: '✗ ',
+          fg: '#d75f5f',
+          attributes: TextAttributes.BOLD,
         })
         const errorText = new TextRenderable(ctx, {
           content: block.text,
-          fg: '#ff0000',
+          fg: '#d75f5f',
           wrapMode: 'word',
         })
+        errorBox.add(errorPrefix)
         errorBox.add(errorText)
         scrollBox.add(errorBox)
+        addSpacer()
       } else if (block.type === 'tool_use') {
         // Find matching ToolResultBlock by scanning forward
         let resultBlock: ToolResultBlock | null = null
@@ -350,6 +353,7 @@ export function createContent(parentBox: any) {
             lineCount,
           })
         }
+        addSpacer()
       } else if (block.type === 'tool_result') {
         // handled above via forward scan from tool_use
       } else if (block.type === 'thinking') {
@@ -373,6 +377,7 @@ export function createContent(parentBox: any) {
           container,
           lineCount,
         })
+        addSpacer()
       }
     }
   }
