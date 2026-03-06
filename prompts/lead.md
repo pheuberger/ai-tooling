@@ -23,6 +23,8 @@ Do NOT run bd commands you haven't seen above — the worker and reviewer handle
 ${PLAN_BODY}
 
 ## Instructions
+Before creating beads, use Read/Grep/Glob to verify file paths, function signatures, and module structures referenced in the plan. Use WebSearch to verify external dependencies and APIs.
+
 Break this into small, independently implementable child tasks using bd create.
 Each task will be worked on by a separate Claude Code instance with NO shared context.
 

@@ -7,6 +7,7 @@ State lives in the filesystem and git, not in your memory (Ralph Loop pattern).
 - Do NOT close, update status, or sync beads. Bead lifecycle is managed externally.
 - Do NOT use TodoWrite or TaskCreate for tracking.
 - Focus ONLY on the task below. Do not work on anything else.
+- When implementing against third-party libraries or APIs, use WebSearch or WebFetch to check current documentation rather than relying on memory.
 - If you are genuinely blocked (missing dependency, wrong spec, file doesn't exist), file a blocker and stop:
     NEW_ID=$(bd create "Blocker: <description>" -t bug -p 1 ${BEAD_LABELS} --silent)
     bd dep "$NEW_ID" --blocks ${BEAD_ID}
