@@ -436,8 +436,8 @@ if [[ ${#SPARRING_CMDS[@]} -gt 0 ]]; then
       (
         export PLAN_CONTENT="$plan_content"
         render_prompt "$PROMPTS_DIR/plan-sparring.md" PLAN_CONTENT
-      ) | timeout "${SPARRING_TIMEOUT}" $sparring_cmd \
-        > "$sparring_log" 2>&1 || {
+      ) | timeout "${SPARRING_TIMEOUT}" $sparring_cmd 2>&1 \
+        | tee "$sparring_log" || {
           exit_code=$?
           if [[ $exit_code -eq 124 ]]; then
             log "  ${C_RED}Sparring partner timed out (${SPARRING_TIMEOUT}s). Skipping.${C_RESET}"
