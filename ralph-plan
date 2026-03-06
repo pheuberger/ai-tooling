@@ -124,7 +124,7 @@ claude_as() {
 # Default lenses
 # ---------------------------------------------------------------------------
 declare -A LENS_INSTRUCTIONS
-LENS_INSTRUCTIONS[feasibility]="Can this be built as described? Look for technical impossibilities, unrealistic estimates, missing prerequisites, and dependencies that don't exist."
+LENS_INSTRUCTIONS[feasibility]="Can this be built as described? Look for technical impossibilities, unrealistic estimates, missing prerequisites, and dependencies that don't exist. Use WebSearch to verify external dependencies, APIs, and third-party tools referenced in the plan actually exist and work as described."
 LENS_INSTRUCTIONS[gaps-and-edge-cases]="What's missing? Look for unhandled error cases, race conditions, partial failures, unhandled workflows, missing validation, and implicit assumptions."
 LENS_INSTRUCTIONS[security-and-risk]="Look for injection vectors, secrets handling issues, auth gaps, blast radius concerns, supply chain risks, and insufficient input validation."
 LENS_INSTRUCTIONS[maintainability]="Evaluate testability, abstraction quality, coupling, observability, and future-proofing. Look for code that will be hard to debug, extend, or operate."
