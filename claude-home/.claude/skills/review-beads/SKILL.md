@@ -45,9 +45,15 @@ Quality gate: a bead passes only if ANY agent can implement it WITHOUT reading o
 
 ### Must Split
 
-- Touches >3 files for different reasons
 - Has >2 logical concerns
 - Title contains "and" connecting distinct deliverables
+- Touches >3 files with **different logic per file** (unique changes, different signatures, different patterns)
+
+### Do NOT Split
+
+- **Mechanical/repetitive changes** — the same transformation applied uniformly across many files (e.g., add an import, rename a symbol, update a call site, apply a new pattern). 10 files with the same 2-line change is one bead.
+- **Tightly coupled files** — files that always change together (e.g., component + its styles + its test, or a type definition + all its consumers). Splitting these just creates dependency chains with no benefit.
+- **Single concern, many touchpoints** — if every file change serves the same purpose and the bead has only one logical concern, file count alone is never a reason to split.
 
 ### Enrichment Standard
 
