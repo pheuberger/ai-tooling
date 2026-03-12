@@ -57,6 +57,31 @@
 # PLAN_REVIEW_SPARRING_TIMEOUT=300         # seconds
 
 # ---------------------------------------------------------------------------
+# ralph-pr-watch — PR comment watcher
+#
+# Agent defaults:
+#   Triage → opus (deep code analysis, nuanced judgment)
+#   Worker → sonnet (well-specified implementation)
+#   Commit → haiku (mechanical commit message)
+#   Defer  → sonnet (creates Linear issue with context)
+# ---------------------------------------------------------------------------
+# PR_WATCH_INTERVAL=300                   # seconds between polling cycles
+# PR_WATCH_MAX_CYCLES=0                   # 0 = infinite
+# PR_WATCH_MAX_RETRIES=3                  # retries per fix group
+# PR_WATCH_LINEAR_TEAM=""                 # Linear team for deferred issues
+# TRIAGE_MODEL="claude-opus-4-6"
+# PR_WATCH_WORKER_MODEL="claude-sonnet-4-6"
+# PR_WATCH_COMMIT_MODEL="claude-haiku-4-5-20251001"
+# DEFER_MODEL="claude-sonnet-4-6"
+
+# ---------------------------------------------------------------------------
+# Notifications — used by ralph-pr-watch
+# ---------------------------------------------------------------------------
+# NOTIFY_TELEGRAM_TOKEN=""                # Bot token from @BotFather
+# NOTIFY_TELEGRAM_CHAT_ID=""              # Chat/group ID
+# NOTIFY_SLACK_WEBHOOK=""                 # Incoming webhook URL
+
+# ---------------------------------------------------------------------------
 # Conditional example — different settings per environment
 # ---------------------------------------------------------------------------
 # if [[ -n "$CI" ]]; then

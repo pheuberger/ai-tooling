@@ -1,0 +1,855 @@
+#!/usr/bin/env bash
+# ralph-pr-watch — Autonomous PR comment watcher and fixer
+#
+# Polls unresolved PR review threads, triages them, implements fixes,
+# defers out-of-scope work to Linear, and notifies via Slack/Telegram.
+# Fire-and-forget: run in background and it handles everything.
+#
+# Usage: ./ralph-pr-watch [options]
+#   --pr NUMBER          PR number (default: detect from current branch)
+#   --repo OWNER/REPO    GitHub repo (default: detect from git remote)
+#   --interval SECONDS   Polling interval (default: 300)
+#   --max-cycles N       Max polling cycles, 0 = infinite (default: 0)
+#   --model MODEL        Force all agents to this model
+#   --once               Single cycle, then exit
+#   --dry-run            Triage only, no fixes or pushes
+#   -h, --help           Show this help
+#
+# Configuration (.ralphrc):
+#   PR_WATCH_INTERVAL, PR_WATCH_MAX_CYCLES, PR_WATCH_MAX_RETRIES,
+#   PR_WATCH_LINEAR_TEAM, TRIAGE_MODEL, PR_WATCH_WORKER_MODEL,
+#   PR_WATCH_COMMIT_MODEL, DEFER_MODEL,
+#   NOTIFY_TELEGRAM_TOKEN, NOTIFY_TELEGRAM_CHAT_ID, NOTIFY_SLACK_WEBHOOK
+#
+# Requires: claude (Claude Code CLI), gh (GitHub CLI), jq, git
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROMPTS_DIR="${PROMPTS_DIR:-$SCRIPT_DIR/prompts}"
+
+# ---------------------------------------------------------------------------
+# Colors
+# ---------------------------------------------------------------------------
+C_RESET='\033[0m'
+C_BOLD='\033[1m'
+C_DIM='\033[2m'
+C_CYAN='\033[36m'
+C_GREEN='\033[32m'
+C_YELLOW='\033[33m'
+C_MAGENTA='\033[35m'
+C_BLUE='\033[34m'
+C_RED='\033[31m'
+C_WHITE='\033[97m'
+
+# ---------------------------------------------------------------------------
+# Output helpers — clean, scannable terminal output
+# ---------------------------------------------------------------------------
+ts()         { printf '%s' "$(date '+%Y-%m-%d %H:%M:%S')"; }
+log_ts()     { echo -e "${C_DIM}[$(ts)]${C_RESET} $*"; }
+out()        { echo -e "  $1 $2"; }
+detail()     { echo -e "    ${C_DIM}$1${C_RESET}"; }
+section()    { echo -e "\n${C_BOLD}$1${C_RESET}"; }
+phase_hdr()  { echo -e "  ${1}●${C_RESET} ${C_BOLD}${2}${C_RESET}"; }
+
+fmt_duration() {
+  local secs=$((${1:-0} / 1000))
+  if [[ $secs -ge 60 ]]; then printf '%dm %ds' "$((secs/60))" "$((secs%60))"
+  else printf '%ds' "$secs"; fi
+}
+fmt_cost() { printf '%.2f' "${1:-0}"; }
+
+# render_prompt <template_file> [VAR1 VAR2 ...]
+render_prompt() {
+  local template="$1"; shift
+  [[ -f "$template" ]] || { echo "Missing prompt template: $template" >&2; return 1; }
+
+  local content
+  content=$(<"$template")
+
+  while [[ "$content" =~ \{\{#IF\ ([A-Z_]+)\}\} ]]; do
+    local var_name="${BASH_REMATCH[1]}"
+    local var_val="${!var_name:-}"
+    if [[ -n "$var_val" ]]; then
+      content=$(echo "$content" | sed "/{{#IF ${var_name}}}/d; /{{\/IF ${var_name}}}/d")
+    else
+      content=$(echo "$content" | sed "/{{#IF ${var_name}}}/,/{{\/IF ${var_name}}}/d")
+    fi
+  done
+
+  local varlist=""
+  for v in "$@"; do varlist="$varlist \${$v}"; done
+  echo "$content" | envsubst "$varlist"
+}
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+PR_NUMBER=""
+REPO_FULL=""              # OWNER/REPO
+INTERVAL=300              # seconds between cycles
+MAX_CYCLES=0              # 0 = infinite
+MAX_RETRIES=3             # retries per fix group
+MODEL=""                  # global override
+TRIAGE_MODEL=""           # triage agent — default: opus
+PR_WATCH_WORKER_MODEL=""  # fix worker — default: sonnet
+PR_WATCH_COMMIT_MODEL=""  # commit agent — default: haiku
+DEFER_MODEL=""            # defer agent (Linear issue) — default: sonnet
+DRY_RUN=false
+ONCE=false
+LINEAR_TEAM=""            # Linear team for deferred issues
+LOG_DIR=".ralph-logs/pr-watch"
+RALPH_RULES_FILE=".ralph-rules.md"
+
+# Notifications
+NOTIFY_TELEGRAM_TOKEN=""
+NOTIFY_TELEGRAM_CHAT_ID=""
+NOTIFY_SLACK_WEBHOOK=""
+
+# Source per-project config (CLI flags override)
+if [[ -f ".ralphrc" ]]; then
+  # shellcheck source=/dev/null
+  source ".ralphrc"
+fi
+
+# Map .ralphrc convenience names
+INTERVAL="${PR_WATCH_INTERVAL:-$INTERVAL}"
+MAX_CYCLES="${PR_WATCH_MAX_CYCLES:-$MAX_CYCLES}"
+MAX_RETRIES="${PR_WATCH_MAX_RETRIES:-$MAX_RETRIES}"
+LINEAR_TEAM="${PR_WATCH_LINEAR_TEAM:-$LINEAR_TEAM}"
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --pr)           PR_NUMBER="$2"; shift 2 ;;
+    --repo)         REPO_FULL="$2"; shift 2 ;;
+    --interval)     INTERVAL="$2"; shift 2 ;;
+    --max-cycles)   MAX_CYCLES="$2"; shift 2 ;;
+    --model)        MODEL="$2"; shift 2 ;;
+    --once)         ONCE=true; MAX_CYCLES=1; shift ;;
+    --dry-run)      DRY_RUN=true; shift ;;
+    -h|--help)      sed -n '/^# Usage/,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    *)              echo "Unknown option: $1" >&2; exit 1 ;;
+  esac
+done
+
+# ---------------------------------------------------------------------------
+# Preflight
+# ---------------------------------------------------------------------------
+for cmd in claude gh jq git envsubst; do
+  command -v "$cmd" >/dev/null 2>&1 || { echo "Required: $cmd" >&2; exit 1; }
+done
+
+# Detect PR number from current branch
+if [[ -z "$PR_NUMBER" ]]; then
+  PR_NUMBER=$(gh pr view --json number -q '.number' 2>/dev/null) \
+    || { echo "No PR found for current branch. Use --pr NUMBER." >&2; exit 1; }
+fi
+
+# Detect repo from git remote
+if [[ -z "$REPO_FULL" ]]; then
+  REPO_FULL=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>/dev/null) \
+    || { echo "Cannot detect repo. Use --repo OWNER/REPO." >&2; exit 1; }
+fi
+
+OWNER="${REPO_FULL%%/*}"
+REPO="${REPO_FULL##*/}"
+
+# Fetch PR metadata
+PR_JSON=$(gh pr view "$PR_NUMBER" --json title,url,headRefName,baseRefName 2>/dev/null) \
+  || { echo "Cannot fetch PR #$PR_NUMBER" >&2; exit 1; }
+PR_TITLE=$(echo "$PR_JSON" | jq -r '.title')
+PR_URL=$(echo "$PR_JSON" | jq -r '.url')
+PR_HEAD=$(echo "$PR_JSON" | jq -r '.headRefName')
+PR_BASE=$(echo "$PR_JSON" | jq -r '.baseRefName')
+
+# Validate current branch matches PR head
+current_branch=$(git rev-parse --abbrev-ref HEAD)
+if [[ "$current_branch" != "$PR_HEAD" ]]; then
+  echo "Current branch ($current_branch) does not match PR head ($PR_HEAD)." >&2
+  echo "Checkout the PR branch first: git checkout $PR_HEAD" >&2
+  exit 1
+fi
+
+# Per-agent model defaults
+TRIAGE_MODEL="${MODEL:-${TRIAGE_MODEL:-claude-opus-4-6}}"
+PR_WATCH_WORKER_MODEL="${MODEL:-${PR_WATCH_WORKER_MODEL:-claude-sonnet-4-6}}"
+PR_WATCH_COMMIT_MODEL="${MODEL:-${PR_WATCH_COMMIT_MODEL:-claude-haiku-4-5-20251001}}"
+DEFER_MODEL="${MODEL:-${DEFER_MODEL:-claude-sonnet-4-6}}"
+
+# Common claude flags
+claude_flags=(--print --dangerously-skip-permissions)
+
+claude_as() {
+  local model="$1"; shift
+  claude "${claude_flags[@]}" --model "$model" "$@"
+}
+
+short_model() { echo "$1" | sed 's/^claude-//; s/-[0-9].*//'; }
+
+# Setup logging
+mkdir -p "$LOG_DIR"
+PROCESSED_FILE="$LOG_DIR/.processed-comments"
+touch "$PROCESSED_FILE"
+
+# Load project rules
+project_rules=""
+[[ -f "$RALPH_RULES_FILE" ]] && project_rules=$(<"$RALPH_RULES_FILE")
+
+# Cost tracking
+declare -A AGENT_COSTS
+extract_cost() {
+  local agent_type="$1" log_file="$2"
+  local cost
+  cost=$(jq -r 'select(.type == "result") | .total_cost_usd // 0' "$log_file" 2>/dev/null | tail -1)
+  if [[ -n "$cost" && "$cost" != "0" && "$cost" != "null" ]]; then
+    AGENT_COSTS[$agent_type]=$(echo "${AGENT_COSTS[$agent_type]:-0} + $cost" | bc 2>/dev/null || echo "${AGENT_COSTS[$agent_type]:-0}")
+  fi
+}
+
+extract_result() {
+  jq -r 'select(.type == "result") | "\(.duration_ms // 0) \(.total_cost_usd // 0)"' "$1" 2>/dev/null | tail -1
+}
+
+# Stream filter — same as ralph-bd
+ralph_stream_filter() {
+  jq --unbuffered -r '
+    if .type == "assistant" then
+      [.message.content[]? |
+        if .type == "tool_use" then
+          (.input // {}) as $in |
+          (.name as $n |
+            if   $n == "Bash"   then $in.command // ""
+            elif $n == "Edit"   then $in.file_path // ""
+            elif $n == "Read"   then $in.file_path // ""
+            elif $n == "Write"  then $in.file_path // ""
+            elif $n == "Grep"   then ($in.pattern // "") + " " + ($in.path // "")
+            elif $n == "Glob"   then $in.pattern // ""
+            else "" end
+          ) as $detail |
+          "    \u001b[36m>>> " + .name + "\u001b[2m " + ($detail | .[0:120]) + "\u001b[0m"
+        else empty end
+      ] | join("\n") | select(length > 0)
+    else empty end
+  ' 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# GraphQL helpers
+# ---------------------------------------------------------------------------
+GRAPHQL_QUERY_FILE=$(mktemp /tmp/ralph-pr-threads.XXXXXX.graphql)
+cat <<'GRAPHQL' > "$GRAPHQL_QUERY_FILE"
+query($owner: String!, $repo: String!, $pr: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $pr) {
+      title
+      url
+      reviewThreads(first: 100) {
+        nodes {
+          id
+          isResolved
+          isOutdated
+          comments(first: 20) {
+            nodes {
+              id
+              body
+              author { login }
+              path
+              line
+              createdAt
+              url
+            }
+          }
+        }
+      }
+    }
+  }
+}
+GRAPHQL
+
+GRAPHQL_RESOLVE_FILE=$(mktemp /tmp/ralph-pr-resolve.XXXXXX.graphql)
+cat <<'GRAPHQL' > "$GRAPHQL_RESOLVE_FILE"
+mutation($threadId: ID!) {
+  resolveReviewThread(input: {threadId: $threadId}) {
+    thread { isResolved }
+  }
+}
+GRAPHQL
+
+cleanup() {
+  rm -f "$GRAPHQL_QUERY_FILE" "$GRAPHQL_RESOLVE_FILE"
+}
+trap cleanup EXIT
+
+# ---------------------------------------------------------------------------
+# Core functions
+# ---------------------------------------------------------------------------
+
+# Fetch unresolved comment threads, filtering out already-processed ones
+fetch_unresolved_comments() {
+  local raw_json
+  raw_json=$(gh api graphql \
+    -F owner="$OWNER" \
+    -F repo="$REPO" \
+    -F "pr=$PR_NUMBER" \
+    -F query=@"$GRAPHQL_QUERY_FILE" 2>/dev/null) || { echo "[]"; return 1; }
+
+  # Extract unresolved threads, filter out processed
+  echo "$raw_json" | jq --slurpfile processed <(
+    # Convert processed file to JSON array
+    if [[ -s "$PROCESSED_FILE" ]]; then
+      jq -R -s 'split("\n") | map(select(length > 0))' "$PROCESSED_FILE"
+    else
+      echo '[]'
+    fi
+  ) '
+    [.data.repository.pullRequest.reviewThreads.nodes[] |
+     select(.isResolved == false) |
+     select(.id as $id | $processed[0] | index($id) | not)]
+  '
+}
+
+# Check if a thread ID has been processed
+is_processed() {
+  grep -qxF "$1" "$PROCESSED_FILE" 2>/dev/null
+}
+
+# Mark a thread ID as processed
+mark_processed() {
+  echo "$1" >> "$PROCESSED_FILE"
+}
+
+# Reply to a review thread comment
+reply_to_thread() {
+  local comment_id="$1" body="$2"
+  gh api "repos/$OWNER/$REPO/pulls/$PR_NUMBER/comments" \
+    --method POST \
+    -f body="$body" \
+    -F "in_reply_to=$comment_id" > /dev/null 2>&1
+}
+
+# Resolve a review thread
+resolve_thread() {
+  local thread_id="$1"
+  gh api graphql \
+    -F query=@"$GRAPHQL_RESOLVE_FILE" \
+    -f threadId="$thread_id" > /dev/null 2>&1
+}
+
+# Extract the numeric REST comment ID from a thread's first comment
+# The GraphQL id is opaque; we need the numeric id for REST replies.
+# We extract it from the comment URL: ...#discussion_r<ID> or from the
+# databaseId field if present, or fall back to listing PR comments.
+get_comment_id() {
+  local thread_json="$1"
+  local url
+  url=$(echo "$thread_json" | jq -r '.comments.nodes[0].url // ""')
+  if [[ "$url" =~ discussion_r([0-9]+) ]]; then
+    echo "${BASH_REMATCH[1]}"
+    return
+  fi
+  # Fallback: try databaseId from comments
+  local db_id
+  db_id=$(echo "$thread_json" | jq -r '.comments.nodes[0].id // ""')
+  if [[ -n "$db_id" && "$db_id" =~ ^[0-9]+$ ]]; then
+    echo "$db_id"
+    return
+  fi
+  echo ""
+}
+
+# Triage all threads via Claude
+triage_comments() {
+  local threads_json="$1"
+  local triage_log="$LOG_DIR/triage-$(date '+%Y%m%d-%H%M%S').log"
+
+  phase_hdr "$C_BLUE" "Triage — $(short_model "$TRIAGE_MODEL")"
+
+  local triage_output
+  triage_output=$(claude_as "$TRIAGE_MODEL" --output-format stream-json --verbose -p "$(
+    export PR_NUMBER PR_TITLE PR_URL PR_BASE REPO_FULL
+    export THREADS_JSON="$threads_json"
+    render_prompt "$PROMPTS_DIR/pr-watch-triage.md" \
+      PR_NUMBER PR_TITLE PR_URL PR_BASE REPO_FULL THREADS_JSON
+  )" 2>&1 | tee "$triage_log" | ralph_stream_filter)
+
+  extract_cost "triage" "$triage_log"
+  read -r dur cost <<< "$(extract_result "$triage_log")"
+  out "${C_GREEN}✓${C_RESET}" "${C_DIM}$(fmt_duration "$dur") · \$$(fmt_cost "$cost")${C_RESET}"
+
+  # Extract the JSON array from the assistant's text output
+  jq -r 'select(.type == "assistant") | .message.content[]? | select(.type == "text") | .text' \
+    "$triage_log" 2>/dev/null \
+    | grep -v '^$' \
+    | sed -n '/^\[/,/^\]/p' \
+    | jq '.' 2>/dev/null || echo "[]"
+}
+
+# Fix a group of comments
+fix_comment_group() {
+  local group_json="$1"
+  local group_id
+  group_id=$(echo "$group_json" | jq -r '.group_id')
+  local fix_desc
+  fix_desc=$(echo "$group_json" | jq -r '.fix_description')
+  local threads_json
+  threads_json=$(echo "$group_json" | jq -c '.threads')
+
+  local retries=0
+  local success=false
+
+  while [[ $retries -lt $MAX_RETRIES ]]; do
+    echo ""
+    if [[ $MAX_RETRIES -gt 1 ]]; then
+      phase_hdr "$C_CYAN" "Worker [$group_id] (attempt $((retries + 1))/$MAX_RETRIES) — $(short_model "$PR_WATCH_WORKER_MODEL")"
+    else
+      phase_hdr "$C_CYAN" "Worker [$group_id] — $(short_model "$PR_WATCH_WORKER_MODEL")"
+    fi
+
+    local worker_log="$LOG_DIR/worker-${group_id}-$(date '+%H%M%S').log"
+    claude_as "$PR_WATCH_WORKER_MODEL" --output-format stream-json --verbose -p "$(
+      export PR_NUMBER PR_TITLE PR_BASE REPO_FULL
+      export FIX_DESCRIPTION="$fix_desc" THREADS_JSON="$threads_json"
+      export PROJECT_RULES="$project_rules"
+      render_prompt "$PROMPTS_DIR/pr-watch-worker.md" \
+        PR_NUMBER PR_TITLE PR_BASE REPO_FULL FIX_DESCRIPTION THREADS_JSON PROJECT_RULES
+    )" 2>&1 | tee "$worker_log" | ralph_stream_filter || true
+
+    extract_cost "worker" "$worker_log"
+
+    if jq -e 'select(.type == "result" and .subtype == "success")' "$worker_log" > /dev/null 2>&1; then
+      read -r dur cost <<< "$(extract_result "$worker_log")"
+      out "${C_GREEN}✓${C_RESET}" "${C_DIM}$(fmt_duration "$dur") · \$$(fmt_cost "$cost")${C_RESET}"
+
+      # Check if worker actually applied a fix
+      local worker_text
+      worker_text=$(jq -r 'select(.type == "assistant") | .message.content[]? | select(.type == "text") | .text' "$worker_log" 2>/dev/null | tail -1)
+      if [[ "$worker_text" == *"FIX_SKIPPED"* ]]; then
+        out "${C_YELLOW}⏭${C_RESET}" "worker skipped fix for $group_id"
+        return 1
+      fi
+      success=true
+      break
+    fi
+
+    retries=$((retries + 1))
+    if [[ $retries -lt $MAX_RETRIES ]]; then
+      out "${C_YELLOW}✗${C_RESET}" "failed, retrying in 5s..."
+      sleep 5
+    fi
+  done
+
+  if [[ "$success" == false ]]; then
+    out "${C_RED}✗${C_RESET}" "fix failed after $MAX_RETRIES attempts — $group_id"
+    return 1
+  fi
+  return 0
+}
+
+# Commit and push changes
+commit_and_push() {
+  local group_id="$1"
+
+  # Check for actual changes
+  if git diff --quiet && git diff --cached --quiet && \
+     [[ -z "$(git ls-files --others --exclude-standard -- ':!.ralph-logs' 2>/dev/null)" ]]; then
+    detail "no changes to commit"
+    return 1
+  fi
+
+  echo ""
+  phase_hdr "$C_YELLOW" "Commit — $(short_model "$PR_WATCH_COMMIT_MODEL")"
+  local commit_log="$LOG_DIR/commit-${group_id}-$(date '+%H%M%S').log"
+  claude_as "$PR_WATCH_COMMIT_MODEL" -p "$(
+    export PR_NUMBER
+    render_prompt "$PROMPTS_DIR/pr-watch-commit.md" PR_NUMBER
+  )" > "$commit_log" 2>&1 \
+    && out "${C_GREEN}✓${C_RESET}" "committed" \
+    || { out "${C_RED}✗${C_RESET}" "commit failed"; return 1; }
+
+  extract_cost "commit" "$commit_log"
+
+  # Push with rebase-retry on conflict
+  local push_retries=0
+  while [[ $push_retries -lt 3 ]]; do
+    if git push 2>/dev/null; then
+      out "${C_GREEN}✓${C_RESET}" "pushed"
+      return 0
+    fi
+    push_retries=$((push_retries + 1))
+    detail "push conflict — pulling and retrying ($push_retries/3)"
+    if ! git pull --rebase 2>/dev/null; then
+      out "${C_RED}✗${C_RESET}" "rebase conflict on push — aborting"
+      git rebase --abort 2>/dev/null || true
+      notify "error" "Push failed for $group_id — rebase conflict"
+      return 1
+    fi
+  done
+
+  out "${C_RED}✗${C_RESET}" "push failed after retries"
+  return 1
+}
+
+# Create a Linear issue for deferred work
+defer_comment_group() {
+  local group_json="$1"
+  local group_id
+  group_id=$(echo "$group_json" | jq -r '.group_id')
+  local reason
+  reason=$(echo "$group_json" | jq -r '.reason')
+  local threads_json
+  threads_json=$(echo "$group_json" | jq -c '.threads')
+
+  echo ""
+  phase_hdr "$C_MAGENTA" "Defer [$group_id] — $(short_model "$DEFER_MODEL")"
+  local defer_log="$LOG_DIR/defer-${group_id}-$(date '+%H%M%S').log"
+
+  local defer_output
+  defer_output=$(claude_as "$DEFER_MODEL" -p "$(
+    export PR_NUMBER PR_TITLE PR_URL REPO_FULL GROUP_ID="$group_id" REASON="$reason"
+    export THREADS_JSON="$threads_json" LINEAR_TEAM="$LINEAR_TEAM"
+    render_prompt "$PROMPTS_DIR/pr-watch-defer.md" \
+      PR_NUMBER PR_TITLE PR_URL REPO_FULL GROUP_ID REASON THREADS_JSON LINEAR_TEAM
+  )" 2>&1 | tee "$defer_log")
+
+  extract_cost "defer" "$defer_log"
+
+  # Extract issue ID from output
+  local issue_id
+  issue_id=$(echo "$defer_output" | grep -oP 'ISSUE_ID:\s*\K\S+' | tail -1)
+  if [[ -n "$issue_id" ]]; then
+    out "${C_GREEN}✓${C_RESET}" "created $issue_id"
+    echo "$issue_id"
+  else
+    out "${C_YELLOW}?${C_RESET}" "defer agent ran but no issue ID found"
+    echo ""
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Notification helpers
+# ---------------------------------------------------------------------------
+notify() {
+  local type="$1" message="$2"
+
+  # Telegram
+  if [[ -n "$NOTIFY_TELEGRAM_TOKEN" && -n "$NOTIFY_TELEGRAM_CHAT_ID" ]]; then
+    curl -s -X POST \
+      "https://api.telegram.org/bot${NOTIFY_TELEGRAM_TOKEN}/sendMessage" \
+      -d chat_id="$NOTIFY_TELEGRAM_CHAT_ID" \
+      -d text="[$type] PR #$PR_NUMBER: $message" \
+      -d parse_mode="Markdown" > /dev/null 2>&1 || true
+  fi
+
+  # Slack
+  if [[ -n "$NOTIFY_SLACK_WEBHOOK" ]]; then
+    local slack_text="[$type] PR #$PR_NUMBER — $PR_TITLE: $message"
+    curl -s -X POST "$NOTIFY_SLACK_WEBHOOK" \
+      -H 'Content-type: application/json' \
+      -d "{\"text\": $(echo "$slack_text" | jq -Rs .)}" > /dev/null 2>&1 || true
+  fi
+}
+
+send_cycle_summary() {
+  local cycle="$1" fixed="$2" deferred="$3" questions="$4" dropped="$5"
+
+  # Build summary text
+  local summary="PR #$PR_NUMBER — \"$PR_TITLE\" — Cycle $cycle\n"
+
+  if [[ -n "$fixed" ]]; then
+    summary+="\nFixed:\n$fixed"
+  fi
+  if [[ -n "$deferred" ]]; then
+    summary+="\nDeferred:\n$deferred"
+  fi
+  if [[ -n "$questions" ]]; then
+    summary+="\nQuestions needing attention:\n$questions"
+  fi
+  if [[ -n "$dropped" ]]; then
+    summary+="\nDropped:\n$dropped"
+  fi
+
+  # Slack — richer format
+  if [[ -n "$NOTIFY_SLACK_WEBHOOK" ]]; then
+    local slack_text
+    slack_text=$(printf '%b' "$summary")
+    curl -s -X POST "$NOTIFY_SLACK_WEBHOOK" \
+      -H 'Content-type: application/json' \
+      -d "{\"text\": $(echo "$slack_text" | jq -Rs .)}" > /dev/null 2>&1 || true
+  fi
+
+  # Telegram
+  if [[ -n "$NOTIFY_TELEGRAM_TOKEN" && -n "$NOTIFY_TELEGRAM_CHAT_ID" ]]; then
+    local tg_text
+    tg_text=$(printf '%b' "$summary")
+    curl -s -X POST \
+      "https://api.telegram.org/bot${NOTIFY_TELEGRAM_TOKEN}/sendMessage" \
+      -d chat_id="$NOTIFY_TELEGRAM_CHAT_ID" \
+      -d text="$tg_text" \
+      -d parse_mode="Markdown" > /dev/null 2>&1 || true
+  fi
+}
+
+# Check if PR is mergeable (approved + 0 unresolved threads)
+check_mergeable() {
+  local pr_state
+  pr_state=$(gh pr view "$PR_NUMBER" --json reviewDecision,reviewThreads 2>/dev/null) || return 1
+  local decision
+  decision=$(echo "$pr_state" | jq -r '.reviewDecision // ""')
+  local unresolved
+  unresolved=$(echo "$pr_state" | jq '[.reviewThreads[]? | select(.isResolved == false)] | length')
+  [[ "$decision" == "APPROVED" && "$unresolved" -eq 0 ]]
+}
+
+# ---------------------------------------------------------------------------
+# Display config
+# ---------------------------------------------------------------------------
+section "PR Watch"
+detail "PR #$PR_NUMBER — $PR_TITLE"
+detail "repo: $REPO_FULL  branch: $PR_HEAD  base: $PR_BASE"
+detail "interval: ${INTERVAL}s  max-cycles: ${MAX_CYCLES:-∞}"
+[[ -f ".ralphrc" ]]          && detail ".ralphrc loaded"
+[[ -f "$RALPH_RULES_FILE" ]] && detail "$RALPH_RULES_FILE loaded"
+[[ "$DRY_RUN" == true ]]     && detail "DRY RUN — triage only, no fixes"
+[[ "$ONCE" == true ]]        && detail "single cycle mode"
+[[ -n "$LINEAR_TEAM" ]]      && detail "linear team: $LINEAR_TEAM"
+
+if [[ -n "$MODEL" ]]; then
+  detail "model (all): $(short_model "$MODEL")"
+else
+  detail "models: triage=$(short_model "$TRIAGE_MODEL")  worker=$(short_model "$PR_WATCH_WORKER_MODEL")  commit=$(short_model "$PR_WATCH_COMMIT_MODEL")  defer=$(short_model "$DEFER_MODEL")"
+fi
+
+has_notifications=false
+[[ -n "$NOTIFY_SLACK_WEBHOOK" ]] && { detail "notify: slack"; has_notifications=true; }
+[[ -n "$NOTIFY_TELEGRAM_TOKEN" && -n "$NOTIFY_TELEGRAM_CHAT_ID" ]] && { detail "notify: telegram"; has_notifications=true; }
+[[ "$has_notifications" == false ]] && detail "notify: none configured"
+
+# ---------------------------------------------------------------------------
+# Main polling loop
+# ---------------------------------------------------------------------------
+cycle=0
+
+while true; do
+  cycle=$((cycle + 1))
+  if [[ $MAX_CYCLES -gt 0 && $cycle -gt $MAX_CYCLES ]]; then
+    section "${C_YELLOW}Reached max cycles ($MAX_CYCLES)${C_RESET}"
+    break
+  fi
+
+  section "Cycle $cycle"
+
+  # Pull latest changes
+  log_ts "pulling latest..."
+  if ! git pull --rebase 2>/dev/null; then
+    out "${C_RED}✗${C_RESET}" "rebase conflict on pull"
+    git rebase --abort 2>/dev/null || true
+    notify "error" "Rebase conflict on pull — skipping cycle $cycle"
+    if [[ $MAX_CYCLES -eq 1 ]]; then break; fi
+    log_ts "sleeping ${INTERVAL}s..."
+    sleep "$INTERVAL"
+    continue
+  fi
+
+  # Fetch unresolved threads
+  log_ts "fetching unresolved threads..."
+  threads_json=$(fetch_unresolved_comments)
+  thread_count=$(echo "$threads_json" | jq 'length')
+
+  if [[ "$thread_count" -eq 0 ]]; then
+    out "${C_GREEN}✓${C_RESET}" "no new unresolved threads"
+
+    if check_mergeable; then
+      section "${C_GREEN}PR is mergeable!${C_RESET}"
+      notify "mergeable" "All threads resolved, PR is approved and mergeable."
+      break
+    fi
+
+    if [[ $MAX_CYCLES -eq 1 ]]; then break; fi
+    log_ts "sleeping ${INTERVAL}s..."
+    sleep "$INTERVAL"
+    continue
+  fi
+
+  out "${C_CYAN}→${C_RESET}" "$thread_count unresolved thread(s) to triage"
+
+  # Triage
+  triage_json=$(triage_comments "$threads_json")
+  group_count=$(echo "$triage_json" | jq 'length' 2>/dev/null || echo 0)
+
+  if [[ "$group_count" -eq 0 ]]; then
+    out "${C_YELLOW}?${C_RESET}" "triage returned no groups"
+    if [[ $MAX_CYCLES -eq 1 ]]; then break; fi
+    log_ts "sleeping ${INTERVAL}s..."
+    sleep "$INTERVAL"
+    continue
+  fi
+
+  # Count by action
+  fix_count=$(echo "$triage_json" | jq '[.[] | select(.action == "fix")] | length')
+  defer_count=$(echo "$triage_json" | jq '[.[] | select(.action == "defer")] | length')
+  question_count=$(echo "$triage_json" | jq '[.[] | select(.action == "question")] | length')
+  drop_count=$(echo "$triage_json" | jq '[.[] | select(.action == "drop")] | length')
+
+  detail "triage: $fix_count fix, $defer_count defer, $question_count question, $drop_count drop"
+
+  if [[ "$DRY_RUN" == true ]]; then
+    out "${C_YELLOW}⏭${C_RESET}" "dry run — skipping execution"
+    echo "$triage_json" | jq '.'
+    if [[ $MAX_CYCLES -eq 1 ]]; then break; fi
+    log_ts "sleeping ${INTERVAL}s..."
+    sleep "$INTERVAL"
+    continue
+  fi
+
+  # Cycle summary accumulators (temp files to avoid subshell variable loss)
+  sum_fixed=$(mktemp /tmp/ralph-pw-fixed.XXXXXX)
+  sum_deferred=$(mktemp /tmp/ralph-pw-deferred.XXXXXX)
+  sum_questions=$(mktemp /tmp/ralph-pw-questions.XXXXXX)
+  sum_dropped=$(mktemp /tmp/ralph-pw-dropped.XXXXXX)
+
+  # --- Process FIX groups ---
+  fix_groups=$(echo "$triage_json" | jq -c '[.[] | select(.action == "fix")]')
+  fix_len=$(echo "$fix_groups" | jq 'length')
+  for i in $(seq 0 $((fix_len - 1))); do
+    group=$(echo "$fix_groups" | jq -c ".[$i]")
+    group_id=$(echo "$group" | jq -r '.group_id')
+    fix_desc=$(echo "$group" | jq -r '.fix_description')
+    files=$(echo "$group" | jq -r '.files | join(", ")')
+
+    if fix_comment_group "$group"; then
+      if commit_and_push "$group_id"; then
+        local_sha=$(git rev-parse --short HEAD)
+
+        # Reply + resolve each thread in this group
+        thread_len=$(echo "$group" | jq '.threads | length')
+        for ti in $(seq 0 $((thread_len - 1))); do
+          thread=$(echo "$group" | jq -c ".threads[$ti]")
+          tid=$(echo "$thread" | jq -r '.thread_id')
+          cid=$(echo "$thread" | jq -r '.comment_id')
+          reply_to_thread "$cid" "Fixed in $local_sha — $fix_desc"
+          resolve_thread "$tid"
+          mark_processed "$tid"
+        done
+
+        echo "  - $fix_desc — $files" >> "$sum_fixed"
+      fi
+    else
+      detail "fix skipped/failed for $group_id — threads left unresolved"
+    fi
+  done
+
+  # --- Process DEFER groups ---
+  defer_groups=$(echo "$triage_json" | jq -c '[.[] | select(.action == "defer")]')
+  defer_len=$(echo "$defer_groups" | jq 'length')
+  for i in $(seq 0 $((defer_len - 1))); do
+    group=$(echo "$defer_groups" | jq -c ".[$i]")
+    group_id=$(echo "$group" | jq -r '.group_id')
+    issue_id=$(defer_comment_group "$group")
+
+    thread_len=$(echo "$group" | jq '.threads | length')
+    for ti in $(seq 0 $((thread_len - 1))); do
+      thread=$(echo "$group" | jq -c ".threads[$ti]")
+      tid=$(echo "$thread" | jq -r '.thread_id')
+      cid=$(echo "$thread" | jq -r '.comment_id')
+      if [[ -n "$issue_id" ]]; then
+        reply_to_thread "$cid" "Valid point — tracked in $issue_id. Deferring from this PR to keep scope focused."
+      else
+        reply_to_thread "$cid" "Valid point — tracked for follow-up. Deferring from this PR to keep scope focused."
+      fi
+      resolve_thread "$tid"
+      mark_processed "$tid"
+    done
+
+    echo "  - $(echo "$group" | jq -r '.fix_description') → ${issue_id:-unknown}" >> "$sum_deferred"
+  done
+
+  # --- Process QUESTION groups ---
+  q_groups=$(echo "$triage_json" | jq -c '[.[] | select(.action == "question")]')
+  q_len=$(echo "$q_groups" | jq 'length')
+  for i in $(seq 0 $((q_len - 1))); do
+    group=$(echo "$q_groups" | jq -c ".[$i]")
+    group_id=$(echo "$group" | jq -r '.group_id')
+    answer=$(echo "$group" | jq -r '.answer // ""')
+    reason=$(echo "$group" | jq -r '.reason')
+
+    thread_len=$(echo "$group" | jq '.threads | length')
+    for ti in $(seq 0 $((thread_len - 1))); do
+      thread=$(echo "$group" | jq -c ".threads[$ti]")
+      tid=$(echo "$thread" | jq -r '.thread_id')
+      cid=$(echo "$thread" | jq -r '.comment_id')
+      path=$(echo "$thread" | jq -r '.path // ""')
+      line=$(echo "$thread" | jq -r '.line // ""')
+
+      if [[ -n "$answer" ]]; then
+        reply_to_thread "$cid" "$answer"
+        resolve_thread "$tid"
+        mark_processed "$tid"
+        echo "  - $path:$line — answered" >> "$sum_questions"
+      else
+        # Cannot answer — leave unresolved, notify
+        mark_processed "$tid"
+        echo "  - $path:$line — needs human attention ($reason)" >> "$sum_questions"
+        notify "question" "Cannot answer: $reason — $path:$line"
+      fi
+    done
+  done
+
+  # --- Process DROP groups ---
+  drop_groups=$(echo "$triage_json" | jq -c '[.[] | select(.action == "drop")]')
+  drop_len=$(echo "$drop_groups" | jq 'length')
+  for i in $(seq 0 $((drop_len - 1))); do
+    group=$(echo "$drop_groups" | jq -c ".[$i]")
+    group_id=$(echo "$group" | jq -r '.group_id')
+    reason=$(echo "$group" | jq -r '.reason')
+
+    thread_len=$(echo "$group" | jq '.threads | length')
+    for ti in $(seq 0 $((thread_len - 1))); do
+      thread=$(echo "$group" | jq -c ".threads[$ti]")
+      tid=$(echo "$thread" | jq -r '.thread_id')
+      cid=$(echo "$thread" | jq -r '.comment_id')
+      reply_to_thread "$cid" "After review, $reason"
+      resolve_thread "$tid"
+      mark_processed "$tid"
+    done
+
+    echo "  - $(echo "$group" | jq -r '.fix_description // .reason') — $reason" >> "$sum_dropped"
+  done
+
+  # --- Cycle summary ---
+  summary_fixed=$(cat "$sum_fixed" 2>/dev/null)
+  summary_deferred=$(cat "$sum_deferred" 2>/dev/null)
+  summary_questions=$(cat "$sum_questions" 2>/dev/null)
+  summary_dropped=$(cat "$sum_dropped" 2>/dev/null)
+  rm -f "$sum_fixed" "$sum_deferred" "$sum_questions" "$sum_dropped"
+
+  if [[ -n "$summary_fixed" || -n "$summary_deferred" || -n "$summary_questions" || -n "$summary_dropped" ]]; then
+    send_cycle_summary "$cycle" "$summary_fixed" "$summary_deferred" "$summary_questions" "$summary_dropped"
+  fi
+
+  # Check mergeability after processing
+  if check_mergeable; then
+    section "${C_GREEN}PR is mergeable!${C_RESET}"
+    notify "mergeable" "All threads resolved, PR is approved and mergeable."
+    break
+  fi
+
+  if [[ $MAX_CYCLES -eq 1 ]]; then break; fi
+  log_ts "sleeping ${INTERVAL}s..."
+  sleep "$INTERVAL"
+done
+
+# ---------------------------------------------------------------------------
+# Cost report
+# ---------------------------------------------------------------------------
+if [[ "${AGENT_COSTS[@]+x}" ]]; then
+  section "Cost"
+  total=0
+  for agent_type in "${!AGENT_COSTS[@]}"; do
+    cost="${AGENT_COSTS[$agent_type]}"
+    printf "    %-20s \$%s\n" "$agent_type" "$(fmt_cost "$cost")"
+    total=$(echo "$total + $cost" | bc 2>/dev/null || echo "$total")
+  done
+  printf "    ${C_BOLD}%-20s \$%s${C_RESET}\n" "total" "$(fmt_cost "$total")"
+fi
+
+section "Done — $cycle cycle(s)"
