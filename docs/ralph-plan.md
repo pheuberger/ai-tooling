@@ -10,15 +10,16 @@ Three-phase pipeline:
 ┌──────────────────────────────────────────────────────────┐
 │  ralph-plan                                              │
 │                                                          │
-│  Phase 1 — Critic-Patch Loop (N sequential passes)       │
+│  Phase 1 — External Sparring (optional)                  │
+│    Non-Claude models critique the plan. Claude            │
+│    integrates valid feedback, ignores the rest.           │
+│    Runs first to catch fundamental issues early.          │
+│                                                          │
+│  Phase 2 — Critic-Patch Loop (N sequential passes)       │
 │    Each pass views the plan through a different lens      │
 │    (feasibility, gaps, security, maintainability, scope). │
 │    Fixable issues are edited in-place; ambiguous ones     │
 │    are logged as open questions.                          │
-│                                                          │
-│  Phase 2 — External Sparring (optional)                  │
-│    Non-Claude models critique the plan. Claude            │
-│    integrates valid feedback, ignores the rest.           │
 │                                                          │
 │  Phase 3 — Final Polish                                  │
 │    One pass to fix contradictions introduced by earlier   │
@@ -45,7 +46,7 @@ Each phase spawns fresh Claude Code instances with `--print --dangerously-skip-p
 | Flag | Default | Description |
 |------|---------|-------------|
 | `PLAN_FILE` (positional) | `PLAN.md` | Path to the plan document |
-| `--iterations N` | `5` | Number of critic passes in Phase 1 |
+| `--iterations N` | `5` | Number of critic passes in Phase 2 |
 | `--model MODEL` | `claude-opus-4-6` | Override Claude model for all passes |
 | `--output FILE` | `PLAN-REFINED.md` | Where to write the refined plan |
 | `--questions FILE` | `PLAN-QUESTIONS.md` | Where to write open questions |
@@ -114,7 +115,7 @@ Custom lens names (not in the default set) get generic instructions: *"Focus on 
 
 ## External sparring
 
-Phase 2 sends the plan to non-Claude models for independent critique, then has Claude integrate the feedback. This catches blind spots in Claude's own reasoning.
+Phase 1 sends the plan to non-Claude models for independent critique, then has Claude integrate the feedback. This runs before the fine-grained critic passes so that fundamental issues are caught early, before detailed lens-specific reviews build on top.
 
 ### How it works
 

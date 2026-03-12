@@ -6,8 +6,8 @@
 # get surfaced at the end.
 #
 # Three-phase pipeline:
-#   1. Critic-patch loop — N sequential passes, each through a different lens
-#   2. Sparring phase (optional) — external models critique; Claude integrates
+#   1. Sparring phase (optional) — external models critique; Claude integrates
+#   2. Critic-patch loop — N sequential passes, each through a different lens
 #   3. Final polish — one pass to fix contradictions, clean up questions
 #
 # Usage: ./ralph-plan [options] [PLAN_FILE]
@@ -290,9 +290,8 @@ extract_sparring_name() {
 }
 
 # =========================================================================
-# Phase 1: Critic-Patch Loop
+# Phase 1: External Sparring (optional)
 # =========================================================================
-phase "$C_BLUE" "PHASE 1: Critic-Patch Loop ($ITERATIONS passes)"
 
 # Setup
 if [[ -z "$RESUME_FROM" ]]; then
@@ -300,112 +299,11 @@ if [[ -z "$RESUME_FROM" ]]; then
   : > "$QUESTIONS_FILE"
 fi
 
-start_pass=${RESUME_FROM:-1}
 total_passes=0
 
-for (( i=start_pass; i<=ITERATIONS; i++ )); do
-  # Round-robin lens selection
-  lens_index=$(( (i - 1) % ${#LENSES[@]} ))
-  lens="${LENSES[$lens_index]}"
-
-  echo ""
-  log "${C_BOLD}Pass $i/$ITERATIONS — lens: ${lens}${C_RESET}"
-
-  # --- Snapshot before this pass ---
-  cp "$OUTPUT_FILE" "$LOG_DIR/snapshot-before-pass-${i}.md"
-
-  # --- Build prompt ---
-  prior_questions=$(<"$QUESTIONS_FILE")
-
-  extra_context=""
-  for f in "${CONTEXT_FILES[@]}"; do
-    extra_context+="### $(basename "$f")
-$(<"$f")
-
-"
-  done
-
-  prompt_file=$(mktemp /tmp/ralph-plan-prompt.XXXXXX)
-  (
-    export REFINED_FILE="$(realpath "$OUTPUT_FILE")"
-    export QUESTIONS_FILE="$(realpath "$QUESTIONS_FILE")"
-    export LENS_NAME="$lens"
-    export LENS_INSTRUCTIONS="${LENS_INSTRUCTIONS[$lens]}"
-    export PRIOR_QUESTIONS="$prior_questions"
-    export EXTRA_CONTEXT="$extra_context"
-    export ITERATION_NUM="$i"
-    export TOTAL_ITERATIONS="$ITERATIONS"
-    export CODEBASE_ACCESS="" NO_CODEBASE=""
-    [[ "$NO_CODEBASE_FLAG" != true ]] && CODEBASE_ACCESS="yes"
-    [[ "$NO_CODEBASE_FLAG" == true ]] && NO_CODEBASE="yes"
-    render_prompt "$PROMPTS_DIR/plan-critic.md" \
-      REFINED_FILE QUESTIONS_FILE LENS_NAME LENS_INSTRUCTIONS \
-      PRIOR_QUESTIONS EXTRA_CONTEXT ITERATION_NUM TOTAL_ITERATIONS \
-      CODEBASE_ACCESS NO_CODEBASE
-  ) > "$prompt_file"
-
-  # --- Run critic (with retry) ---
-  log_file="$LOG_DIR/pass-${i}-${lens}.log"
-  retries=0; success=false
-
-  while [[ $retries -lt $MAX_RETRIES ]]; do
-    # Restore snapshot before retry (undo partial edits from failed attempt)
-    [[ $retries -gt 0 ]] && cp "$LOG_DIR/snapshot-before-pass-${i}.md" "$OUTPUT_FILE"
-
-    phase "$C_BLUE" "CRITIC pass $i — $lens (attempt $((retries + 1))/$MAX_RETRIES)"
-
-    claude_as "$REVIEW_MODEL" --output-format stream-json --verbose \
-      < "$prompt_file" 2>&1 \
-      | tee "$log_file" \
-      | ralph_stream_filter || true
-
-    extract_cost "pass-$i-$lens" "$log_file"
-
-    if jq -e 'select(.type == "result" and .subtype == "success")' "$log_file" > /dev/null 2>&1; then
-      success=true; break
-    fi
-
-    retries=$((retries + 1))
-    [[ $retries -lt $MAX_RETRIES ]] && log "  Retry in 5s..." && sleep 5
-  done
-
-  rm -f "$prompt_file"
-
-  if [[ "$success" == false ]]; then
-    cp "$LOG_DIR/snapshot-before-pass-${i}.md" "$OUTPUT_FILE"
-    log "  ${C_RED}Pass $i ($lens) failed after $MAX_RETRIES attempts. Skipping.${C_RESET}"
-    continue
-  fi
-
-  # --- Corruption guard ---
-  line_count_before=$(wc -l < "$LOG_DIR/snapshot-before-pass-${i}.md")
-  line_count_after=$(wc -l < "$OUTPUT_FILE")
-  threshold=$(( line_count_before * 70 / 100 ))
-  if [[ $line_count_after -lt $threshold ]]; then
-    log "  ${C_RED}Plan shrank from $line_count_before to $line_count_after lines — reverting pass $i.${C_RESET}"
-    cp "$LOG_DIR/snapshot-before-pass-${i}.md" "$OUTPUT_FILE"
-    continue
-  fi
-
-  # --- Snapshot after successful pass ---
-  cp "$OUTPUT_FILE" "$LOG_DIR/snapshot-after-pass-${i}.md"
-  total_passes=$((total_passes + 1))
-
-  # --- Log what changed ---
-  changes=$(diff "$LOG_DIR/snapshot-before-pass-${i}.md" "$LOG_DIR/snapshot-after-pass-${i}.md" | head -20 || true)
-  if [[ -n "$changes" ]]; then
-    log "  ${C_GREEN}Plan edited.${C_RESET} Diff in $LOG_DIR/snapshot-before-pass-${i}.md vs after."
-  else
-    log "  ${C_DIM}No plan edits this pass.${C_RESET}"
-  fi
-done
-
-# =========================================================================
-# Phase 2: External Sparring (optional)
-# =========================================================================
 if [[ ${#SPARRING_CMDS[@]} -gt 0 ]]; then
   echo ""
-  phase "$C_MAGENTA" "PHASE 2: External Sparring (${#SPARRING_CMDS[@]} partner(s))"
+  phase "$C_MAGENTA" "PHASE 1: External Sparring (${#SPARRING_CMDS[@]} partner(s))"
 
   sparring_index=0
   for sparring_cmd in "${SPARRING_CMDS[@]}"; do
@@ -515,6 +413,111 @@ if [[ ${#SPARRING_CMDS[@]} -gt 0 ]]; then
     done
   done
 fi
+
+# =========================================================================
+# Phase 2: Critic-Patch Loop
+# =========================================================================
+echo ""
+phase "$C_BLUE" "PHASE 2: Critic-Patch Loop ($ITERATIONS passes)"
+
+start_pass=${RESUME_FROM:-1}
+
+for (( i=start_pass; i<=ITERATIONS; i++ )); do
+  # Round-robin lens selection
+  lens_index=$(( (i - 1) % ${#LENSES[@]} ))
+  lens="${LENSES[$lens_index]}"
+
+  echo ""
+  log "${C_BOLD}Pass $i/$ITERATIONS — lens: ${lens}${C_RESET}"
+
+  # --- Snapshot before this pass ---
+  cp "$OUTPUT_FILE" "$LOG_DIR/snapshot-before-pass-${i}.md"
+
+  # --- Build prompt ---
+  prior_questions=$(<"$QUESTIONS_FILE")
+
+  extra_context=""
+  for f in "${CONTEXT_FILES[@]}"; do
+    extra_context+="### $(basename "$f")
+$(<"$f")
+
+"
+  done
+
+  prompt_file=$(mktemp /tmp/ralph-plan-prompt.XXXXXX)
+  (
+    export REFINED_FILE="$(realpath "$OUTPUT_FILE")"
+    export QUESTIONS_FILE="$(realpath "$QUESTIONS_FILE")"
+    export LENS_NAME="$lens"
+    export LENS_INSTRUCTIONS="${LENS_INSTRUCTIONS[$lens]}"
+    export PRIOR_QUESTIONS="$prior_questions"
+    export EXTRA_CONTEXT="$extra_context"
+    export ITERATION_NUM="$i"
+    export TOTAL_ITERATIONS="$ITERATIONS"
+    export CODEBASE_ACCESS="" NO_CODEBASE=""
+    [[ "$NO_CODEBASE_FLAG" != true ]] && CODEBASE_ACCESS="yes"
+    [[ "$NO_CODEBASE_FLAG" == true ]] && NO_CODEBASE="yes"
+    render_prompt "$PROMPTS_DIR/plan-critic.md" \
+      REFINED_FILE QUESTIONS_FILE LENS_NAME LENS_INSTRUCTIONS \
+      PRIOR_QUESTIONS EXTRA_CONTEXT ITERATION_NUM TOTAL_ITERATIONS \
+      CODEBASE_ACCESS NO_CODEBASE
+  ) > "$prompt_file"
+
+  # --- Run critic (with retry) ---
+  log_file="$LOG_DIR/pass-${i}-${lens}.log"
+  retries=0; success=false
+
+  while [[ $retries -lt $MAX_RETRIES ]]; do
+    # Restore snapshot before retry (undo partial edits from failed attempt)
+    [[ $retries -gt 0 ]] && cp "$LOG_DIR/snapshot-before-pass-${i}.md" "$OUTPUT_FILE"
+
+    phase "$C_BLUE" "CRITIC pass $i — $lens (attempt $((retries + 1))/$MAX_RETRIES)"
+
+    claude_as "$REVIEW_MODEL" --output-format stream-json --verbose \
+      < "$prompt_file" 2>&1 \
+      | tee "$log_file" \
+      | ralph_stream_filter || true
+
+    extract_cost "pass-$i-$lens" "$log_file"
+
+    if jq -e 'select(.type == "result" and .subtype == "success")' "$log_file" > /dev/null 2>&1; then
+      success=true; break
+    fi
+
+    retries=$((retries + 1))
+    [[ $retries -lt $MAX_RETRIES ]] && log "  Retry in 5s..." && sleep 5
+  done
+
+  rm -f "$prompt_file"
+
+  if [[ "$success" == false ]]; then
+    cp "$LOG_DIR/snapshot-before-pass-${i}.md" "$OUTPUT_FILE"
+    log "  ${C_RED}Pass $i ($lens) failed after $MAX_RETRIES attempts. Skipping.${C_RESET}"
+    continue
+  fi
+
+  # --- Corruption guard ---
+  line_count_before=$(wc -l < "$LOG_DIR/snapshot-before-pass-${i}.md")
+  line_count_after=$(wc -l < "$OUTPUT_FILE")
+  threshold=$(( line_count_before * 70 / 100 ))
+  if [[ $line_count_after -lt $threshold ]]; then
+    log "  ${C_RED}Plan shrank from $line_count_before to $line_count_after lines — reverting pass $i.${C_RESET}"
+    cp "$LOG_DIR/snapshot-before-pass-${i}.md" "$OUTPUT_FILE"
+    continue
+  fi
+
+  # --- Snapshot after successful pass ---
+  cp "$OUTPUT_FILE" "$LOG_DIR/snapshot-after-pass-${i}.md"
+  total_passes=$((total_passes + 1))
+
+  # --- Log what changed ---
+  changes=$(diff "$LOG_DIR/snapshot-before-pass-${i}.md" "$LOG_DIR/snapshot-after-pass-${i}.md" | head -20 || true)
+  if [[ -n "$changes" ]]; then
+    log "  ${C_GREEN}Plan edited.${C_RESET} Diff in $LOG_DIR/snapshot-before-pass-${i}.md vs after."
+  else
+    log "  ${C_DIM}No plan edits this pass.${C_RESET}"
+  fi
+done
 
 # =========================================================================
 # Phase 3: Final Polish
