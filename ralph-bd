@@ -591,11 +591,11 @@ TESTFAIL
   # Skipped when the worker diff is smaller than SIMPLIFY_THRESHOLD lines.
   # -----------------------------------------------------------------------
   # Count tracked changes (staged + unstaged) excluding internal dirs
-  diff_lines=$(git diff HEAD --stat -- ':!.ralph-logs' ':!.beads' 2>/dev/null | tail -1 | grep -oP '\d+(?= insertion)' || echo 0)
-  del_lines=$(git diff HEAD --stat -- ':!.ralph-logs' ':!.beads' 2>/dev/null | tail -1 | grep -oP '\d+(?= deletion)' || echo 0)
+  diff_lines=$(git diff HEAD --stat -- ':!.ralph-logs' ':!.beads' 2>/dev/null | tail -1 | grep -oP '\d+(?= insertion)' || true)
+  del_lines=$(git diff HEAD --stat -- ':!.ralph-logs' ':!.beads' 2>/dev/null | tail -1 | grep -oP '\d+(?= deletion)' || true)
   # Count lines in untracked files (new files not yet git-added)
-  untracked_lines=$(git ls-files --others --exclude-standard -- ':!.ralph-logs' ':!.beads' 2>/dev/null | xargs -r wc -l 2>/dev/null | tail -1 | awk '{print $1}' || echo 0)
-  changed_lines=$(( diff_lines + del_lines + untracked_lines ))
+  untracked_lines=$(git ls-files --others --exclude-standard -- ':!.ralph-logs' ':!.beads' 2>/dev/null | xargs -r wc -l 2>/dev/null | tail -1 | awk '{print $1}' || true)
+  changed_lines=$(( ${diff_lines:-0} + ${del_lines:-0} + ${untracked_lines:-0} ))
 
   if (( changed_lines >= SIMPLIFY_THRESHOLD )); then
     echo ""
