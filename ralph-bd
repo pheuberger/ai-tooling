@@ -318,10 +318,15 @@ run_agent() {
   local display="$1" log_file="$2" model="$3"; shift 3
   if (( WATCHDOG_TIMEOUT > 0 )); then
     > "$log_file"
+    # Save stdin to fd 9 — background processes get stdin from /dev/null,
+    # but some agents (worker) read their prompt from stdin.
+    exec 9<&0
     (
+      exec 0<&9 9<&-
       claude_as "$model" "$@" 2>&1 | tee "$log_file" | "$display"
     ) &
     local _pid=$! _wdpid _rc=0
+    exec 9<&-
     _watchdog "$log_file" "$WATCHDOG_TIMEOUT" "$_pid" &
     _wdpid=$!
     wait "$_pid" || _rc=$?
