@@ -18,6 +18,8 @@
 #   --label LABEL        Filter ready beads by label
 #   --from-plan FILE     Decompose a plan file into label-grouped tasks, then work them
 #   --test-cmd CMD       Run CMD as pre-commit test gate; retries worker on failure
+#   --watchdog N         Kill worker after N minutes of inactivity (default: 15)
+#   --no-watchdog        Disable the inactivity watchdog
 #
 # Configuration files (optional):
 #   .ralphrc             Sourced from project root before CLI args are parsed.
@@ -26,7 +28,8 @@
 #                        COMMIT_MODEL, FINAL_REVIEW_MODEL, LEAD_MODEL,
 #                        SPEC_MODEL, SUMMARY_MODEL,
 #                        FILTER_TYPE, FILTER_PRIORITY, FILTER_OWNER,
-#                        FILTER_LABEL, TEST_CMD, LOG_DIR, RALPH_RULES_FILE.
+#                        FILTER_LABEL, TEST_CMD, WATCHDOG_TIMEOUT,
+#                        LOG_DIR, RALPH_RULES_FILE.
 #                        CLI flags override values set here.
 #   .ralph-rules.md      Extra instructions injected into the agent prompt as a
 #                        "## Project Rules" section. Use for ralph-specific rules
@@ -139,6 +142,7 @@ FILTER_OWNER=""       # only beads owned by this name
 FILTER_LABEL=""       # filter by label
 PLAN_FILE=""          # --from-plan: plan file to decompose into beads
 TEST_CMD=""           # --test-cmd: command to run as pre-commit test gate
+WATCHDOG_TIMEOUT=15  # minutes of worker inactivity before kill (0=disabled)
 LOG_DIR=".ralph-logs"
 RALPH_RULES_FILE=".ralph-rules.md"
 
@@ -163,6 +167,8 @@ while [[ $# -gt 0 ]]; do
     --label)          FILTER_LABEL="$2"; shift 2 ;;
     --from-plan)      PLAN_FILE="$2"; shift 2 ;;
     --test-cmd)       TEST_CMD="$2"; shift 2 ;;
+    --watchdog)       WATCHDOG_TIMEOUT="$2"; shift 2 ;;
+    --no-watchdog)    WATCHDOG_TIMEOUT=0; shift ;;
     -h|--help)        sed -n '/^# Usage/,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
     *)                echo "Unknown option: $1" >&2; exit 1 ;;
   esac
@@ -280,6 +286,52 @@ claude_as() {
   claude "${claude_flags[@]}" --model "$model" "$@"
 }
 
+# Watchdog — kills a background agent subshell if its log file goes stale.
+# Runs in background; caller must kill it after the agent exits.
+_watchdog() {
+  local log_file="$1" timeout_min="$2" target_pid="$3"
+  local timeout_sec=$((timeout_min * 60))
+  while kill -0 "$target_pid" 2>/dev/null; do
+    sleep 30
+    [[ -f "$log_file" ]] || continue
+    local last_mod now
+    last_mod=$(stat -c %Y "$log_file" 2>/dev/null) || continue
+    now=$(date +%s)
+    if (( now - last_mod > timeout_sec )); then
+      echo ""
+      out "${C_RED}⏱${C_RESET}" "watchdog: no output for ${timeout_min}m — killing agent"
+      pkill -TERM -P "$target_pid" 2>/dev/null || true
+      sleep 2
+      kill -TERM "$target_pid" 2>/dev/null || true
+      return
+    fi
+  done
+}
+
+# Sink for run_agent — discards console output (quiet agents)
+_discard() { cat > /dev/null; }
+
+# run_agent <display_fn> <log_file> <model> [claude args...]
+# Runs claude with tee streaming to log_file and optional watchdog.
+# Console output is piped through display_fn (ralph_stream_filter or _discard).
+run_agent() {
+  local display="$1" log_file="$2" model="$3"; shift 3
+  if (( WATCHDOG_TIMEOUT > 0 )); then
+    > "$log_file"
+    (
+      claude_as "$model" "$@" 2>&1 | tee "$log_file" | "$display"
+    ) &
+    local _pid=$! _wdpid _rc=0
+    _watchdog "$log_file" "$WATCHDOG_TIMEOUT" "$_pid" &
+    _wdpid=$!
+    wait "$_pid" || _rc=$?
+    kill "$_wdpid" 2>/dev/null; wait "$_wdpid" 2>/dev/null || true
+    return "$_rc"
+  else
+    claude_as "$model" "$@" 2>&1 | tee "$log_file" | "$display"
+  fi
+}
+
 # Short model name for display: claude-sonnet-4-6 → sonnet
 short_model() { echo "$1" | sed 's/^claude-//; s/-[0-9].*//'; }
 
@@ -295,6 +347,7 @@ cfg_opt "priority" "${FILTER_PRIORITY:+<= $FILTER_PRIORITY}"
 cfg_opt "owner"    "$FILTER_OWNER"
 cfg_opt "label"    "$FILTER_LABEL"
 cfg_opt "test"     "$TEST_CMD"
+(( WATCHDOG_TIMEOUT > 0 )) && cfg_opt "watchdog" "${WATCHDOG_TIMEOUT}m" || true
 [[ "$RESPECT_DEPS" == true ]] && detail "respect-deps: yes" || true
 if [[ -n "$MODEL" ]]; then
   detail "model (all): $(short_model "$MODEL")"
@@ -336,10 +389,10 @@ if [[ -n "$PLAN_FILE" ]]; then
   phase_hdr "$C_BLUE" "Lead — $(short_model "$LEAD_MODEL")"
   lead_log="$LOG_DIR/lead-$(date '+%H%M%S').log"
 
-  claude_as "$LEAD_MODEL" --output-format stream-json --verbose -p "$(
+  run_agent ralph_stream_filter "$lead_log" "$LEAD_MODEL" --output-format stream-json --verbose -p "$(
     export PLAN_TITLE="$plan_title" PLAN_BODY="$plan_body" PLAN_LABEL="$PLAN_LABEL"
     render_prompt "$PROMPTS_DIR/lead.md" PLAN_TITLE PLAN_BODY PLAN_LABEL
-  )" 2>&1 | tee "$lead_log" | ralph_stream_filter || true
+  )" || true
   extract_cost "lead" "$lead_log"
   bd_sync
   read -r dur cost <<< "$(extract_result "$lead_log")"
@@ -350,10 +403,10 @@ if [[ -n "$PLAN_FILE" ]]; then
   spec_log="$LOG_DIR/spec-review-$(date '+%H%M%S').log"
   children_json=$(bd list --label "$PLAN_LABEL" --status open --json --limit 0 2>/dev/null) || children_json="[]"
 
-  claude_as "$SPEC_MODEL" --output-format stream-json --verbose -p "$(
+  run_agent ralph_stream_filter "$spec_log" "$SPEC_MODEL" --output-format stream-json --verbose -p "$(
     export CHILDREN_JSON="$children_json"
     render_prompt "$PROMPTS_DIR/spec-review.md" CHILDREN_JSON
-  )" 2>&1 | tee "$spec_log" | ralph_stream_filter || true
+  )" || true
   extract_cost "spec" "$spec_log"
   bd_sync
   read -r dur cost <<< "$(extract_result "$spec_log")"
@@ -511,10 +564,8 @@ while true; do
     else
       phase_hdr "$C_BLUE" "Worker — $(short_model "$WORKER_MODEL")"
     fi
-    claude_as "$WORKER_MODEL" --output-format stream-json --verbose \
-      < "$prompt_file" 2>&1 \
-      | tee "$log_file" \
-      | ralph_stream_filter || true
+    run_agent ralph_stream_filter "$log_file" "$WORKER_MODEL" --output-format stream-json --verbose \
+      < "$prompt_file" || true
 
     # Check success from the stream-json result event (not pipeline exit code)
     extract_cost "worker" "$log_file"
@@ -602,9 +653,9 @@ TESTFAIL
     phase_hdr "$C_CYAN" "Simplify — $(short_model "$SIMPLIFY_MODEL")"
     simplify_log="$LOG_DIR/iter-${iteration}-${bead_id}-simplify.log"
 
-    claude_as "$SIMPLIFY_MODEL" --output-format stream-json --verbose -p "$(
+    run_agent ralph_stream_filter "$simplify_log" "$SIMPLIFY_MODEL" --output-format stream-json --verbose -p "$(
       render_prompt "$PROMPTS_DIR/simplify.md"
-    )" 2>&1 | tee "$simplify_log" | ralph_stream_filter || true
+    )" || true
 
     extract_cost "simplify" "$simplify_log"
     if jq -e 'select(.type == "result" and .subtype == "success")' "$simplify_log" > /dev/null 2>&1; then
@@ -625,10 +676,10 @@ TESTFAIL
   # -----------------------------------------------------------------------
   echo ""
   commit_log="$LOG_DIR/iter-${iteration}-${bead_id}-commit.log"
-  claude_as "$COMMIT_MODEL" -p "$(
+  run_agent _discard "$commit_log" "$COMMIT_MODEL" -p "$(
     export BEAD_ID="$bead_id"
     render_prompt "$PROMPTS_DIR/commit.md" BEAD_ID
-  )" > "$commit_log" 2>&1 \
+  )" \
     && phase_hdr "$C_YELLOW" "Commit ${C_GREEN}✓${C_RESET}" \
     || phase_hdr "$C_YELLOW" "Commit ${C_RED}✗${C_RESET}"
 
@@ -639,11 +690,11 @@ TESTFAIL
   phase_hdr "$C_MAGENTA" "Review — $(short_model "$REVIEWER_MODEL")"
   review_log="$LOG_DIR/iter-${iteration}-${bead_id}-review.log"
 
-  claude_as "$REVIEWER_MODEL" --output-format stream-json --verbose -p "$(
+  run_agent _discard "$review_log" "$REVIEWER_MODEL" --output-format stream-json --verbose -p "$(
     export BEAD_DETAILS="$bead_details" BEAD_ID="$bead_id"
     export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" BEAD_LABELS="$bead_labels"
     render_prompt "$PROMPTS_DIR/review.md" BEAD_DETAILS BEAD_ID PRE_LOOP_HEAD BEAD_LABELS
-  )" > "$review_log" 2>&1 || true
+  )" || true
 
   extract_cost "reviewer" "$review_log"
   review_result=$(jq -r 'select(.type == "assistant") | .message.content[]? | select(.type == "text") | .text' "$review_log" 2>/dev/null | tail -1)
@@ -731,26 +782,26 @@ $(cat PLAN.md)"
 
   # --- Persona A: Security Reviewer ---
   sec_log="$LOG_DIR/final-review-security-$(date '+%H%M%S').log"
-  claude_as "$FINAL_REVIEW_MODEL" --output-format stream-json --verbose -p "$(
+  run_agent _discard "$sec_log" "$FINAL_REVIEW_MODEL" --output-format stream-json --verbose -p "$(
     export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" BEAD_LABELS_FLAG="$bead_labels_flag"
     render_prompt "$PROMPTS_DIR/final-review-security.md" PRE_LOOP_HEAD BEAD_LABELS_FLAG
-  )" > "$sec_log" 2>&1 &
+  )" &
   sec_pid=$!
 
   # --- Persona B: Integration Reviewer ---
   int_log="$LOG_DIR/final-review-integration-$(date '+%H%M%S').log"
-  claude_as "$FINAL_REVIEW_MODEL" --output-format stream-json --verbose -p "$(
+  run_agent _discard "$int_log" "$FINAL_REVIEW_MODEL" --output-format stream-json --verbose -p "$(
     export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" BEAD_LABELS_FLAG="$bead_labels_flag"
     render_prompt "$PROMPTS_DIR/final-review-integration.md" PRE_LOOP_HEAD BEAD_LABELS_FLAG
-  )" > "$int_log" 2>&1 &
+  )" &
   int_pid=$!
 
   # --- Persona C: Codebase Patterns Reviewer ---
   pat_log="$LOG_DIR/final-review-patterns-$(date '+%H%M%S').log"
-  claude_as "$FINAL_REVIEW_MODEL" --output-format stream-json --verbose -p "$(
+  run_agent _discard "$pat_log" "$FINAL_REVIEW_MODEL" --output-format stream-json --verbose -p "$(
     export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" BEAD_LABELS_FLAG="$bead_labels_flag"
     render_prompt "$PROMPTS_DIR/final-review-patterns.md" PRE_LOOP_HEAD BEAD_LABELS_FLAG
-  )" > "$pat_log" 2>&1 &
+  )" &
   pat_pid=$!
 
   # --- Persona D: Plan Adherence Reviewer (conditional) ---
@@ -758,11 +809,11 @@ $(cat PLAN.md)"
   plan_log=""
   if [[ -n "$plan_context" ]]; then
     plan_log="$LOG_DIR/final-review-plan-$(date '+%H%M%S').log"
-    claude_as "$FINAL_REVIEW_MODEL" --output-format stream-json --verbose -p "$(
+    run_agent _discard "$plan_log" "$FINAL_REVIEW_MODEL" --output-format stream-json --verbose -p "$(
       export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" BEAD_LABELS_FLAG="$bead_labels_flag"
       export PLAN_CONTEXT="$plan_context"
       render_prompt "$PROMPTS_DIR/final-review-plan.md" PRE_LOOP_HEAD BEAD_LABELS_FLAG PLAN_CONTEXT
-    )" > "$plan_log" 2>&1 &
+    )" &
     plan_pid=$!
   fi
 
@@ -804,11 +855,11 @@ if [[ $iteration -gt 0 ]]; then
   done
 
   if [[ -n "$log_list" ]]; then
-    claude_as "$SUMMARY_MODEL" -p "$(
+    run_agent _discard "$summary_file" "$SUMMARY_MODEL" -p "$(
       export LOG_LIST="$log_list" SKIP_FILE="$SKIP_FILE"
       export GENERATED_TS="$(date '+%Y-%m-%d %H:%M:%S')"
       render_prompt "$PROMPTS_DIR/summary.md" LOG_LIST SKIP_FILE GENERATED_TS
-    )" > "$summary_file" 2>&1
+    )"
 
     echo ""
     cat "$summary_file"

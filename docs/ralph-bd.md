@@ -44,6 +44,14 @@ After the coding agent finishes, a separate commit agent stages and commits the 
 
 Before starting, ralph shelves any pre-existing untracked files (except `.beads/` and `.ralph-logs/`) to a temp directory. They're restored after the loop finishes. This prevents `git add -A` inside the loop from accidentally committing your scratch files.
 
+### Worker watchdog
+
+By default, ralph monitors all agent output for activity. If any agent (worker, reviewer, commit, simplify, lead, spec, final review, or summary) produces no output for 15 minutes, the watchdog kills it. For workers, the bead retries (up to `MAX_RETRIES`) or releases back to `open` status. Other agents fail gracefully — the loop continues.
+
+All agent output streams to log files via `tee` in real time. The watchdog checks each log file's modification time every 30 seconds. Since `--output-format stream-json` streams events continuously during normal operation, a stale log file reliably indicates a stuck process.
+
+Disable with `--no-watchdog` or `WATCHDOG_TIMEOUT=0` in `.ralphrc`. Adjust the timeout with `--watchdog N` (minutes).
+
 ### Bead lifecycle
 
 | Step | Who | What happens |
@@ -73,6 +81,8 @@ If the coding agent fails after all retries, the bead is released (`bd update �
 | `--respect-deps` | off | With `--beads`: skip beads whose dependencies aren't closed yet. Blocked beads are re-queued at the end of the list. |
 | `--from-plan FILE` | — | Decompose a plan file into label-grouped tasks, then work them. See [Plan mode](#plan-mode). |
 | `--test-cmd CMD` | — | Run `CMD` as a post-loop test gate. Files a bead and exits 1 on failure. |
+| `--watchdog N` | `15` | Kill any agent after N minutes of inactivity. Monitors the log file for writes — if `claude` produces no output for N minutes, the agent is killed. Workers retry (or release after `MAX_RETRIES`); other agents fail gracefully. |
+| `--no-watchdog` | — | Disable the inactivity watchdog (`WATCHDOG_TIMEOUT=0`) |
 | `--type TYPE` | — | Filter `bd ready` by `issue_type` (`feature`, `bug`, `task`) |
 | `--priority N` | — | Only pick beads with `priority <= N` (0=critical, 1=high, 2=medium, 3=low, 4=backlog) |
 | `--owner NAME` | — | Only pick beads owned by `NAME` |
@@ -102,6 +112,12 @@ If the coding agent fails after all retries, the bead is released (`bd update �
 
 # Maximum retries for flaky CI environments
 ./ralph-bd --max-retries 5
+
+# Tighter watchdog (kill after 10 minutes of inactivity)
+./ralph-bd --watchdog 10
+
+# Disable watchdog entirely (let workers run as long as they need)
+./ralph-bd --no-watchdog
 ```
 
 ## Plan mode
@@ -170,6 +186,9 @@ FILTER_LABEL=""
 
 # Post-loop test command (default: "" = no test gate)
 # TEST_CMD="npm test"
+
+# Kill worker after N minutes of inactivity (default: 15, 0=disabled)
+# WATCHDOG_TIMEOUT=15
 
 # Where to write logs (default: ".ralph-logs")
 LOG_DIR=".ralph-logs"
