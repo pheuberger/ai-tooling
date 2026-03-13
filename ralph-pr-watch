@@ -277,6 +277,9 @@ GRAPHQL
 
 cleanup() {
   rm -f "$GRAPHQL_QUERY_FILE" "$GRAPHQL_RESOLVE_FILE"
+  if [[ "${stashed:-false}" == true ]]; then
+    git stash pop >/dev/null 2>&1 || true
+  fi
 }
 trap cleanup EXIT
 
@@ -362,7 +365,7 @@ triage_comments() {
   local threads_json="$1"
   local triage_log="$LOG_DIR/triage-$(date '+%Y%m%d-%H%M%S').log"
 
-  phase_hdr "$C_BLUE" "Triage — $(short_model "$TRIAGE_MODEL")"
+  phase_hdr "$C_BLUE" "Triage — $(short_model "$TRIAGE_MODEL")" >&2
 
   local triage_output
   triage_output=$(claude_as "$TRIAGE_MODEL" --output-format stream-json --verbose -p "$(
@@ -374,7 +377,7 @@ triage_comments() {
 
   extract_cost "triage" "$triage_log"
   read -r dur cost <<< "$(extract_result "$triage_log")"
-  out "${C_GREEN}✓${C_RESET}" "${C_DIM}$(fmt_duration "$dur") · \$$(fmt_cost "$cost")${C_RESET}"
+  out "${C_GREEN}✓${C_RESET}" "${C_DIM}$(fmt_duration "$dur") · \$$(fmt_cost "$cost")${C_RESET}" >&2
 
   # Extract the JSON array from the assistant's text output
   jq -r 'select(.type == "assistant") | .message.content[]? | select(.type == "text") | .text' \
@@ -499,28 +502,27 @@ defer_comment_group() {
   local threads_json
   threads_json=$(echo "$group_json" | jq -c '.threads')
 
-  echo ""
-  phase_hdr "$C_MAGENTA" "Defer [$group_id] — $(short_model "$DEFER_MODEL")"
+  echo "" >&2
+  phase_hdr "$C_MAGENTA" "Defer [$group_id] — $(short_model "$DEFER_MODEL")" >&2
   local defer_log="$LOG_DIR/defer-${group_id}-$(date '+%H%M%S').log"
 
-  local defer_output
-  defer_output=$(claude_as "$DEFER_MODEL" -p "$(
+  claude_as "$DEFER_MODEL" -p "$(
     export PR_NUMBER PR_TITLE PR_URL REPO_FULL GROUP_ID="$group_id" REASON="$reason"
     export THREADS_JSON="$threads_json" LINEAR_TEAM="$LINEAR_TEAM"
     render_prompt "$PROMPTS_DIR/pr-watch-defer.md" \
       PR_NUMBER PR_TITLE PR_URL REPO_FULL GROUP_ID REASON THREADS_JSON LINEAR_TEAM
-  )" 2>&1 | tee "$defer_log")
+  )" > "$defer_log" 2>&1
 
   extract_cost "defer" "$defer_log"
 
   # Extract issue ID from output
   local issue_id
-  issue_id=$(echo "$defer_output" | grep -oP 'ISSUE_ID:\s*\K\S+' | tail -1)
+  issue_id=$(grep -oP 'ISSUE_ID:\s*\K\S+' "$defer_log" | tail -1)
   if [[ -n "$issue_id" ]]; then
-    out "${C_GREEN}✓${C_RESET}" "created $issue_id"
+    out "${C_GREEN}✓${C_RESET}" "created $issue_id" >&2
     echo "$issue_id"
   else
-    out "${C_YELLOW}?${C_RESET}" "defer agent ran but no issue ID found"
+    out "${C_YELLOW}?${C_RESET}" "defer agent ran but no issue ID found" >&2
     echo ""
   fi
 }
@@ -542,39 +544,59 @@ notify() {
 
   # Slack
   if [[ -n "$NOTIFY_SLACK_WEBHOOK" ]]; then
-    local slack_text="[$type] PR #$PR_NUMBER — $PR_TITLE: $message"
-    curl -s -X POST "$NOTIFY_SLACK_WEBHOOK" \
+    local slack_text="[$type] <$PR_URL|PR #$PR_NUMBER> — $PR_TITLE: $message"
+    local slack_resp
+    slack_resp=$(curl -s -w "\n%{http_code}" -X POST "$NOTIFY_SLACK_WEBHOOK" \
       -H 'Content-type: application/json' \
-      -d "{\"text\": $(echo "$slack_text" | jq -Rs .)}" > /dev/null 2>&1 || true
+      -d "{\"text\": $(echo "$slack_text" | jq -Rs .)}" 2>&1)
+    local slack_http=${slack_resp##*$'\n'}
+    if [[ "$slack_http" != "200" ]]; then
+      detail "slack notify failed (HTTP $slack_http)"
+    fi
   fi
 }
 
 send_cycle_summary() {
   local cycle="$1" fixed="$2" deferred="$3" questions="$4" dropped="$5"
 
-  # Build summary text
-  local summary="PR #$PR_NUMBER — \"$PR_TITLE\" — Cycle $cycle\n"
+  # Build plain-text summary (used for Telegram + fallback)
+  local summary="PR #$PR_NUMBER — Cycle $cycle"
+  [[ -n "$fixed" ]]     && summary+="\n✅ Fixed:\n$fixed"
+  [[ -n "$deferred" ]]  && summary+="\n↗️ Deferred:\n$deferred"
+  [[ -n "$questions" ]] && summary+="\n❓ Needs attention:\n$questions"
+  [[ -n "$dropped" ]]   && summary+="\n⊘ Dropped:\n$dropped"
 
-  if [[ -n "$fixed" ]]; then
-    summary+="\nFixed:\n$fixed"
-  fi
-  if [[ -n "$deferred" ]]; then
-    summary+="\nDeferred:\n$deferred"
-  fi
-  if [[ -n "$questions" ]]; then
-    summary+="\nQuestions needing attention:\n$questions"
-  fi
-  if [[ -n "$dropped" ]]; then
-    summary+="\nDropped:\n$dropped"
-  fi
-
-  # Slack — richer format
+  # Slack — mrkdwn sections
   if [[ -n "$NOTIFY_SLACK_WEBHOOK" ]]; then
-    local slack_text
-    slack_text=$(printf '%b' "$summary")
-    curl -s -X POST "$NOTIFY_SLACK_WEBHOOK" \
+    local blocks header_text
+    header_text="*<$PR_URL|PR #$PR_NUMBER>* — Cycle $cycle"
+
+    blocks=$(jq -n --arg hdr "$header_text" '[{"type":"section","text":{"type":"mrkdwn","text":$hdr}}]')
+
+    if [[ -n "$fixed" ]]; then
+      blocks=$(echo "$blocks" | jq --arg t "✅ *Fixed*\n$fixed" '. + [{"type":"section","text":{"type":"mrkdwn","text":$t}}]')
+    fi
+    if [[ -n "$deferred" ]]; then
+      blocks=$(echo "$blocks" | jq --arg t "↗️ *Deferred*\n$deferred" '. + [{"type":"section","text":{"type":"mrkdwn","text":$t}}]')
+    fi
+    if [[ -n "$questions" ]]; then
+      blocks=$(echo "$blocks" | jq --arg t "❓ *Needs attention*\n$questions" '. + [{"type":"section","text":{"type":"mrkdwn","text":$t}}]')
+    fi
+    if [[ -n "$dropped" ]]; then
+      blocks=$(echo "$blocks" | jq --arg t "⊘ *Dropped*\n$dropped" '. + [{"type":"section","text":{"type":"mrkdwn","text":$t}}]')
+    fi
+
+    local payload slack_resp slack_http
+    payload=$(jq -n --argjson blocks "$blocks" --arg fallback "$(printf '%b' "$summary")" \
+      '{blocks: $blocks, text: $fallback}')
+
+    slack_resp=$(curl -s -w "\n%{http_code}" -X POST "$NOTIFY_SLACK_WEBHOOK" \
       -H 'Content-type: application/json' \
-      -d "{\"text\": $(echo "$slack_text" | jq -Rs .)}" > /dev/null 2>&1 || true
+      -d "$payload" 2>&1)
+    slack_http=${slack_resp##*$'\n'}
+    if [[ "$slack_http" != "200" ]]; then
+      detail "slack summary failed (HTTP $slack_http): ${slack_resp%$'\n'*}"
+    fi
   fi
 
   # Telegram
@@ -623,6 +645,14 @@ has_notifications=false
 [[ -n "$NOTIFY_SLACK_WEBHOOK" ]] && { detail "notify: slack"; has_notifications=true; }
 [[ -n "$NOTIFY_TELEGRAM_TOKEN" && -n "$NOTIFY_TELEGRAM_CHAT_ID" ]] && { detail "notify: telegram"; has_notifications=true; }
 [[ "$has_notifications" == false ]] && detail "notify: none configured"
+
+# ---------------------------------------------------------------------------
+# Stash any uncommitted changes so pulls don't conflict
+# ---------------------------------------------------------------------------
+stashed=false
+if ! git diff --quiet HEAD 2>/dev/null || [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
+  git stash push -u -m "ralph-pr-watch: auto-stash before run" >/dev/null 2>&1 && stashed=true
+fi
 
 # ---------------------------------------------------------------------------
 # Main polling loop
@@ -692,6 +722,9 @@ while true; do
 
   detail "triage: $fix_count fix, $defer_count defer, $question_count question, $drop_count drop"
 
+  # Show triage plan
+  echo "$triage_json" | jq -r '.[] | "    \(.action): [\(.group_id)] \(.fix_description // .reason // "")"' 2>/dev/null
+
   if [[ "$DRY_RUN" == true ]]; then
     out "${C_YELLOW}⏭${C_RESET}" "dry run — skipping execution"
     echo "$triage_json" | jq '.'
@@ -730,8 +763,18 @@ while true; do
           resolve_thread "$tid"
           mark_processed "$tid"
         done
+        out "${C_GREEN}✓${C_RESET}" "resolved $thread_len thread(s) for $group_id"
 
-        echo "  - $fix_desc — $files" >> "$sum_fixed"
+        # Link to first comment in group
+        first_cid=$(echo "$group" | jq -r '.threads[0].comment_id // ""')
+        comment_link=""
+        [[ -n "$first_cid" ]] && comment_link="${PR_URL}#discussion_r${first_cid}"
+
+        if [[ -n "$comment_link" ]]; then
+          echo "• <${comment_link}|\`$group_id\`> — $files" >> "$sum_fixed"
+        else
+          echo "• \`$group_id\` — $files" >> "$sum_fixed"
+        fi
       fi
     else
       detail "fix skipped/failed for $group_id — threads left unresolved"
@@ -759,8 +802,19 @@ while true; do
       resolve_thread "$tid"
       mark_processed "$tid"
     done
+    out "${C_CYAN}↗${C_RESET}" "deferred $group_id → ${issue_id:-no-issue}"
 
-    echo "  - $(echo "$group" | jq -r '.fix_description') → ${issue_id:-unknown}" >> "$sum_deferred"
+    first_cid=$(echo "$group" | jq -r '.threads[0].comment_id // ""')
+    comment_link=""
+    [[ -n "$first_cid" ]] && comment_link="${PR_URL}#discussion_r${first_cid}"
+    issue_link=""
+    [[ -n "$issue_id" ]] && issue_link="<https://linear.app/issue/${issue_id}|${issue_id}>"
+
+    if [[ -n "$comment_link" ]]; then
+      echo "• <${comment_link}|\`$group_id\`> → ${issue_link:-deferred}" >> "$sum_deferred"
+    else
+      echo "• \`$group_id\` → ${issue_link:-deferred}" >> "$sum_deferred"
+    fi
   done
 
   # --- Process QUESTION groups ---
@@ -784,11 +838,11 @@ while true; do
         reply_to_thread "$cid" "$answer"
         resolve_thread "$tid"
         mark_processed "$tid"
-        echo "  - $path:$line — answered" >> "$sum_questions"
+        echo "• <${PR_URL}#discussion_r${cid}|\`$path:$line\`> — answered" >> "$sum_questions"
       else
         # Cannot answer — leave unresolved, notify
         mark_processed "$tid"
-        echo "  - $path:$line — needs human attention ($reason)" >> "$sum_questions"
+        echo "• <${PR_URL}#discussion_r${cid}|\`$path:$line\`> — ⚠️ needs human attention" >> "$sum_questions"
         notify "question" "Cannot answer: $reason — $path:$line"
       fi
     done
@@ -812,7 +866,12 @@ while true; do
       mark_processed "$tid"
     done
 
-    echo "  - $(echo "$group" | jq -r '.fix_description // .reason') — $reason" >> "$sum_dropped"
+    first_cid=$(echo "$group" | jq -r '.threads[0].comment_id // ""')
+    if [[ -n "$first_cid" ]]; then
+      echo "• <${PR_URL}#discussion_r${first_cid}|\`$group_id\`> — $reason" >> "$sum_dropped"
+    else
+      echo "• \`$group_id\` — $reason" >> "$sum_dropped"
+    fi
   done
 
   # --- Cycle summary ---
