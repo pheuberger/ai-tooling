@@ -281,11 +281,14 @@ FINAL_REVIEW_MODEL="${MODEL:-${FINAL_REVIEW_MODEL:-claude-opus-4-6}}"
 SUMMARY_MODEL="${MODEL:-${SUMMARY_MODEL:-claude-haiku-4-5-20251001}}"
 
 # Run claude with a specific model: claude_as <model> [extra-args...]
-# TERM=dumb prevents claude from writing alternate-screen / cursor-control
-# sequences to /dev/tty, which would destroy the caller's scrollback.
+# setsid -w detaches from controlling terminal so claude can't write
+# alternate-screen / cursor-control sequences to /dev/tty (which destroys
+# the caller's scrollback).  -w keeps the wrapper alive until claude exits.
+# CI=true tells test runners (vitest, jest, etc.) to run non-interactively
+# instead of entering watch mode, which would hang the agent indefinitely.
 claude_as() {
   local model="$1"; shift
-  TERM=dumb claude "${claude_flags[@]}" --model "$model" "$@"
+  CI=true setsid -w claude "${claude_flags[@]}" --model "$model" "$@"
 }
 
 # Watchdog — kills a background agent subshell if its log file goes stale.
@@ -293,15 +296,33 @@ claude_as() {
 _watchdog() {
   local log_file="$1" timeout_min="$2" target_pid="$3"
   local timeout_sec=$((timeout_min * 60))
+  local last_tool_count=0 last_change
+  last_change=$(date +%s)
   while kill -0 "$target_pid" 2>/dev/null; do
     sleep 30
     [[ -f "$log_file" ]] || continue
-    local last_mod now
-    last_mod=$(stat -c %Y "$log_file" 2>/dev/null) || continue
+    local current_tool_count now
+    current_tool_count=$(grep -c '"tool_use"' "$log_file" 2>/dev/null || echo 0)
+    if (( current_tool_count != last_tool_count )); then
+      last_tool_count=$current_tool_count
+      last_change=$(date +%s)
+    fi
     now=$(date +%s)
-    if (( now - last_mod > timeout_sec )); then
+    # If the result event is already in the log, the agent is done — give it
+    # 60s to exit cleanly, then force-kill.
+    if grep -q '"type":"result"' "$log_file" 2>/dev/null; then
+      sleep 60
+      if kill -0 "$target_pid" 2>/dev/null; then
+        out "${C_RED}⏱${C_RESET}" "watchdog: agent finished but process hung — killing"
+        pkill -TERM -P "$target_pid" 2>/dev/null || true
+        sleep 2
+        kill -TERM "$target_pid" 2>/dev/null || true
+      fi
+      return
+    fi
+    if (( now - last_change > timeout_sec )); then
       echo ""
-      out "${C_RED}⏱${C_RESET}" "watchdog: no output for ${timeout_min}m — killing agent"
+      out "${C_RED}⏱${C_RESET}" "watchdog: no tool calls for ${timeout_min}m — killing agent"
       # Signal to run_agent that this was a watchdog kill (not a normal exit)
       touch "${log_file}.watchdog-killed"
       pkill -TERM -P "$target_pid" 2>/dev/null || true
