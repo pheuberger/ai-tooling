@@ -281,9 +281,11 @@ FINAL_REVIEW_MODEL="${MODEL:-${FINAL_REVIEW_MODEL:-claude-opus-4-6}}"
 SUMMARY_MODEL="${MODEL:-${SUMMARY_MODEL:-claude-haiku-4-5-20251001}}"
 
 # Run claude with a specific model: claude_as <model> [extra-args...]
+# TERM=dumb prevents claude from writing alternate-screen / cursor-control
+# sequences to /dev/tty, which would destroy the caller's scrollback.
 claude_as() {
   local model="$1"; shift
-  claude "${claude_flags[@]}" --model "$model" "$@"
+  TERM=dumb claude "${claude_flags[@]}" --model "$model" "$@"
 }
 
 # Watchdog — kills a background agent subshell if its log file goes stale.
@@ -300,6 +302,8 @@ _watchdog() {
     if (( now - last_mod > timeout_sec )); then
       echo ""
       out "${C_RED}⏱${C_RESET}" "watchdog: no output for ${timeout_min}m — killing agent"
+      # Signal to run_agent that this was a watchdog kill (not a normal exit)
+      touch "${log_file}.watchdog-killed"
       pkill -TERM -P "$target_pid" 2>/dev/null || true
       sleep 2
       kill -TERM "$target_pid" 2>/dev/null || true
@@ -310,6 +314,18 @@ _watchdog() {
 
 # Sink for run_agent — discards console output (quiet agents)
 _discard() { cat > /dev/null; }
+
+# Heartbeat — prints elapsed time every 60s so the user knows the agent is alive.
+# Only active when display_fn is ralph_stream_filter (visible agents).
+_heartbeat() {
+  local target_pid="$1" start=$SECONDS
+  while kill -0 "$target_pid" 2>/dev/null; do
+    sleep 60
+    kill -0 "$target_pid" 2>/dev/null || break
+    local elapsed=$(( SECONDS - start ))
+    printf '    \033[2m⋯ %dm elapsed\033[0m\n' $((elapsed / 60))
+  done
+}
 
 # run_agent <display_fn> <log_file> <model> [claude args...]
 # Runs claude with tee streaming to log_file and optional watchdog.
@@ -325,12 +341,26 @@ run_agent() {
       exec 0<&9 9<&-
       claude_as "$model" "$@" 2>&1 | tee "$log_file" | "$display"
     ) &
-    local _pid=$! _wdpid _rc=0
+    local _pid=$! _wdpid _hbpid="" _rc=0
     exec 9<&-
     _watchdog "$log_file" "$WATCHDOG_TIMEOUT" "$_pid" &
     _wdpid=$!
+    # Show heartbeat for visible agents so silence during thinking isn't alarming
+    if [[ "$display" == ralph_stream_filter ]]; then
+      _heartbeat "$_pid" &
+      _hbpid=$!
+    fi
     wait "$_pid" || _rc=$?
     kill "$_wdpid" 2>/dev/null; wait "$_wdpid" 2>/dev/null || true
+    [[ -n "$_hbpid" ]] && { kill "$_hbpid" 2>/dev/null; wait "$_hbpid" 2>/dev/null || true; }
+    # If the watchdog killed the agent, strip any result event claude may
+    # have emitted during SIGTERM shutdown — callers check the log for
+    # result/success to decide next steps, and a watchdog kill is never success.
+    if [[ -f "${log_file}.watchdog-killed" ]]; then
+      rm -f "${log_file}.watchdog-killed"
+      sed -i '/"type":"result"/d' "$log_file" 2>/dev/null || true
+      return 1
+    fi
     return "$_rc"
   else
     claude_as "$model" "$@" 2>&1 | tee "$log_file" | "$display"
