@@ -759,7 +759,7 @@ while true; do
           thread=$(echo "$group" | jq -c ".threads[$ti]")
           tid=$(echo "$thread" | jq -r '.thread_id')
           cid=$(echo "$thread" | jq -r '.comment_id')
-          reply_to_thread "$cid" "Fixed in $local_sha — $fix_desc"
+          reply_to_thread "$cid" "Fixed in $local_sha."
           resolve_thread "$tid"
           mark_processed "$tid"
         done
@@ -799,7 +799,6 @@ while true; do
       else
         reply_to_thread "$cid" "Valid point — tracked for follow-up. Deferring from this PR to keep scope focused."
       fi
-      resolve_thread "$tid"
       mark_processed "$tid"
     done
     out "${C_CYAN}↗${C_RESET}" "deferred $group_id → ${issue_id:-no-issue}"
@@ -836,7 +835,6 @@ while true; do
 
       if [[ -n "$answer" ]]; then
         reply_to_thread "$cid" "$answer"
-        resolve_thread "$tid"
         mark_processed "$tid"
         echo "• <${PR_URL}#discussion_r${cid}|\`$path:$line\`> — answered" >> "$sum_questions"
       else
@@ -862,7 +860,6 @@ while true; do
       tid=$(echo "$thread" | jq -r '.thread_id')
       cid=$(echo "$thread" | jq -r '.comment_id')
       reply_to_thread "$cid" "After review, $reason"
-      resolve_thread "$tid"
       mark_processed "$tid"
     done
 
