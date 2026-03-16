@@ -302,7 +302,8 @@ _watchdog() {
     sleep 30
     [[ -f "$log_file" ]] || continue
     local current_tool_count now
-    current_tool_count=$(grep -c '"tool_use"' "$log_file" 2>/dev/null || true)
+    current_tool_count=$(grep -c '"tool_use"' "$log_file" 2>/dev/null | tail -1 || true)
+    [[ "$current_tool_count" =~ ^[0-9]+$ ]] || current_tool_count=0
     if (( current_tool_count != last_tool_count )); then
       last_tool_count=$current_tool_count
       last_change=$(date +%s)
