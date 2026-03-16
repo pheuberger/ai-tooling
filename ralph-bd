@@ -609,6 +609,7 @@ while true; do
   # -----------------------------------------------------------------------
   # Run Claude — retry on failure
   # -----------------------------------------------------------------------
+  pre_worker_head=$(git rev-parse HEAD)
   log_file="$LOG_DIR/iter-${iteration}-${bead_id}.log"
   retries=0
   success=false
@@ -694,37 +695,6 @@ TESTFAIL
   fi
 
   # -----------------------------------------------------------------------
-  # Simplify — fix reuse, quality, and efficiency issues before committing
-  # Skipped when the worker diff is smaller than SIMPLIFY_THRESHOLD lines.
-  # -----------------------------------------------------------------------
-  # Count tracked changes (staged + unstaged) excluding internal dirs
-  diff_lines=$(git diff HEAD --stat -- ':!.ralph-logs' ':!.beads' 2>/dev/null | tail -1 | grep -oP '\d+(?= insertion)' || true)
-  del_lines=$(git diff HEAD --stat -- ':!.ralph-logs' ':!.beads' 2>/dev/null | tail -1 | grep -oP '\d+(?= deletion)' || true)
-  # Count lines in untracked files (new files not yet git-added)
-  untracked_lines=$(git ls-files --others --exclude-standard -- ':!.ralph-logs' ':!.beads' 2>/dev/null | xargs -r wc -l 2>/dev/null | tail -1 | awk '{print $1}' || true)
-  changed_lines=$(( ${diff_lines:-0} + ${del_lines:-0} + ${untracked_lines:-0} ))
-
-  if (( changed_lines >= SIMPLIFY_THRESHOLD )); then
-    echo ""
-    phase_hdr "$C_CYAN" "Simplify — $(short_model "$SIMPLIFY_MODEL")"
-    simplify_log="$LOG_DIR/iter-${iteration}-${bead_id}-simplify.log"
-
-    run_agent ralph_stream_filter "$simplify_log" "$SIMPLIFY_MODEL" --output-format stream-json --verbose -p "$(
-      render_prompt "$PROMPTS_DIR/simplify.md"
-    )" || true
-
-    extract_cost "simplify" "$simplify_log"
-    if jq -e 'select(.type == "result" and .subtype == "success")' "$simplify_log" > /dev/null 2>&1; then
-      read -r dur cost <<< "$(extract_result "$simplify_log")"
-      out "${C_GREEN}✓${C_RESET}" "${C_DIM}$(fmt_duration "$dur") · \$$(fmt_cost "$cost")${C_RESET}"
-    else
-      out "${C_YELLOW}✗${C_RESET}" "simplify failed — continuing"
-    fi
-  else
-    detail "skipping simplify — only $changed_lines lines changed (threshold: $SIMPLIFY_THRESHOLD)"
-  fi
-
-  # -----------------------------------------------------------------------
   # Commit code + beads changes together.
   # .ralph-logs/ and .beads/ are script-internal and excluded.
   # Exclude pathspecs (:!) don't play well with git add, so we use
@@ -738,6 +708,44 @@ TESTFAIL
   )" \
     && phase_hdr "$C_YELLOW" "Commit ${C_GREEN}✓${C_RESET}" \
     || phase_hdr "$C_YELLOW" "Commit ${C_RED}✗${C_RESET}"
+
+  # -----------------------------------------------------------------------
+  # Simplify — fix reuse, quality, and efficiency issues before review
+  # Skipped when the worker diff is smaller than SIMPLIFY_THRESHOLD lines.
+  # -----------------------------------------------------------------------
+  changed_lines=$(git diff --stat "$pre_worker_head"..HEAD -- ':!.ralph-logs' ':!.beads' 2>/dev/null | tail -1 | grep -oP '\d+(?= (insertion|file))' | head -1 || true)
+  del_lines=$(git diff --stat "$pre_worker_head"..HEAD -- ':!.ralph-logs' ':!.beads' 2>/dev/null | tail -1 | grep -oP '\d+(?= deletion)' || true)
+  changed_lines=$(( ${changed_lines:-0} + ${del_lines:-0} ))
+
+  if (( changed_lines >= SIMPLIFY_THRESHOLD )); then
+    echo ""
+    phase_hdr "$C_CYAN" "Simplify — $(short_model "$SIMPLIFY_MODEL")"
+    simplify_log="$LOG_DIR/iter-${iteration}-${bead_id}-simplify.log"
+
+    run_agent ralph_stream_filter "$simplify_log" "$SIMPLIFY_MODEL" --output-format stream-json --verbose -p "$(
+      export PRE_WORKER_HEAD="$pre_worker_head"
+      render_prompt "$PROMPTS_DIR/simplify.md" PRE_WORKER_HEAD
+    )" || true
+
+    extract_cost "simplify" "$simplify_log"
+    if jq -e 'select(.type == "result" and .subtype == "success")' "$simplify_log" > /dev/null 2>&1; then
+      read -r dur cost <<< "$(extract_result "$simplify_log")"
+      out "${C_GREEN}✓${C_RESET}" "${C_DIM}$(fmt_duration "$dur") · \$$(fmt_cost "$cost")${C_RESET}"
+      # Commit any simplify changes
+      if ! git diff --quiet HEAD -- ':!.ralph-logs' ':!.beads' 2>/dev/null || \
+         git ls-files --others --exclude-standard -- ':!.ralph-logs' ':!.beads' 2>/dev/null | grep -q .; then
+        simplify_commit_log="$LOG_DIR/iter-${iteration}-${bead_id}-simplify-commit.log"
+        run_agent _discard "$simplify_commit_log" "$COMMIT_MODEL" -p "$(
+          export BEAD_ID="$bead_id"
+          render_prompt "$PROMPTS_DIR/commit.md" BEAD_ID
+        )" || true
+      fi
+    else
+      out "${C_YELLOW}✗${C_RESET}" "simplify failed — continuing"
+    fi
+  else
+    detail "skipping simplify — only $changed_lines lines changed (threshold: $SIMPLIFY_THRESHOLD)"
+  fi
 
   # -----------------------------------------------------------------------
   # Review the work — fresh Claude instance, read-only
