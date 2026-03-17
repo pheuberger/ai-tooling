@@ -116,6 +116,12 @@ Good: "Done when: (1) POST /api/user with `{ displayName: 'Test' }` updates the 
 
 If a bead touches multiple files for different reasons, split it. A schema migration is one bead. The service change is another. The API route change is another. The tests are another (or colocated with the service bead if tightly coupled).
 
+### Every Bead Must Leave Tests Passing
+
+Each bead must leave the codebase in a state where tests pass. If a bead adds or changes behavior, it must include the corresponding test updates in the same bead. **Never create a separate bead to "fix tests broken by bead X"** — the test changes belong in bead X. A test gate runs after each bead's worker, so broken tests will trigger retries and waste cycles.
+
+Separate test beads are only valid for: (1) fixing pre-existing test failures unrelated to the current plan, or (2) adding coverage for untested existing code.
+
 ## Bead Description Template
 
 Every bead description MUST follow this structure:

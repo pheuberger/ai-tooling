@@ -42,6 +42,7 @@ Quality gate: a bead passes only if ANY agent can implement it WITHOUT reading o
 - Missing `## Files` or `## Code Changes` sections
 - Dependencies reference concepts instead of bead IDs
 - Missing feature label (fix: `bd update <id> --add-label <label>`)
+- **Bead would leave tests broken** — if a bead adds/changes behavior, it must include the corresponding test updates. A separate "fix tests for bead X" bead is always wrong; merge the test changes into bead X. (Exception: beads that fix pre-existing test failures or add coverage for untested existing code.)
 
 ### Must Split
 
