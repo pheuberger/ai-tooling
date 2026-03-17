@@ -1,2 +1,10 @@
 #!/usr/bin/env bash
-exec bun run "$(dirname "$0")/src/main.ts" "$@"
+SCRIPT_DIR="$(dirname "$0")"
+DIST="$SCRIPT_DIR/dist/main.js"
+
+# Auto-rebuild when any source file is newer than the bundle
+if [[ ! -f "$DIST" ]] || [[ -n "$(find "$SCRIPT_DIR/src" -newer "$DIST" -name '*.ts' -print -quit 2>/dev/null)" ]]; then
+  bun build "$SCRIPT_DIR/src/main.ts" --outdir "$SCRIPT_DIR/dist" --target bun --minify >/dev/null 2>&1
+fi
+
+exec bun "$DIST" "$@"

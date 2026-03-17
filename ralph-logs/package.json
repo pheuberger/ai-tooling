@@ -3,7 +3,10 @@
   "version": "0.1.0",
   "type": "module",
   "bin": { "ralph-logs": "./ralph-logs" },
-  "scripts": { "check": "bunx tsc --noEmit" },
+  "scripts": {
+    "check": "bunx tsc --noEmit",
+    "build": "bun build src/main.ts --outdir dist --target bun --minify"
+  },
   "dependencies": { "@opentui/core": "latest" },
   "devDependencies": { "typescript": "latest" }
 }

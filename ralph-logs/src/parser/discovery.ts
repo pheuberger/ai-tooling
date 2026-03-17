@@ -194,24 +194,30 @@ export async function discoverLogFiles(logDir: string): Promise<LogFile[]> {
     if (classified) {
       files.push({ path, filename, ...classified })
     } else {
-      // Unrecognized: sniff first line for stream-json
+      // Unrecognized: sniff first line for stream-json (read only first 1KB)
       try {
-        const text = await Bun.file(path).text()
-        const firstLine = text.split('\n')[0].trim()
-        if (firstLine) {
-          const parsed = JSON.parse(firstLine)
-          if (parsed && typeof parsed === 'object' && 'type' in parsed) {
-            const nameWithoutExt = filename.replace(/\.[^.]+$/, '')
-            files.push({
-              path,
-              filename,
-              phase: 'other',
-              agentType: nameWithoutExt,
-              format: 'stream-json',
-              groupKey: 'other',
-              displayLabel: filename,
-            })
+        const fd = await import('fs').then(m => m.promises.open(path, 'r'))
+        try {
+          const buf = Buffer.alloc(1024)
+          const { bytesRead } = await fd.read(buf, 0, 1024, 0)
+          const firstLine = buf.toString('utf-8', 0, bytesRead).split('\n')[0].trim()
+          if (firstLine) {
+            const parsed = JSON.parse(firstLine)
+            if (parsed && typeof parsed === 'object' && 'type' in parsed) {
+              const nameWithoutExt = filename.replace(/\.[^.]+$/, '')
+              files.push({
+                path,
+                filename,
+                phase: 'other',
+                agentType: nameWithoutExt,
+                format: 'stream-json',
+                groupKey: 'other',
+                displayLabel: filename,
+              })
+            }
           }
+        } finally {
+          await fd.close()
         }
       } catch {
         // Silently ignore unrecognized files

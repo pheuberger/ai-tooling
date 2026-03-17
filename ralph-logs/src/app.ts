@@ -74,8 +74,16 @@ export async function createApp(logDir: string): Promise<void> {
   rootBox.add(statusBarBox)
   renderer.root.add(rootBox)
 
-  // Parse cache
+  // Parse cache (LRU, keeps last 5 files)
+  const LRU_MAX = 5
   const cache = new Map<string, ParsedLog>()
+  function cacheSet(key: string, value: ParsedLog) {
+    cache.delete(key) // move to end
+    cache.set(key, value)
+    if (cache.size > LRU_MAX) {
+      cache.delete(cache.keys().next().value!)
+    }
+  }
 
   // View state memory: scroll position + collapse states per file
   type FileViewState = { scrollY: number; collapseStates: boolean[] }
@@ -98,7 +106,7 @@ export async function createApp(logDir: string): Promise<void> {
       } else {
         parsedLog = await parsePlainText(file.path)
       }
-      cache.set(file.path, parsedLog)
+      cacheSet(file.path, parsedLog)
     }
     content.loadBlocks(parsedLog.blocks)
     statusBar.update(file, parsedLog.metadata)
@@ -121,17 +129,29 @@ export async function createApp(logDir: string): Promise<void> {
 
   // Mark errored files in sidebar by reading last line of each stream-json file
   async function markErrorFiles() {
+    const { promises: fsp, statSync: fstatSync } = await import('fs')
     for (let i = 0; i < files.length; i++) {
       const file = files[i]
       if (file.format !== 'stream-json') continue
       try {
-        const text = await Bun.file(file.path).text()
-        const lines = text.split('\n').filter((l: string) => l.trim())
-        if (lines.length === 0) continue
-        const lastLine = lines[lines.length - 1]
-        const parsed = JSON.parse(lastLine)
-        if (parsed && parsed.type === 'result' && parsed.subtype === 'error') {
-          sidebar.setFileError(i)
+        // Read only the last 4KB to find the final line
+        const TAIL_SIZE = 4096
+        const stat = fstatSync(file.path)
+        const fd = await fsp.open(file.path, 'r')
+        try {
+          const readSize = Math.min(TAIL_SIZE, stat.size)
+          const buf = Buffer.alloc(readSize)
+          await fd.read(buf, 0, readSize, Math.max(0, stat.size - readSize))
+          const tail = buf.toString('utf-8')
+          const lines = tail.split('\n').filter((l: string) => l.trim())
+          if (lines.length === 0) continue
+          const lastLine = lines[lines.length - 1]
+          const parsed = JSON.parse(lastLine)
+          if (parsed && parsed.type === 'result' && parsed.subtype === 'error') {
+            sidebar.setFileError(i)
+          }
+        } finally {
+          await fd.close()
         }
       } catch {
         // ignore unreadable or non-JSON files
