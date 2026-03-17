@@ -272,14 +272,25 @@ export async function createApp(logDir: string): Promise<void> {
       return
     }
 
-    // [ / ] → prev/next file (works from either panel)
+    // [ / ] → prev/next iteration group (works from either panel)
     if (key.name === '[' || key.sequence === '[') {
-      triggerSelectFile(-1)
+      sidebar.moveToIterGroup(-1)
       return
     }
 
     if (key.name === ']' || key.sequence === ']') {
-      triggerSelectFile(+1)
+      sidebar.moveToIterGroup(+1)
+      return
+    }
+
+    // h / l → prev/next iteration group (works from either panel)
+    if (key.name === 'h' || key.name === 'left') {
+      sidebar.moveToIterGroup(-1)
+      return
+    }
+
+    if (key.name === 'l' || key.name === 'right') {
+      sidebar.moveToIterGroup(+1)
       return
     }
 

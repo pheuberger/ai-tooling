@@ -29,6 +29,7 @@ export function createSidebar(
   getSelectedFile(): LogFile | null
   getSelectedIndex(): number
   moveSelection(delta: number): void
+  moveToIterGroup(delta: number): void
   setOnSelect(cb: (file: LogFile) => void): void
   setFileError(fileIndex: number): void
 } {
@@ -172,6 +173,40 @@ export function createSidebar(
       }
       if (onSelectCallback) {
         onSelectCallback(files[selectedIndex])
+      }
+    },
+    moveToIterGroup(delta: number) {
+      if (files.length === 0 || selectedIndex < 0) return
+      const currentGroup = files[selectedIndex].groupKey
+      if (delta > 0) {
+        // Find first file in the next iteration group
+        for (let i = selectedIndex + 1; i < files.length; i++) {
+          if (files[i].groupKey !== currentGroup && files[i].groupKey.startsWith('iter-')) {
+            selectedIndex = i
+            render()
+            if (selectedIndex < entryPositions.length) scrollBox.scrollTo(entryPositions[selectedIndex])
+            if (onSelectCallback) onSelectCallback(files[selectedIndex])
+            return
+          }
+        }
+      } else {
+        // Find first file of the previous iteration group
+        // First, find the start of the current group
+        let groupStart = selectedIndex
+        while (groupStart > 0 && files[groupStart - 1].groupKey === currentGroup) groupStart--
+        // Now search backward from there for an iter- group
+        for (let i = groupStart - 1; i >= 0; i--) {
+          if (files[i].groupKey.startsWith('iter-')) {
+            // Jump to first file in that group
+            let start = i
+            while (start > 0 && files[start - 1].groupKey === files[i].groupKey) start--
+            selectedIndex = start
+            render()
+            if (selectedIndex < entryPositions.length) scrollBox.scrollTo(entryPositions[selectedIndex])
+            if (onSelectCallback) onSelectCallback(files[selectedIndex])
+            return
+          }
+        }
       }
     },
     setOnSelect(cb: (file: LogFile) => void) {

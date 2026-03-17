@@ -14,7 +14,7 @@ const KEYBINDINGS: Array<[string, string]> = [
   ['Tab', 'Switch panel focus'],
   ['Enter', 'Open file / toggle block'],
   ['Space', 'Toggle block'],
-  ['[ / ]', 'Prev / next file'],
+  ['h / l / [ / ]', 'Prev / next iteration'],
   ['e', 'Expand all blocks'],
   ['c', 'Collapse all blocks'],
   ['?', 'Toggle this help'],
