@@ -17,8 +17,11 @@ ${LENS_INSTRUCTIONS}
 2. You do NOT have codebase access. Evaluate the plan on its own merits.
 {{/IF NO_CODEBASE}}
 3. For each issue you find, decide:
-   - **Fixable** (missing detail, vague language, obvious gap, contradiction):
+   - **Fixable** (missing detail, vague language, obvious gap, contradiction, prose/code mismatch):
      → Edit ${REFINED_FILE} directly to fix it. Be precise and concise.
+     → **Prose vs code examples**: If prose describes approach A but a code snippet
+       demonstrates approach B, this is ALWAYS fixable — pick the correct one and
+       update both prose and code to agree. Never log this as a question.
    - **Ambiguous** (requires human judgment, multiple valid approaches, business decision):
      → Append to ${QUESTIONS_FILE} in this format:
      Q: [clear question]
