@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# ralph-pr-watch — Autonomous PR comment watcher and fixer
+# ralph-babysit — Autonomous PR shepherd: fixes review comments,
+# diagnoses CI failures, pushes to production
 #
-# Polls unresolved PR review threads, triages them, implements fixes,
-# defers out-of-scope work to Linear, and notifies via Slack/Telegram.
-# Fire-and-forget: run in background and it handles everything.
+# Polls unresolved PR review threads and failing CI checks, triages them,
+# implements fixes, defers out-of-scope work to Linear, and notifies via
+# Slack/Telegram. Fire-and-forget: run in background and it handles everything.
 #
-# Usage: ./ralph-pr-watch [options]
+# Usage: ./ralph-babysit [options]
 #   --pr NUMBER          PR number (default: detect from current branch)
 #   --repo OWNER/REPO    GitHub repo (default: detect from git remote)
 #   --interval SECONDS   Polling interval (default: 300)
@@ -16,9 +17,10 @@
 #   -h, --help           Show this help
 #
 # Configuration (.ralphrc):
-#   PR_WATCH_INTERVAL, PR_WATCH_MAX_CYCLES, PR_WATCH_MAX_RETRIES,
-#   PR_WATCH_LINEAR_TEAM, TRIAGE_MODEL, PR_WATCH_WORKER_MODEL,
-#   PR_WATCH_COMMIT_MODEL, DEFER_MODEL,
+#   BABYSIT_INTERVAL, BABYSIT_MAX_CYCLES, BABYSIT_MAX_RETRIES,
+#   BABYSIT_LINEAR_TEAM, TRIAGE_MODEL, BABYSIT_WORKER_MODEL,
+#   BABYSIT_COMMIT_MODEL, BABYSIT_CI_MODEL, DEFER_MODEL,
+#   BABYSIT_MAX_CI_CYCLES, BABYSIT_CI_TIMEOUT,
 #   NOTIFY_TELEGRAM_TOKEN, NOTIFY_TELEGRAM_CHAT_ID, NOTIFY_SLACK_WEBHOOK
 #
 # Requires: claude (Claude Code CLI), gh (GitHub CLI), jq, git
@@ -92,14 +94,17 @@ MAX_CYCLES=0              # 0 = infinite
 MAX_RETRIES=3             # retries per fix group
 MODEL=""                  # global override
 TRIAGE_MODEL=""           # triage agent — default: opus
-PR_WATCH_WORKER_MODEL=""  # fix worker — default: sonnet
-PR_WATCH_COMMIT_MODEL=""  # commit agent — default: haiku
+BABYSIT_WORKER_MODEL=""   # fix worker — default: sonnet
+BABYSIT_COMMIT_MODEL=""   # commit agent — default: haiku
+BABYSIT_CI_MODEL=""       # CI fix worker — default: sonnet
 DEFER_MODEL=""            # defer agent (Linear issue) — default: sonnet
 DRY_RUN=false
 ONCE=false
 LINEAR_TEAM=""            # Linear team for deferred issues
-LOG_DIR=".ralph-logs/pr-watch"
+LOG_DIR=".ralph-logs/babysit"
 RALPH_RULES_FILE=".ralph-rules.md"
+MAX_CI_CYCLES=3           # max rounds of CI fix attempts
+CI_TIMEOUT=600            # seconds to wait for checks to complete
 
 # Notifications
 NOTIFY_TELEGRAM_TOKEN=""
@@ -112,11 +117,13 @@ if [[ -f ".ralphrc" ]]; then
   source ".ralphrc"
 fi
 
-# Map .ralphrc convenience names
-INTERVAL="${PR_WATCH_INTERVAL:-$INTERVAL}"
-MAX_CYCLES="${PR_WATCH_MAX_CYCLES:-$MAX_CYCLES}"
-MAX_RETRIES="${PR_WATCH_MAX_RETRIES:-$MAX_RETRIES}"
-LINEAR_TEAM="${PR_WATCH_LINEAR_TEAM:-$LINEAR_TEAM}"
+# Map .ralphrc convenience names (BABYSIT_* preferred, PR_WATCH_* fallback)
+INTERVAL="${BABYSIT_INTERVAL:-${PR_WATCH_INTERVAL:-$INTERVAL}}"
+MAX_CYCLES="${BABYSIT_MAX_CYCLES:-${PR_WATCH_MAX_CYCLES:-$MAX_CYCLES}}"
+MAX_RETRIES="${BABYSIT_MAX_RETRIES:-${PR_WATCH_MAX_RETRIES:-$MAX_RETRIES}}"
+LINEAR_TEAM="${BABYSIT_LINEAR_TEAM:-${PR_WATCH_LINEAR_TEAM:-$LINEAR_TEAM}}"
+MAX_CI_CYCLES="${BABYSIT_MAX_CI_CYCLES:-$MAX_CI_CYCLES}"
+CI_TIMEOUT="${BABYSIT_CI_TIMEOUT:-$CI_TIMEOUT}"
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -170,10 +177,11 @@ if [[ "$current_branch" != "$PR_HEAD" ]]; then
   exit 1
 fi
 
-# Per-agent model defaults
+# Per-agent model defaults (BABYSIT_* preferred, PR_WATCH_* fallback)
 TRIAGE_MODEL="${MODEL:-${TRIAGE_MODEL:-claude-opus-4-6}}"
-PR_WATCH_WORKER_MODEL="${MODEL:-${PR_WATCH_WORKER_MODEL:-claude-sonnet-4-6}}"
-PR_WATCH_COMMIT_MODEL="${MODEL:-${PR_WATCH_COMMIT_MODEL:-claude-haiku-4-5-20251001}}"
+BABYSIT_WORKER_MODEL="${MODEL:-${BABYSIT_WORKER_MODEL:-${BABYSIT_WORKER_MODEL:-claude-sonnet-4-6}}}"
+BABYSIT_COMMIT_MODEL="${MODEL:-${BABYSIT_COMMIT_MODEL:-${BABYSIT_COMMIT_MODEL:-claude-haiku-4-5-20251001}}}"
+BABYSIT_CI_MODEL="${MODEL:-${BABYSIT_CI_MODEL:-claude-sonnet-4-6}}"
 DEFER_MODEL="${MODEL:-${DEFER_MODEL:-claude-sonnet-4-6}}"
 
 # Common claude flags
@@ -236,7 +244,7 @@ ralph_stream_filter() {
 # ---------------------------------------------------------------------------
 # GraphQL helpers
 # ---------------------------------------------------------------------------
-GRAPHQL_QUERY_FILE=$(mktemp /tmp/ralph-pr-threads.XXXXXX.graphql)
+GRAPHQL_QUERY_FILE=$(mktemp /tmp/ralph-babysit-threads.XXXXXX.graphql)
 cat <<'GRAPHQL' > "$GRAPHQL_QUERY_FILE"
 query($owner: String!, $repo: String!, $pr: Int!) {
   repository(owner: $owner, name: $repo) {
@@ -266,7 +274,7 @@ query($owner: String!, $repo: String!, $pr: Int!) {
 }
 GRAPHQL
 
-GRAPHQL_RESOLVE_FILE=$(mktemp /tmp/ralph-pr-resolve.XXXXXX.graphql)
+GRAPHQL_RESOLVE_FILE=$(mktemp /tmp/ralph-babysit-resolve.XXXXXX.graphql)
 cat <<'GRAPHQL' > "$GRAPHQL_RESOLVE_FILE"
 mutation($threadId: ID!) {
   resolveReviewThread(input: {threadId: $threadId}) {
@@ -371,7 +379,7 @@ triage_comments() {
   triage_output=$(claude_as "$TRIAGE_MODEL" --output-format stream-json --verbose -p "$(
     export PR_NUMBER PR_TITLE PR_URL PR_BASE REPO_FULL
     export THREADS_JSON="$threads_json"
-    render_prompt "$PROMPTS_DIR/pr-watch-triage.md" \
+    render_prompt "$PROMPTS_DIR/babysit-triage.md" \
       PR_NUMBER PR_TITLE PR_URL PR_BASE REPO_FULL THREADS_JSON
   )" 2>&1 | tee "$triage_log" | ralph_stream_filter)
 
@@ -403,17 +411,17 @@ fix_comment_group() {
   while [[ $retries -lt $MAX_RETRIES ]]; do
     echo ""
     if [[ $MAX_RETRIES -gt 1 ]]; then
-      phase_hdr "$C_CYAN" "Worker [$group_id] (attempt $((retries + 1))/$MAX_RETRIES) — $(short_model "$PR_WATCH_WORKER_MODEL")"
+      phase_hdr "$C_CYAN" "Worker [$group_id] (attempt $((retries + 1))/$MAX_RETRIES) — $(short_model "$BABYSIT_WORKER_MODEL")"
     else
-      phase_hdr "$C_CYAN" "Worker [$group_id] — $(short_model "$PR_WATCH_WORKER_MODEL")"
+      phase_hdr "$C_CYAN" "Worker [$group_id] — $(short_model "$BABYSIT_WORKER_MODEL")"
     fi
 
     local worker_log="$LOG_DIR/worker-${group_id}-$(date '+%H%M%S').log"
-    claude_as "$PR_WATCH_WORKER_MODEL" --output-format stream-json --verbose -p "$(
+    claude_as "$BABYSIT_WORKER_MODEL" --output-format stream-json --verbose -p "$(
       export PR_NUMBER PR_TITLE PR_BASE REPO_FULL
       export FIX_DESCRIPTION="$fix_desc" THREADS_JSON="$threads_json"
       export PROJECT_RULES="$project_rules"
-      render_prompt "$PROMPTS_DIR/pr-watch-worker.md" \
+      render_prompt "$PROMPTS_DIR/babysit-worker.md" \
         PR_NUMBER PR_TITLE PR_BASE REPO_FULL FIX_DESCRIPTION THREADS_JSON PROJECT_RULES
     )" 2>&1 | tee "$worker_log" | ralph_stream_filter || true
 
@@ -460,11 +468,11 @@ commit_and_push() {
   fi
 
   echo ""
-  phase_hdr "$C_YELLOW" "Commit — $(short_model "$PR_WATCH_COMMIT_MODEL")"
+  phase_hdr "$C_YELLOW" "Commit — $(short_model "$BABYSIT_COMMIT_MODEL")"
   local commit_log="$LOG_DIR/commit-${group_id}-$(date '+%H%M%S').log"
-  claude_as "$PR_WATCH_COMMIT_MODEL" -p "$(
+  claude_as "$BABYSIT_COMMIT_MODEL" -p "$(
     export PR_NUMBER
-    render_prompt "$PROMPTS_DIR/pr-watch-commit.md" PR_NUMBER
+    render_prompt "$PROMPTS_DIR/babysit-commit.md" PR_NUMBER
   )" > "$commit_log" 2>&1 \
     && out "${C_GREEN}✓${C_RESET}" "committed" \
     || { out "${C_RED}✗${C_RESET}" "commit failed"; return 1; }
@@ -509,7 +517,7 @@ defer_comment_group() {
   claude_as "$DEFER_MODEL" -p "$(
     export PR_NUMBER PR_TITLE PR_URL REPO_FULL GROUP_ID="$group_id" REASON="$reason"
     export THREADS_JSON="$threads_json" LINEAR_TEAM="$LINEAR_TEAM"
-    render_prompt "$PROMPTS_DIR/pr-watch-defer.md" \
+    render_prompt "$PROMPTS_DIR/babysit-defer.md" \
       PR_NUMBER PR_TITLE PR_URL REPO_FULL GROUP_ID REASON THREADS_JSON LINEAR_TEAM
   )" > "$defer_log" 2>&1
 
@@ -525,6 +533,105 @@ defer_comment_group() {
     out "${C_YELLOW}?${C_RESET}" "defer agent ran but no issue ID found" >&2
     echo ""
   fi
+}
+
+# ---------------------------------------------------------------------------
+# CI check helpers
+# ---------------------------------------------------------------------------
+
+# Wait for all PR checks to reach a terminal state (or timeout)
+wait_for_checks() {
+  local timeout="$CI_TIMEOUT"
+  local elapsed=0
+  local interval=30
+  while [[ $elapsed -lt $timeout ]]; do
+    local pending
+    pending=$(gh pr view "$PR_NUMBER" --json statusCheckRollup --jq '
+      [.statusCheckRollup[] | select(.status != "COMPLETED")] | length
+    ' 2>/dev/null || echo "0")
+    if [[ "$pending" -eq 0 ]]; then return 0; fi
+    detail "waiting for $pending check(s)... (${elapsed}s/${timeout}s)"
+    sleep "$interval"
+    elapsed=$((elapsed + interval))
+  done
+  return 1  # timeout
+}
+
+# Fetch failing checks as JSON array
+fetch_failing_checks() {
+  gh pr view "$PR_NUMBER" --json statusCheckRollup --jq '
+    [.statusCheckRollup[] |
+     select(.conclusion == "FAILURE" or .conclusion == "failure") |
+     {name: .name, detailsUrl: .detailsUrl, context: .context}]
+  ' 2>/dev/null || echo "[]"
+}
+
+# Fetch logs for a failing check
+fetch_check_logs() {
+  local check_name="$1"
+  local logs=""
+
+  # Try check-run annotations (structured errors with file/line)
+  local run_id
+  run_id=$(gh api "repos/$OWNER/$REPO/commits/$(git rev-parse HEAD)/check-runs" \
+    --jq ".check_runs[] | select(.name == \"$check_name\" and .conclusion == \"failure\") | .id" \
+    2>/dev/null | head -1)
+
+  if [[ -n "$run_id" ]]; then
+    local annotations
+    annotations=$(gh api "repos/$OWNER/$REPO/check-runs/$run_id/annotations" \
+      --jq '.[] | "\(.path):\(.start_line) — \(.annotation_level): \(.message)"' 2>/dev/null || true)
+    [[ -n "$annotations" ]] && logs="$annotations"
+  fi
+
+  # Also try gh run view for workflow run logs
+  local workflow_run_id
+  workflow_run_id=$(gh run list --branch "$PR_HEAD" --status failure --limit 1 \
+    --json databaseId --jq '.[0].databaseId' 2>/dev/null || true)
+  if [[ -n "$workflow_run_id" ]]; then
+    local run_logs
+    run_logs=$(gh run view "$workflow_run_id" --log-failed 2>/dev/null | tail -100 || true)
+    if [[ -n "$run_logs" ]]; then
+      [[ -n "$logs" ]] && logs="$logs"$'\n\n'"--- Workflow run logs ---"$'\n'
+      logs="${logs}${run_logs}"
+    fi
+  fi
+
+  echo "$logs"
+}
+
+# Fix a CI failure via Claude worker agent
+fix_ci_failure() {
+  local check_name="$1" ci_log="$2"
+  local ci_log_file="$LOG_DIR/ci-worker-${check_name//[^a-zA-Z0-9_-]/_}-$(date '+%H%M%S').log"
+
+  phase_hdr "$C_CYAN" "CI Worker [$check_name] — $(short_model "$BABYSIT_CI_MODEL")"
+
+  claude_as "$BABYSIT_CI_MODEL" --output-format stream-json --verbose -p "$(
+    export PR_NUMBER PR_TITLE PR_BASE REPO_FULL
+    export CHECK_NAME="$check_name" CI_LOG="$ci_log"
+    export PROJECT_RULES="$project_rules"
+    render_prompt "$PROMPTS_DIR/babysit-ci-worker.md" \
+      PR_NUMBER PR_TITLE PR_BASE REPO_FULL CHECK_NAME CI_LOG PROJECT_RULES
+  )" 2>&1 | tee "$ci_log_file" | ralph_stream_filter || true
+
+  extract_cost "ci-worker" "$ci_log_file"
+
+  if jq -e 'select(.type == "result" and .subtype == "success")' "$ci_log_file" > /dev/null 2>&1; then
+    read -r dur cost <<< "$(extract_result "$ci_log_file")"
+    out "${C_GREEN}✓${C_RESET}" "${C_DIM}$(fmt_duration "$dur") · \$$(fmt_cost "$cost")${C_RESET}"
+
+    local worker_text
+    worker_text=$(jq -r 'select(.type == "assistant") | .message.content[]? | select(.type == "text") | .text' "$ci_log_file" 2>/dev/null | tail -1)
+    if [[ "$worker_text" == *"FIX_SKIPPED"* ]]; then
+      out "${C_YELLOW}⏭${C_RESET}" "ci worker skipped fix for $check_name"
+      return 1
+    fi
+    return 0
+  fi
+
+  out "${C_RED}✗${C_RESET}" "ci worker failed for $check_name"
+  return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -557,7 +664,7 @@ notify() {
 }
 
 send_cycle_summary() {
-  local cycle="$1" fixed="$2" deferred="$3" questions="$4" dropped="$5"
+  local cycle="$1" fixed="$2" deferred="$3" questions="$4" dropped="$5" ci="${6:-}"
 
   # Build plain-text summary (used for Telegram + fallback)
   local summary="PR #$PR_NUMBER — Cycle $cycle"
@@ -565,6 +672,7 @@ send_cycle_summary() {
   [[ -n "$deferred" ]]  && summary+="\n↗️ Deferred:\n$deferred"
   [[ -n "$questions" ]] && summary+="\n❓ Needs attention:\n$questions"
   [[ -n "$dropped" ]]   && summary+="\n⊘ Dropped:\n$dropped"
+  [[ -n "$ci" ]]        && summary+="\n🔧 CI:\n$ci"
 
   # Slack — mrkdwn sections
   if [[ -n "$NOTIFY_SLACK_WEBHOOK" ]]; then
@@ -584,6 +692,9 @@ send_cycle_summary() {
     fi
     if [[ -n "$dropped" ]]; then
       blocks=$(echo "$blocks" | jq --arg t "⊘ *Dropped*\n$dropped" '. + [{"type":"section","text":{"type":"mrkdwn","text":$t}}]')
+    fi
+    if [[ -n "$ci" ]]; then
+      blocks=$(echo "$blocks" | jq --arg t "🔧 *CI*\n$ci" '. + [{"type":"section","text":{"type":"mrkdwn","text":$t}}]')
     fi
 
     local payload slack_resp slack_http
@@ -625,10 +736,10 @@ check_mergeable() {
 # ---------------------------------------------------------------------------
 # Display config
 # ---------------------------------------------------------------------------
-section "PR Watch"
+section "Babysit"
 detail "PR #$PR_NUMBER — $PR_TITLE"
 detail "repo: $REPO_FULL  branch: $PR_HEAD  base: $PR_BASE"
-detail "interval: ${INTERVAL}s  max-cycles: ${MAX_CYCLES:-∞}"
+detail "interval: ${INTERVAL}s  max-cycles: ${MAX_CYCLES:-∞}  ci-cycles: $MAX_CI_CYCLES  ci-timeout: ${CI_TIMEOUT}s"
 [[ -f ".ralphrc" ]]          && detail ".ralphrc loaded"
 [[ -f "$RALPH_RULES_FILE" ]] && detail "$RALPH_RULES_FILE loaded"
 [[ "$DRY_RUN" == true ]]     && detail "DRY RUN — triage only, no fixes"
@@ -638,7 +749,7 @@ detail "interval: ${INTERVAL}s  max-cycles: ${MAX_CYCLES:-∞}"
 if [[ -n "$MODEL" ]]; then
   detail "model (all): $(short_model "$MODEL")"
 else
-  detail "models: triage=$(short_model "$TRIAGE_MODEL")  worker=$(short_model "$PR_WATCH_WORKER_MODEL")  commit=$(short_model "$PR_WATCH_COMMIT_MODEL")  defer=$(short_model "$DEFER_MODEL")"
+  detail "models: triage=$(short_model "$TRIAGE_MODEL")  worker=$(short_model "$BABYSIT_WORKER_MODEL")  commit=$(short_model "$BABYSIT_COMMIT_MODEL")  ci=$(short_model "$BABYSIT_CI_MODEL")  defer=$(short_model "$DEFER_MODEL")"
 fi
 
 has_notifications=false
@@ -651,7 +762,7 @@ has_notifications=false
 # ---------------------------------------------------------------------------
 stashed=false
 if ! git diff --quiet HEAD 2>/dev/null || [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
-  git stash push -u -m "ralph-pr-watch: auto-stash before run" >/dev/null 2>&1 && stashed=true
+  git stash push -u -m "ralph-babysit: auto-stash before run" >/dev/null 2>&1 && stashed=true
 fi
 
 # ---------------------------------------------------------------------------
@@ -687,18 +798,16 @@ while true; do
 
   if [[ "$thread_count" -eq 0 ]]; then
     out "${C_GREEN}✓${C_RESET}" "no new unresolved threads"
-
-    if check_mergeable; then
-      section "${C_GREEN}PR is mergeable!${C_RESET}"
-      notify "mergeable" "All threads resolved, PR is approved and mergeable."
-      break
-    fi
-
-    if [[ $MAX_CYCLES -eq 1 ]]; then break; fi
-    log_ts "sleeping ${INTERVAL}s..."
-    sleep "$INTERVAL"
-    continue
   fi
+
+  # Cycle summary accumulators (temp files to avoid subshell variable loss)
+  sum_fixed=$(mktemp /tmp/ralph-bs-fixed.XXXXXX)
+  sum_deferred=$(mktemp /tmp/ralph-bs-deferred.XXXXXX)
+  sum_questions=$(mktemp /tmp/ralph-bs-questions.XXXXXX)
+  sum_dropped=$(mktemp /tmp/ralph-bs-dropped.XXXXXX)
+
+  # --- Review comment phase (skip if no threads) ---
+  if [[ "$thread_count" -gt 0 ]]; then
 
   out "${C_CYAN}→${C_RESET}" "$thread_count unresolved thread(s) to triage"
 
@@ -708,11 +817,9 @@ while true; do
 
   if [[ "$group_count" -eq 0 ]]; then
     out "${C_YELLOW}?${C_RESET}" "triage returned no groups"
-    if [[ $MAX_CYCLES -eq 1 ]]; then break; fi
-    log_ts "sleeping ${INTERVAL}s..."
-    sleep "$INTERVAL"
-    continue
   fi
+
+  if [[ "$group_count" -gt 0 ]]; then
 
   # Count by action
   fix_count=$(echo "$triage_json" | jq '[.[] | select(.action == "fix")] | length')
@@ -728,17 +835,7 @@ while true; do
   if [[ "$DRY_RUN" == true ]]; then
     out "${C_YELLOW}⏭${C_RESET}" "dry run — skipping execution"
     echo "$triage_json" | jq '.'
-    if [[ $MAX_CYCLES -eq 1 ]]; then break; fi
-    log_ts "sleeping ${INTERVAL}s..."
-    sleep "$INTERVAL"
-    continue
-  fi
-
-  # Cycle summary accumulators (temp files to avoid subshell variable loss)
-  sum_fixed=$(mktemp /tmp/ralph-pw-fixed.XXXXXX)
-  sum_deferred=$(mktemp /tmp/ralph-pw-deferred.XXXXXX)
-  sum_questions=$(mktemp /tmp/ralph-pw-questions.XXXXXX)
-  sum_dropped=$(mktemp /tmp/ralph-pw-dropped.XXXXXX)
+  else
 
   # --- Process FIX groups ---
   fix_groups=$(echo "$triage_json" | jq -c '[.[] | select(.action == "fix")]')
@@ -871,15 +968,85 @@ while true; do
     fi
   done
 
-  # --- Cycle summary ---
-  summary_fixed=$(cat "$sum_fixed" 2>/dev/null)
-  summary_deferred=$(cat "$sum_deferred" 2>/dev/null)
-  summary_questions=$(cat "$sum_questions" 2>/dev/null)
-  summary_dropped=$(cat "$sum_dropped" 2>/dev/null)
-  rm -f "$sum_fixed" "$sum_deferred" "$sum_questions" "$sum_dropped"
+  fi # ! DRY_RUN
+  fi # group_count > 0
+  fi # thread_count > 0
 
-  if [[ -n "$summary_fixed" || -n "$summary_deferred" || -n "$summary_questions" || -n "$summary_dropped" ]]; then
-    send_cycle_summary "$cycle" "$summary_fixed" "$summary_deferred" "$summary_questions" "$summary_dropped"
+  # --- CI Check Phase (skip in dry-run) ---
+  if [[ "$DRY_RUN" != true ]]; then
+  ci_cycle=0
+  ci_fixed_total=0
+  ci_unfixable=""
+  sum_ci=$(mktemp /tmp/ralph-bs-ci.XXXXXX)
+
+  while [[ $ci_cycle -lt $MAX_CI_CYCLES ]]; do
+    ci_cycle=$((ci_cycle + 1))
+    echo ""
+    phase_hdr "$C_BLUE" "CI Checks (round $ci_cycle/$MAX_CI_CYCLES)"
+
+    if ! wait_for_checks; then
+      out "${C_YELLOW}⏱${C_RESET}" "timeout waiting for checks (${CI_TIMEOUT}s)"
+      notify "ci" "Timed out waiting for CI checks to complete"
+      break
+    fi
+
+    failing_checks=$(fetch_failing_checks)
+    fail_count=$(echo "$failing_checks" | jq 'length')
+
+    if [[ "$fail_count" -eq 0 ]]; then
+      out "${C_GREEN}✓${C_RESET}" "all checks passing"
+      break
+    fi
+
+    out "${C_RED}✗${C_RESET}" "$fail_count failing check(s)"
+    ci_fixed_this_round=0
+
+    for i in $(seq 0 $((fail_count - 1))); do
+      check_name=$(echo "$failing_checks" | jq -r ".[$i].name")
+      ci_log=$(fetch_check_logs "$check_name")
+
+      if [[ -z "$ci_log" ]]; then
+        detail "no logs available for $check_name — skipping"
+        ci_unfixable+="• $check_name (no logs)\n"
+        continue
+      fi
+
+      if fix_ci_failure "$check_name" "$ci_log"; then
+        if commit_and_push "ci-$check_name"; then
+          out "${C_GREEN}✓${C_RESET}" "fixed $check_name"
+          ci_fixed_this_round=$((ci_fixed_this_round + 1))
+          ci_fixed_total=$((ci_fixed_total + 1))
+          echo "• \`$check_name\` — fixed" >> "$sum_ci"
+        fi
+      else
+        out "${C_YELLOW}⏭${C_RESET}" "cannot fix $check_name"
+        ci_unfixable+="• $check_name\n"
+        echo "• \`$check_name\` — ⚠️ unfixable" >> "$sum_ci"
+      fi
+    done
+
+    if [[ $ci_fixed_this_round -eq 0 ]]; then
+      detail "no fixes applied this round — stopping CI loop"
+      break
+    fi
+  done
+
+  # Notify about unfixable CI failures
+  if [[ -n "$ci_unfixable" ]]; then
+    notify "ci" "Unfixable CI failures:\n$ci_unfixable"
+  fi
+  fi # ! DRY_RUN (CI phase)
+
+  # --- Cycle summary ---
+  summary_fixed=$(cat "$sum_fixed" 2>/dev/null || true)
+  summary_deferred=$(cat "$sum_deferred" 2>/dev/null || true)
+  summary_questions=$(cat "$sum_questions" 2>/dev/null || true)
+  summary_dropped=$(cat "$sum_dropped" 2>/dev/null || true)
+  summary_ci=$(cat "${sum_ci:-/dev/null}" 2>/dev/null || true)
+  rm -f "$sum_fixed" "$sum_deferred" "$sum_questions" "$sum_dropped" "${sum_ci:-}" 2>/dev/null || true
+
+  if [[ -n "$summary_fixed" || -n "$summary_deferred" || -n "$summary_questions" || -n "$summary_dropped" || -n "$summary_ci" ]]; then
+    send_cycle_summary "$cycle" "$summary_fixed" "$summary_deferred" "$summary_questions" "$summary_dropped" "$summary_ci"
   fi
 
   # Check mergeability after processing

@@ -57,25 +57,29 @@
 # PLAN_REVIEW_SPARRING_TIMEOUT=300         # seconds
 
 # ---------------------------------------------------------------------------
-# ralph-pr-watch — PR comment watcher
+# ralph-babysit — Autonomous PR shepherd
 #
 # Agent defaults:
-#   Triage → opus (deep code analysis, nuanced judgment)
-#   Worker → sonnet (well-specified implementation)
-#   Commit → haiku (mechanical commit message)
-#   Defer  → sonnet (creates Linear issue with context)
+#   Triage    → opus (deep code analysis, nuanced judgment)
+#   Worker    → sonnet (well-specified implementation)
+#   Commit    → haiku (mechanical commit message)
+#   CI Worker → sonnet (CI failure diagnosis and fix)
+#   Defer     → sonnet (creates Linear issue with context)
 # ---------------------------------------------------------------------------
-# PR_WATCH_INTERVAL=300                   # seconds between polling cycles
-# PR_WATCH_MAX_CYCLES=0                   # 0 = infinite
-# PR_WATCH_MAX_RETRIES=3                  # retries per fix group
-# PR_WATCH_LINEAR_TEAM=""                 # Linear team for deferred issues
+# BABYSIT_INTERVAL=300                    # seconds between polling cycles
+# BABYSIT_MAX_CYCLES=0                    # 0 = infinite
+# BABYSIT_MAX_RETRIES=3                   # retries per fix group
+# BABYSIT_LINEAR_TEAM=""                  # Linear team for deferred issues
+# BABYSIT_MAX_CI_CYCLES=3                 # max rounds of CI fix attempts
+# BABYSIT_CI_TIMEOUT=600                  # seconds to wait for checks
 # TRIAGE_MODEL="claude-opus-4-6"
-# PR_WATCH_WORKER_MODEL="claude-sonnet-4-6"
-# PR_WATCH_COMMIT_MODEL="claude-haiku-4-5-20251001"
+# BABYSIT_WORKER_MODEL="claude-sonnet-4-6"
+# BABYSIT_COMMIT_MODEL="claude-haiku-4-5-20251001"
+# BABYSIT_CI_MODEL="claude-sonnet-4-6"
 # DEFER_MODEL="claude-sonnet-4-6"
 
 # ---------------------------------------------------------------------------
-# Notifications — used by ralph-pr-watch
+# Notifications — used by ralph-babysit
 # ---------------------------------------------------------------------------
 # NOTIFY_TELEGRAM_TOKEN=""                # Bot token from @BotFather
 # NOTIFY_TELEGRAM_CHAT_ID=""              # Chat/group ID
