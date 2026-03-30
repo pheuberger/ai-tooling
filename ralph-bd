@@ -268,7 +268,7 @@ extract_result() {
 iteration=0
 
 # Common claude flags — shared by all agent invocations
-claude_flags=(--print --dangerously-skip-permissions)
+claude_flags=(--bare --print --dangerously-skip-permissions)
 
 # Per-agent model defaults — global MODEL overrides everything
 LEAD_MODEL="${MODEL:-${LEAD_MODEL:-claude-opus-4-6}}"
