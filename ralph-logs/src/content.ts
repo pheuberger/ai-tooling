@@ -467,5 +467,9 @@ export function createContent(parentBox: any, palette: TerminalPalette) {
       }
       rerenderAllHeaders()
     },
+    isAtBottom(): boolean {
+      const maxScroll = Math.max(0, scrollBox.scrollHeight - scrollBox.viewport.height)
+      return scrollBox.scrollTop >= maxScroll - 2
+    },
   }
 }

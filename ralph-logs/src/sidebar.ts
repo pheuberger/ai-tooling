@@ -23,33 +23,42 @@ function truncateLabel(label: string, prefixLen = 0): string {
 
 export function createSidebar(
   parentBox: any,
-  files: LogFile[],
+  initialFiles: LogFile[],
   palette: TerminalPalette,
 ): {
   getSelectedFile(): LogFile | null
   getSelectedIndex(): number
+  getFiles(): LogFile[]
   moveSelection(delta: number): void
   moveToIterGroup(delta: number): void
   setOnSelect(cb: (file: LogFile) => void): void
   setFileError(fileIndex: number): void
+  updateFiles(newFiles: LogFile[]): void
 } {
   const ctx = parentBox.ctx
 
+  let files = initialFiles
   let selectedIndex = files.length > 0 ? 0 : -1
   let onSelectCallback: ((file: LogFile) => void) | null = null
-  const erroredFiles = new Set<number>()
+  let erroredFiles = new Set<number>()
 
   // Build group structure (maintaining insertion order)
-  const groupOrder: string[] = []
-  const groupMap = new Map<string, LogFile[]>()
+  let groupOrder: string[] = []
+  let groupMap = new Map<string, LogFile[]>()
 
-  for (const file of files) {
-    if (!groupMap.has(file.groupKey)) {
-      groupOrder.push(file.groupKey)
-      groupMap.set(file.groupKey, [])
+  function rebuildGroups() {
+    groupOrder = []
+    groupMap = new Map<string, LogFile[]>()
+    for (const file of files) {
+      if (!groupMap.has(file.groupKey)) {
+        groupOrder.push(file.groupKey)
+        groupMap.set(file.groupKey, [])
+      }
+      groupMap.get(file.groupKey)!.push(file)
     }
-    groupMap.get(file.groupKey)!.push(file)
   }
+
+  rebuildGroups()
 
   // Clear parentBox children and add ScrollBox
   const clearParent = () => {
@@ -214,6 +223,25 @@ export function createSidebar(
     },
     setFileError(fileIndex: number) {
       erroredFiles.add(fileIndex)
+      render()
+    },
+    getFiles(): LogFile[] {
+      return files
+    },
+    updateFiles(newFiles: LogFile[]) {
+      const selectedPath = selectedIndex >= 0 && selectedIndex < files.length
+        ? files[selectedIndex].path
+        : null
+      files = newFiles
+      erroredFiles = new Set<number>()
+      rebuildGroups()
+      // Restore selection by path
+      if (selectedPath !== null) {
+        const idx = files.findIndex((f) => f.path === selectedPath)
+        selectedIndex = idx >= 0 ? idx : Math.min(selectedIndex, files.length - 1)
+      } else {
+        selectedIndex = files.length > 0 ? 0 : -1
+      }
       render()
     },
   }

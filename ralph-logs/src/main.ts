@@ -11,7 +11,7 @@ Arguments:
   LOG_DIR                Path to a ralph log directory (default: .ralph-logs)
 
 Options:
-  -f, --follow           Live-tail mode (not yet implemented)
+  -f, --follow           (no-op, follow is always on)
   --theme dark|light     Color theme (default: dark)
   -h, --help             Print this help message
   --version              Print version`
@@ -35,7 +35,7 @@ while (i < args.length) {
   }
 
   if (arg === '-f' || arg === '--follow') {
-    console.error('--follow is not yet implemented')
+    // follow is always on; flag accepted as no-op for backward compat
     i++
     continue
   }

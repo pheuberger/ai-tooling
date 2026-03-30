@@ -1,5 +1,5 @@
 import { createCliRenderer, BoxRenderable, TextRenderable } from '@opentui/core'
-import { SIDEBAR_WIDTH } from './constants.ts'
+import { SIDEBAR_WIDTH, FOLLOW_POLL_INTERVAL, DIR_POLL_INTERVAL } from './constants.ts'
 import { createContent } from './content.ts'
 import { createStatusBar } from './statusbar.ts'
 import { createSidebar } from './sidebar.ts'
@@ -8,6 +8,7 @@ import { discoverLogFiles } from './parser/discovery.ts'
 import { parseStreamJson } from './parser/stream-json.ts'
 import { parsePlainText } from './parser/plaintext.ts'
 import { detectPalette } from './theme.ts'
+import { statSync } from 'fs'
 import type { LogFile, ParsedLog } from './types.ts'
 
 export async function createApp(logDir: string): Promise<void> {
@@ -89,6 +90,8 @@ export async function createApp(logDir: string): Promise<void> {
   type FileViewState = { scrollY: number; collapseStates: boolean[] }
   const viewStates = new Map<string, FileViewState>()
   let currentFilePath: string | null = null
+  let currentFileMtime = 0
+  let currentFileSize = 0
 
   async function loadFile(file: LogFile) {
     // Save current view state before switching away
@@ -121,6 +124,11 @@ export async function createApp(logDir: string): Promise<void> {
     }
 
     currentFilePath = file.path
+    try {
+      const st = statSync(file.path)
+      currentFileMtime = st.mtimeMs
+      currentFileSize = st.size
+    } catch { /* ignore */ }
   }
 
   sidebar.setOnSelect((file) => {
@@ -129,9 +137,10 @@ export async function createApp(logDir: string): Promise<void> {
 
   // Mark errored files in sidebar by reading last line of each stream-json file
   async function markErrorFiles() {
+    const sidebarFiles = sidebar.getFiles()
     const { promises: fsp, statSync: fstatSync } = await import('fs')
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i]
+    for (let i = 0; i < sidebarFiles.length; i++) {
+      const file = sidebarFiles[i]
       if (file.format !== 'stream-json') continue
       try {
         // Read only the last 4KB to find the final line
@@ -165,6 +174,71 @@ export async function createApp(logDir: string): Promise<void> {
   if (firstFile) {
     await loadFile(firstFile)
   }
+
+  // Reload the currently viewed file (preserving scroll/collapse state)
+  async function reloadCurrentFile(file: LogFile) {
+    const savedScrollY = content.getScrollY()
+    const savedCollapse = content.getCollapseStates()
+    const wasAtBottom = content.isAtBottom()
+
+    cache.delete(file.path)
+    let parsedLog: ParsedLog
+    if (file.format === 'stream-json') {
+      parsedLog = await parseStreamJson(file.path)
+    } else {
+      parsedLog = await parsePlainText(file.path)
+    }
+    cacheSet(file.path, parsedLog)
+
+    content.loadBlocks(parsedLog.blocks)
+    content.setCollapseStates(savedCollapse)
+    if (wasAtBottom) {
+      content.scrollToBottom()
+    } else {
+      content.setScrollY(savedScrollY)
+    }
+    statusBar.update(file, parsedLog.metadata)
+  }
+
+  // Re-discover log files and update sidebar if changed
+  async function refreshDirectory() {
+    const newFiles = await discoverLogFiles(logDir)
+    const oldFiles = sidebar.getFiles()
+    const oldPaths = oldFiles.map((f) => f.path).join('\0')
+    const newPaths = newFiles.map((f) => f.path).join('\0')
+    if (oldPaths === newPaths) return
+    sidebar.updateFiles(newFiles)
+    markErrorFiles().catch(() => {})
+    // If the currently viewed file was removed, load whatever is now selected
+    if (currentFilePath && !newFiles.some((f) => f.path === currentFilePath)) {
+      const sel = sidebar.getSelectedFile()
+      if (sel) await loadFile(sel)
+    }
+  }
+
+  // Poll loops for auto-refresh
+  let reloadInFlight = false
+  setInterval(() => {
+    if (!currentFilePath || reloadInFlight) return
+    try {
+      const st = statSync(currentFilePath)
+      if (st.mtimeMs === currentFileMtime && st.size === currentFileSize) return
+      currentFileMtime = st.mtimeMs
+      currentFileSize = st.size
+    } catch { return }
+    cache.delete(currentFilePath)
+    const file = sidebar.getSelectedFile()
+    if (file && file.path === currentFilePath) {
+      reloadInFlight = true
+      reloadCurrentFile(file)
+        .catch(() => {})
+        .finally(() => { reloadInFlight = false })
+    }
+  }, FOLLOW_POLL_INTERVAL)
+
+  setInterval(() => {
+    refreshDirectory().catch(() => {})
+  }, DIR_POLL_INTERVAL)
 
   // Focus tracking: 'sidebar' | 'content', default sidebar
   let focus: 'sidebar' | 'content' = 'sidebar'
