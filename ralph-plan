@@ -294,9 +294,14 @@ extract_sparring_name() {
 # =========================================================================
 
 # Setup
+ORIGINAL_SNAPSHOT="$LOG_DIR/snapshot-original.md"
 if [[ -z "$RESUME_FROM" ]]; then
   cp "$PLAN_FILE" "$OUTPUT_FILE"
+  cp "$PLAN_FILE" "$ORIGINAL_SNAPSHOT"
   : > "$QUESTIONS_FILE"
+else
+  # Ensure original snapshot exists for summary diff
+  [[ -f "$ORIGINAL_SNAPSHOT" ]] || cp "$OUTPUT_FILE" "$ORIGINAL_SNAPSHOT"
 fi
 
 total_passes=0
@@ -538,7 +543,29 @@ claude_as "$REVIEW_MODEL" --output-format stream-json --verbose -p "$(
 extract_cost "final-polish" "$final_log"
 
 # =========================================================================
-# Summary
+# Change Summary
+# =========================================================================
+echo ""
+phase "$C_WHITE" "Summary"
+
+summary_log="$LOG_DIR/summary.log"
+
+claude_as "$REVIEW_MODEL" --output-format stream-json --verbose -p "$(
+  export ORIGINAL_FILE="$(realpath "$ORIGINAL_SNAPSHOT")"
+  export REFINED_FILE="$(realpath "$OUTPUT_FILE")"
+  export QUESTIONS_FILE="$(realpath "$QUESTIONS_FILE")"
+  render_prompt "$PROMPTS_DIR/plan-summary.md" \
+    ORIGINAL_FILE REFINED_FILE QUESTIONS_FILE
+)" 2>&1 | tee "$summary_log" | jq --unbuffered -r '
+  if .type == "assistant" then
+    [.message.content[]? | select(.type == "text") | .text] | join("")
+  else empty end
+' 2>/dev/null || true
+
+extract_cost "summary" "$summary_log"
+
+# =========================================================================
+# Completion
 # =========================================================================
 echo ""
 divider
@@ -546,14 +573,6 @@ log "${C_GREEN}${C_BOLD}Plan refinement complete.${C_RESET}"
 log "  Refined plan: $OUTPUT_FILE"
 log "  Open questions: $QUESTIONS_FILE"
 log "  Logs: $LOG_DIR/"
-
-# Question count
-if [[ -s "$QUESTIONS_FILE" ]]; then
-  q_count=$(grep -c '^Q:' "$QUESTIONS_FILE" 2>/dev/null || echo "0")
-  log "  ${C_YELLOW}$q_count open question(s) for human review.${C_RESET}"
-else
-  log "  ${C_GREEN}No open questions.${C_RESET}"
-fi
 
 # ---------------------------------------------------------------------------
 # Cost report
