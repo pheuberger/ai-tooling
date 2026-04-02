@@ -268,7 +268,7 @@ extract_result() {
 iteration=0
 
 # Common claude flags — shared by all agent invocations
-claude_flags=(--bare --print --dangerously-skip-permissions)
+claude_flags=(--print --dangerously-skip-permissions)
 
 # Per-agent model defaults — global MODEL overrides everything
 LEAD_MODEL="${MODEL:-${LEAD_MODEL:-claude-opus-4-6}}"
@@ -472,7 +472,7 @@ if [[ -n "$PLAN_FILE" ]]; then
   # FILTER_LABEL is set — fall through into the main worker+reviewer loop
 fi
 
-PRE_LOOP_HEAD=$(git rev-parse HEAD)
+PRE_LOOP_HEAD=$(git rev-parse HEAD 2>/dev/null || git hash-object -t tree /dev/null)
 
 # ---------------------------------------------------------------------------
 # Main loop — runs as long as there are unblocked beads
@@ -610,7 +610,7 @@ while true; do
   # -----------------------------------------------------------------------
   # Run Claude — retry on failure
   # -----------------------------------------------------------------------
-  pre_worker_head=$(git rev-parse HEAD)
+  pre_worker_head=$(git rev-parse HEAD 2>/dev/null || git hash-object -t tree /dev/null)
   log_file="$LOG_DIR/iter-${iteration}-${bead_id}.log"
   retries=0
   success=false
