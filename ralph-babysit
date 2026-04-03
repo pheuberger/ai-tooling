@@ -13,14 +13,15 @@
 #   --max-cycles N       Max polling cycles, 0 = infinite (default: 0)
 #   --model MODEL        Force all agents to this model
 #   --once               Single cycle, then exit
+#   --test-cmd CMD       Run CMD as pre-commit test gate; retries worker on failure
 #   --dry-run            Triage only, no fixes or pushes
 #   -h, --help           Show this help
 #
 # Configuration (.ralphrc):
 #   BABYSIT_INTERVAL, BABYSIT_MAX_CYCLES, BABYSIT_MAX_RETRIES,
-#   BABYSIT_LINEAR_TEAM, TRIAGE_MODEL, BABYSIT_WORKER_MODEL,
-#   BABYSIT_COMMIT_MODEL, BABYSIT_CI_MODEL, DEFER_MODEL,
-#   BABYSIT_MAX_CI_CYCLES, BABYSIT_CI_TIMEOUT,
+#   BABYSIT_LINEAR_TEAM, BABYSIT_TEST_CMD, TRIAGE_MODEL,
+#   BABYSIT_WORKER_MODEL, BABYSIT_COMMIT_MODEL, BABYSIT_CI_MODEL,
+#   DEFER_MODEL, BABYSIT_MAX_CI_CYCLES, BABYSIT_CI_TIMEOUT,
 #   NOTIFY_TELEGRAM_TOKEN, NOTIFY_TELEGRAM_CHAT_ID, NOTIFY_SLACK_WEBHOOK
 #
 # Requires: claude (Claude Code CLI), gh (GitHub CLI), jq, git
@@ -105,6 +106,7 @@ LOG_DIR=".ralph-logs/babysit"
 RALPH_RULES_FILE=".ralph-rules.md"
 MAX_CI_CYCLES=3           # max rounds of CI fix attempts
 CI_TIMEOUT=600            # seconds to wait for checks to complete
+TEST_CMD=""               # --test-cmd: command to run as pre-commit test gate
 
 # Notifications
 NOTIFY_TELEGRAM_TOKEN=""
@@ -124,6 +126,7 @@ MAX_RETRIES="${BABYSIT_MAX_RETRIES:-${PR_WATCH_MAX_RETRIES:-$MAX_RETRIES}}"
 LINEAR_TEAM="${BABYSIT_LINEAR_TEAM:-${PR_WATCH_LINEAR_TEAM:-$LINEAR_TEAM}}"
 MAX_CI_CYCLES="${BABYSIT_MAX_CI_CYCLES:-$MAX_CI_CYCLES}"
 CI_TIMEOUT="${BABYSIT_CI_TIMEOUT:-$CI_TIMEOUT}"
+TEST_CMD="${BABYSIT_TEST_CMD:-$TEST_CMD}"
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -132,6 +135,7 @@ while [[ $# -gt 0 ]]; do
     --interval)     INTERVAL="$2"; shift 2 ;;
     --max-cycles)   MAX_CYCLES="$2"; shift 2 ;;
     --model)        MODEL="$2"; shift 2 ;;
+    --test-cmd)     TEST_CMD="$2"; shift 2 ;;
     --once)         ONCE=true; MAX_CYCLES=1; shift ;;
     --dry-run)      DRY_RUN=true; shift ;;
     -h|--help)      sed -n '/^# Usage/,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
@@ -408,6 +412,16 @@ fix_comment_group() {
   local retries=0
   local success=false
 
+  # Build prompt file so test failures can be appended for retries
+  local prompt_file
+  prompt_file=$(mktemp /tmp/ralph-babysit-worker.XXXXXX.md)
+  export PR_NUMBER PR_TITLE PR_BASE REPO_FULL
+  export FIX_DESCRIPTION="$fix_desc" THREADS_JSON="$threads_json"
+  export PROJECT_RULES="$project_rules"
+  render_prompt "$PROMPTS_DIR/babysit-worker.md" \
+    PR_NUMBER PR_TITLE PR_BASE REPO_FULL FIX_DESCRIPTION THREADS_JSON PROJECT_RULES \
+    > "$prompt_file"
+
   while [[ $retries -lt $MAX_RETRIES ]]; do
     echo ""
     if [[ $MAX_RETRIES -gt 1 ]]; then
@@ -417,13 +431,8 @@ fix_comment_group() {
     fi
 
     local worker_log="$LOG_DIR/worker-${group_id}-$(date '+%H%M%S').log"
-    claude_as "$BABYSIT_WORKER_MODEL" --output-format stream-json --verbose -p "$(
-      export PR_NUMBER PR_TITLE PR_BASE REPO_FULL
-      export FIX_DESCRIPTION="$fix_desc" THREADS_JSON="$threads_json"
-      export PROJECT_RULES="$project_rules"
-      render_prompt "$PROMPTS_DIR/babysit-worker.md" \
-        PR_NUMBER PR_TITLE PR_BASE REPO_FULL FIX_DESCRIPTION THREADS_JSON PROJECT_RULES
-    )" 2>&1 | tee "$worker_log" | ralph_stream_filter || true
+    claude_as "$BABYSIT_WORKER_MODEL" --output-format stream-json --verbose -p "$(cat "$prompt_file")" \
+      2>&1 | tee "$worker_log" | ralph_stream_filter || true
 
     extract_cost "worker" "$worker_log"
 
@@ -436,8 +445,45 @@ fix_comment_group() {
       worker_text=$(jq -r 'select(.type == "assistant") | .message.content[]? | select(.type == "text") | .text' "$worker_log" 2>/dev/null | tail -1)
       if [[ "$worker_text" == *"FIX_SKIPPED"* ]]; then
         out "${C_YELLOW}⏭${C_RESET}" "worker skipped fix for $group_id"
+        rm -f "$prompt_file"
         return 1
       fi
+
+      # --- Pre-commit test gate ---
+      if [[ -n "$TEST_CMD" ]]; then
+        echo ""
+        phase_hdr "$C_CYAN" "Test gate"
+        local test_gate_log="$LOG_DIR/test-${group_id}-${retries}.log"
+        if eval "$TEST_CMD" > "$test_gate_log" 2>&1; then
+          out "${C_GREEN}✓${C_RESET}" "passed"
+        else
+          out "${C_RED}✗${C_RESET}" "failed"
+          retries=$((retries + 1))
+          if [[ $retries -lt $MAX_RETRIES ]]; then
+            local test_snippet
+            test_snippet=$(tail -80 "$test_gate_log")
+            cat >> "$prompt_file" <<TESTFAIL
+
+## Test Failures (attempt $retries)
+
+Your previous changes cause test/typecheck failures. You MUST fix these.
+
+Command: $TEST_CMD
+Output (last 80 lines):
+\`\`\`
+$test_snippet
+\`\`\`
+TESTFAIL
+            out "${C_YELLOW}↻${C_RESET}" "retrying worker with test output..."
+            sleep 2
+            continue
+          fi
+          # Exhausted retries on test failure
+          rm -f "$prompt_file"
+          return 1
+        fi
+      fi
+
       success=true
       break
     fi
@@ -449,6 +495,8 @@ fix_comment_group() {
     fi
   done
 
+  rm -f "$prompt_file"
+
   if [[ "$success" == false ]]; then
     out "${C_RED}✗${C_RESET}" "fix failed after $MAX_RETRIES attempts — $group_id"
     return 1
@@ -456,8 +504,8 @@ fix_comment_group() {
   return 0
 }
 
-# Commit and push changes
-commit_and_push() {
+# Commit changes locally (no push)
+commit_changes() {
   local group_id="$1"
 
   # Check for actual changes
@@ -478,8 +526,11 @@ commit_and_push() {
     || { out "${C_RED}✗${C_RESET}" "commit failed"; return 1; }
 
   extract_cost "commit" "$commit_log"
+  return 0
+}
 
-  # Push with rebase-retry on conflict
+# Push with rebase-retry on conflict
+push_changes() {
   local push_retries=0
   while [[ $push_retries -lt 3 ]]; do
     if git push 2>/dev/null; then
@@ -491,7 +542,7 @@ commit_and_push() {
     if ! git pull --rebase 2>/dev/null; then
       out "${C_RED}✗${C_RESET}" "rebase conflict on push — aborting"
       git rebase --abort 2>/dev/null || true
-      notify "error" "Push failed for $group_id — rebase conflict"
+      notify "error" "Push failed — rebase conflict"
       return 1
     fi
   done
@@ -517,8 +568,9 @@ defer_comment_group() {
   claude_as "$DEFER_MODEL" -p "$(
     export PR_NUMBER PR_TITLE PR_URL REPO_FULL GROUP_ID="$group_id" REASON="$reason"
     export THREADS_JSON="$threads_json" LINEAR_TEAM="$LINEAR_TEAM"
+    export PARENT_ISSUE_ID="${PARENT_ISSUE_ID:-}"
     render_prompt "$PROMPTS_DIR/babysit-defer.md" \
-      PR_NUMBER PR_TITLE PR_URL REPO_FULL GROUP_ID REASON THREADS_JSON LINEAR_TEAM
+      PR_NUMBER PR_TITLE PR_URL REPO_FULL GROUP_ID REASON THREADS_JSON LINEAR_TEAM PARENT_ISSUE_ID
   )" > "$defer_log" 2>&1
 
   extract_cost "defer" "$defer_log"
@@ -740,6 +792,7 @@ section "Babysit"
 detail "PR #$PR_NUMBER — $PR_TITLE"
 detail "repo: $REPO_FULL  branch: $PR_HEAD  base: $PR_BASE"
 detail "interval: ${INTERVAL}s  max-cycles: ${MAX_CYCLES:-∞}  ci-cycles: $MAX_CI_CYCLES  ci-timeout: ${CI_TIMEOUT}s"
+[[ -n "$TEST_CMD" ]]         && detail "test-cmd: $TEST_CMD"
 [[ -f ".ralphrc" ]]          && detail ".ralphrc loaded"
 [[ -f "$RALPH_RULES_FILE" ]] && detail "$RALPH_RULES_FILE loaded"
 [[ "$DRY_RUN" == true ]]     && detail "DRY RUN — triage only, no fixes"
@@ -837,9 +890,13 @@ while true; do
     echo "$triage_json" | jq '.'
   else
 
-  # --- Process FIX groups ---
+  # --- Process FIX groups (commit locally, push once at end) ---
   fix_groups=$(echo "$triage_json" | jq -c '[.[] | select(.action == "fix")]')
   fix_len=$(echo "$fix_groups" | jq 'length')
+  pre_fix_sha=$(git rev-parse HEAD)
+  all_fixes_passed=true
+  committed_groups=()  # track groups that were successfully committed
+
   for i in $(seq 0 $((fix_len - 1))); do
     group=$(echo "$fix_groups" | jq -c ".[$i]")
     group_id=$(echo "$group" | jq -r '.group_id')
@@ -847,10 +904,29 @@ while true; do
     files=$(echo "$group" | jq -r '.files | join(", ")')
 
     if fix_comment_group "$group"; then
-      if commit_and_push "$group_id"; then
-        local_sha=$(git rev-parse --short HEAD)
+      if commit_changes "$group_id"; then
+        committed_groups+=("$i")
+      fi
+    else
+      detail "fix failed for $group_id — aborting fix loop"
+      all_fixes_passed=false
+      break
+    fi
+  done
 
-        # Reply + resolve each thread in this group
+  # Push once if all fixes passed, or reset everything
+  if [[ "$all_fixes_passed" == true && ${#committed_groups[@]} -gt 0 ]]; then
+    echo ""
+    phase_hdr "$C_GREEN" "Push (${#committed_groups[@]} fix commit(s))"
+    if push_changes; then
+      local_sha=$(git rev-parse --short HEAD)
+
+      # Reply + resolve threads for all committed groups
+      for ci_idx in "${committed_groups[@]}"; do
+        group=$(echo "$fix_groups" | jq -c ".[$ci_idx]")
+        group_id=$(echo "$group" | jq -r '.group_id')
+        files=$(echo "$group" | jq -r '.files | join(", ")')
+
         thread_len=$(echo "$group" | jq '.threads | length')
         for ti in $(seq 0 $((thread_len - 1))); do
           thread=$(echo "$group" | jq -c ".threads[$ti]")
@@ -862,7 +938,6 @@ while true; do
         done
         out "${C_GREEN}✓${C_RESET}" "resolved $thread_len thread(s) for $group_id"
 
-        # Link to first comment in group
         first_cid=$(echo "$group" | jq -r '.threads[0].comment_id // ""')
         comment_link=""
         [[ -n "$first_cid" ]] && comment_link="${PR_URL}#discussion_r${first_cid}"
@@ -872,19 +947,51 @@ while true; do
         else
           echo "• \`$group_id\` — $files" >> "$sum_fixed"
         fi
-      fi
+      done
     else
-      detail "fix skipped/failed for $group_id — threads left unresolved"
+      out "${C_RED}✗${C_RESET}" "push failed — resetting local commits"
+      git reset --hard "$pre_fix_sha" 2>/dev/null || true
+      notify "error" "Push failed after fixes — all changes reverted"
     fi
-  done
+  elif [[ "$all_fixes_passed" == false ]]; then
+    if [[ "$(git rev-parse HEAD)" != "$pre_fix_sha" ]]; then
+      out "${C_YELLOW}↩${C_RESET}" "fix failed — resetting ${#committed_groups[@]} local commit(s)"
+      git reset --hard "$pre_fix_sha" 2>/dev/null || true
+    fi
+    notify "error" "Fix failed — no changes pushed"
+  fi
 
-  # --- Process DEFER groups ---
+  # --- Process DEFER groups (grouped under one parent issue) ---
   defer_groups=$(echo "$triage_json" | jq -c '[.[] | select(.action == "defer")]')
   defer_len=$(echo "$defer_groups" | jq 'length')
+  parent_issue_id=""
+
+  # Create parent issue if there are defer groups
+  if [[ "$defer_len" -gt 0 && -n "$LINEAR_TEAM" ]]; then
+    echo ""
+    phase_hdr "$C_MAGENTA" "Defer — creating parent issue"
+    local parent_log="$LOG_DIR/defer-parent-$(date '+%H%M%S').log"
+    parent_issue_id=$(claude_as "$DEFER_MODEL" -p "Create a Linear issue using mcp__linear__save_issue with:
+- title: \"Review feedback: PR #${PR_NUMBER} — ${PR_TITLE}\"
+- description: \"Aggregated review feedback from ${PR_URL}. ${defer_len} item(s) deferred from this PR.\"
+- team: \"${LINEAR_TEAM}\"
+- priority: 3
+
+Output the issue identifier on the last line, prefixed with ISSUE_ID:. Example: ISSUE_ID: ENG-456" 2>"$parent_log" \
+      | grep -oP 'ISSUE_ID:\s*\K\S+' | tail -1) || true
+    extract_cost "defer" "$parent_log"
+
+    if [[ -n "$parent_issue_id" ]]; then
+      out "${C_GREEN}✓${C_RESET}" "parent issue: $parent_issue_id"
+    else
+      out "${C_YELLOW}?${C_RESET}" "could not create parent issue — sub-issues will be standalone"
+    fi
+  fi
+
   for i in $(seq 0 $((defer_len - 1))); do
     group=$(echo "$defer_groups" | jq -c ".[$i]")
     group_id=$(echo "$group" | jq -r '.group_id')
-    issue_id=$(defer_comment_group "$group")
+    issue_id=$(PARENT_ISSUE_ID="$parent_issue_id" defer_comment_group "$group")
 
     thread_len=$(echo "$group" | jq '.threads | length')
     for ti in $(seq 0 $((thread_len - 1))); do
@@ -930,15 +1037,17 @@ while true; do
       path=$(echo "$thread" | jq -r '.path // ""')
       line=$(echo "$thread" | jq -r '.line // ""')
 
+      local comment_permalink="${PR_URL}#discussion_r${cid}"
       if [[ -n "$answer" ]]; then
         reply_to_thread "$cid" "$answer"
         mark_processed "$tid"
-        echo "• <${PR_URL}#discussion_r${cid}|\`$path:$line\`> — answered" >> "$sum_questions"
+        echo "• <${comment_permalink}|\`$path:$line\`> — answered" >> "$sum_questions"
+        notify "question" "Answered: $path:$line — <${comment_permalink}|view comment>"
       else
         # Cannot answer — leave unresolved, notify
         mark_processed "$tid"
-        echo "• <${PR_URL}#discussion_r${cid}|\`$path:$line\`> — ⚠️ needs human attention" >> "$sum_questions"
-        notify "question" "Cannot answer: $reason — $path:$line"
+        echo "• <${comment_permalink}|\`$path:$line\`> — ⚠️ needs human attention" >> "$sum_questions"
+        notify "question" "⚠️ Needs human attention: $reason — $path:$line — <${comment_permalink}|view comment>"
       fi
     done
   done
@@ -1012,8 +1121,7 @@ while true; do
       fi
 
       if fix_ci_failure "$check_name" "$ci_log"; then
-        if commit_and_push "ci-$check_name"; then
-          out "${C_GREEN}✓${C_RESET}" "fixed $check_name"
+        if commit_changes "ci-$check_name"; then
           ci_fixed_this_round=$((ci_fixed_this_round + 1))
           ci_fixed_total=$((ci_fixed_total + 1))
           echo "• \`$check_name\` — fixed" >> "$sum_ci"
@@ -1029,6 +1137,15 @@ while true; do
       detail "no fixes applied this round — stopping CI loop"
       break
     fi
+
+    # Push CI fixes so checks re-run
+    echo ""
+    phase_hdr "$C_GREEN" "Push ($ci_fixed_this_round CI fix commit(s))"
+    if ! push_changes; then
+      notify "error" "Push failed after CI fixes"
+      break
+    fi
+    out "${C_GREEN}✓${C_RESET}" "fixed $ci_fixed_this_round check(s) this round"
   done
 
   # Notify about unfixable CI failures

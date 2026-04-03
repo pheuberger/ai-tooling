@@ -30,6 +30,9 @@ Create a Linear issue using the `mcp__linear__save_issue` tool:
   - Your analysis of why this is valid but out of scope
 - **Team:** ${LINEAR_TEAM}
 - **Priority:** 3 (Normal) — unless the comment suggests urgency, then use 2 (High)
+{{#IF PARENT_ISSUE_ID}}
+- **parentId:** ${PARENT_ISSUE_ID}
+{{/IF PARENT_ISSUE_ID}}
 
 Output the issue identifier (e.g., `TEAM-123`) on the last line, prefixed with `ISSUE_ID:`. Example:
 ```
