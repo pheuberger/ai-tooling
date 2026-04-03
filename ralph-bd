@@ -20,6 +20,8 @@
 #   --test-cmd CMD       Run CMD as pre-commit test gate; retries worker on failure
 #   --watchdog N         Kill worker after N minutes of inactivity (default: 15)
 #   --no-watchdog        Disable the inactivity watchdog
+#   --review-only [REF]  Skip worker loop; run only final review + summary.
+#                        REF is the git ref to diff from (default: empty tree)
 #
 # Configuration files (optional):
 #   .ralphrc             Sourced from project root before CLI args are parsed.
@@ -143,6 +145,8 @@ FILTER_LABEL=""       # filter by label
 PLAN_FILE=""          # --from-plan: plan file to decompose into beads
 TEST_CMD=""           # --test-cmd: command to run as pre-commit test gate
 WATCHDOG_TIMEOUT=15  # minutes of worker inactivity before kill (0=disabled)
+REVIEW_ONLY=false    # --review-only: skip loop, run final review + summary
+REVIEW_ONLY_REF=""   # git ref to diff from (empty = empty tree)
 LOG_DIR=".ralph-logs"
 RALPH_RULES_FILE=".ralph-rules.md"
 
@@ -169,6 +173,9 @@ while [[ $# -gt 0 ]]; do
     --test-cmd)       TEST_CMD="$2"; shift 2 ;;
     --watchdog)       WATCHDOG_TIMEOUT="$2"; shift 2 ;;
     --no-watchdog)    WATCHDOG_TIMEOUT=0; shift ;;
+    --review-only)    REVIEW_ONLY=true; shift
+                      # Optional ref argument (skip if next arg looks like a flag or is absent)
+                      if [[ $# -gt 0 && "$1" != -* ]]; then REVIEW_ONLY_REF="$1"; shift; fi ;;
     -h|--help)        sed -n '/^# Usage/,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
     *)                echo "Unknown option: $1" >&2; exit 1 ;;
   esac
@@ -472,12 +479,25 @@ if [[ -n "$PLAN_FILE" ]]; then
   # FILTER_LABEL is set — fall through into the main worker+reviewer loop
 fi
 
-PRE_LOOP_HEAD=$(git rev-parse HEAD 2>/dev/null || git hash-object -t tree /dev/null)
+PRE_LOOP_HEAD=$(git rev-parse --verify HEAD 2>/dev/null || git hash-object -t tree /dev/null)
+
+# ---------------------------------------------------------------------------
+# --review-only: skip worker loop, jump to final review
+# ---------------------------------------------------------------------------
+if [[ "$REVIEW_ONLY" == true ]]; then
+  if [[ -n "$REVIEW_ONLY_REF" ]]; then
+    PRE_LOOP_HEAD=$(git rev-parse --verify "$REVIEW_ONLY_REF" 2>/dev/null) \
+      || { echo "Cannot resolve ref: $REVIEW_ONLY_REF" >&2; exit 1; }
+  fi
+  iteration=1  # satisfy the iteration-gt-0 guards
+  section "Review-only mode — diffing from ${PRE_LOOP_HEAD:0:7}..HEAD"
+  git diff --stat "$PRE_LOOP_HEAD"..HEAD | while IFS= read -r line; do detail "  $line"; done
+fi
 
 # ---------------------------------------------------------------------------
 # Main loop — runs as long as there are unblocked beads
 # ---------------------------------------------------------------------------
-while true; do
+while [[ "$REVIEW_ONLY" != true ]]; do
   # -----------------------------------------------------------------------
   # Pick next bead — explicit list, filtered ready, or default ready
   # -----------------------------------------------------------------------
@@ -803,10 +823,12 @@ if [[ -n "$STASH_DIR" && -d "$STASH_DIR" ]]; then
   detail "restored shelved untracked files"
 fi
 
-section "Completed — $iteration iteration(s)"
-if [[ -s "$SKIP_FILE" ]]; then
-  detail "skipped (failed after retries):"
-  while IFS= read -r id; do detail "  - $id"; done < "$SKIP_FILE"
+if [[ "$REVIEW_ONLY" != true ]]; then
+  section "Completed — $iteration iteration(s)"
+  if [[ -s "$SKIP_FILE" ]]; then
+    detail "skipped (failed after retries):"
+    while IFS= read -r id; do detail "  - $id"; done < "$SKIP_FILE"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -815,9 +837,11 @@ fi
 final_review_failed=false
 
 if [[ $iteration -gt 0 ]]; then
-  echo ""
-  detail "diff stats:"
-  git diff --stat "$PRE_LOOP_HEAD"..HEAD | while IFS= read -r line; do detail "  $line"; done
+  if [[ "$REVIEW_ONLY" != true ]]; then
+    echo ""
+    detail "diff stats:"
+    git diff --stat "$PRE_LOOP_HEAD"..HEAD | while IFS= read -r line; do detail "  $line"; done
+  fi
 
   # Build plan context — from --from-plan flag or PLAN.md in repo
   plan_context=""
