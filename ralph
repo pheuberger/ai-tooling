@@ -20,6 +20,11 @@
 #   --test-cmd CMD       Run CMD as pre-commit test gate; retries worker on failure
 #   --watchdog N         Kill worker after N minutes of inactivity (default: 15)
 #   --no-watchdog        Disable the inactivity watchdog
+#   --triage            Evaluate and refine open tickets before starting work.
+#                        Auto-improves underspecified tickets, defers ones
+#                        needing human input (tagged needs-input), then runs
+#                        the worker loop on approved tickets only.
+#   --triage-only        Like --triage, but stop after triage (no worker loop)
 #   --review-only [REF]  Skip worker loop; run only final review + summary.
 #                        REF is the git ref to diff from (default: empty tree)
 #
@@ -32,6 +37,7 @@
 #                        FILTER_TYPE, FILTER_PRIORITY, FILTER_OWNER,
 #                        FILTER_TAG, TEST_CMD, WATCHDOG_TIMEOUT,
 #                        LOG_DIR, RALPH_RULES_FILE.
+#                        TRIAGE_MODEL,
 #                        CLI flags override values set here.
 #   .ralph-rules.md      Extra instructions injected into the agent prompt as a
 #                        "## Project Rules" section. Use for ralph-specific rules
@@ -133,6 +139,9 @@ SIMPLIFY_THRESHOLD=10 # skip simplify when worker diff is fewer lines than this
 REVIEWER_MODEL=""     # intermittent code reviewer — default: sonnet
 FINAL_REVIEW_MODEL="" # final parallel review personas — default: opus
 SUMMARY_MODEL=""      # post-run summary — default: haiku
+TRIAGE_MODEL=""       # ticket triage/refinement — default: opus
+TRIAGE=false          # --triage: evaluate and refine tickets before work
+TRIAGE_ONLY=false     # --triage-only: stop after triage phase
 TICKET_IDS=""         # comma-separated explicit ticket list (--tickets mode only)
 PLAN_TAG=""           # tag slug generated from --from-plan title
 EXPLICIT_MODE=false   # set when --tickets is used (prevents fallback to vima ready)
@@ -169,6 +178,8 @@ while [[ $# -gt 0 ]]; do
     --owner)          FILTER_OWNER="$2"; shift 2 ;;
     --tag)            FILTER_TAG="$2"; shift 2 ;;
     --from-plan)      PLAN_FILE="$2"; shift 2 ;;
+    --triage)         TRIAGE=true; shift ;;
+    --triage-only)    TRIAGE=true; TRIAGE_ONLY=true; shift ;;
     --test-cmd)       TEST_CMD="$2"; shift 2 ;;
     --watchdog)       WATCHDOG_TIMEOUT="$2"; shift 2 ;;
     --no-watchdog)    WATCHDOG_TIMEOUT=0; shift ;;
@@ -292,6 +303,7 @@ SIMPLIFY_MODEL="${MODEL:-${SIMPLIFY_MODEL:-claude-sonnet-4-6}}"
 REVIEWER_MODEL="${MODEL:-${REVIEWER_MODEL:-claude-sonnet-4-6}}"
 FINAL_REVIEW_MODEL="${MODEL:-${FINAL_REVIEW_MODEL:-claude-opus-4-6}}"
 SUMMARY_MODEL="${MODEL:-${SUMMARY_MODEL:-claude-haiku-4-5-20251001}}"
+TRIAGE_MODEL="${MODEL:-${TRIAGE_MODEL:-claude-opus-4-6}}"
 
 # Run claude with a specific model: claude_as <model> [extra-args...]
 # setsid -w detaches from controlling terminal so claude can't write
@@ -410,6 +422,7 @@ detail "iterations: $MAX_ITERATIONS  retries: $MAX_RETRIES"
 cfg_opt() { [[ -n "${2:-}" ]] && detail "$1: $2" || true; }
 [[ -f ".ralphrc" ]]          && detail ".ralphrc loaded"
 [[ -f "$RALPH_RULES_FILE" ]] && detail "$RALPH_RULES_FILE loaded"
+[[ "$TRIAGE" == true ]] && detail "triage: yes$( [[ "$TRIAGE_ONLY" == true ]] && echo ' (only)' )" || true
 cfg_opt "plan"     "$PLAN_FILE"
 cfg_opt "tickets"  "$TICKET_IDS"
 cfg_opt "type"     "$FILTER_TYPE"
@@ -425,6 +438,7 @@ else
   detail "models: worker=$(short_model "$WORKER_MODEL")  simplify=$(short_model "$SIMPLIFY_MODEL")  review=$(short_model "$REVIEWER_MODEL")  commit=$(short_model "$COMMIT_MODEL")"
   detail "        final=$(short_model "$FINAL_REVIEW_MODEL")  summary=$(short_model "$SUMMARY_MODEL")"
   [[ -n "$PLAN_FILE" ]] && detail "        lead=$(short_model "$LEAD_MODEL")  spec=$(short_model "$SPEC_MODEL")" || true
+  [[ "$TRIAGE" == true ]] && detail "        triage=$(short_model "$TRIAGE_MODEL")" || true
 fi
 
 # Load project-specific rules once (injected into worker prompts)
@@ -483,6 +497,120 @@ if [[ -n "$PLAN_FILE" ]]; then
   # FILTER_TAG is set — fall through into the main worker+reviewer loop
 fi
 
+# ---------------------------------------------------------------------------
+# --triage: evaluate and refine tickets before the worker loop
+# ---------------------------------------------------------------------------
+DEFERRED_FILE="$LOG_DIR/.deferred"
+: > "$DEFERRED_FILE"
+
+if [[ "$TRIAGE" == true ]]; then
+  # Gather ready tickets using the same filters the main loop would use
+  triage_ready_args=()
+  [[ -n "$FILTER_TAG" ]]      && triage_ready_args+=(--tag "$FILTER_TAG")
+  [[ -n "$FILTER_TYPE" ]]     && triage_ready_args+=(--type "$FILTER_TYPE")
+  [[ -n "$FILTER_PRIORITY" ]] && triage_ready_args+=(--priority "$FILTER_PRIORITY")
+  [[ -n "$FILTER_OWNER" ]]    && triage_ready_args+=(--assignee "$FILTER_OWNER")
+
+  triage_tickets_json=$(vima ready "${triage_ready_args[@]}" 2>/dev/null) || triage_tickets_json="[]"
+  triage_count=$(echo "$triage_tickets_json" | jq 'length')
+
+  if [[ "$triage_count" -gt 0 ]]; then
+    echo ""
+    phase_hdr "$C_CYAN" "Triage ($triage_count ticket(s)) — $(short_model "$TRIAGE_MODEL")"
+
+    triage_log="$LOG_DIR/triage-$(date '+%H%M%S').log"
+
+    run_agent ralph_stream_filter "$triage_log" "$TRIAGE_MODEL" --output-format stream-json --verbose -p "$(
+      export TICKETS_JSON="$triage_tickets_json" PROJECT_RULES="$project_rules"
+      render_prompt "$PROMPTS_DIR/triage.md" TICKETS_JSON PROJECT_RULES
+    )" || true
+
+    extract_cost "triage" "$triage_log"
+    read -r dur cost <<< "$(extract_result "$triage_log")"
+    out "${C_GREEN}✓${C_RESET}" "${C_DIM}$(fmt_duration "$dur") · \$$(fmt_cost "$cost")${C_RESET}"
+
+    # Parse triage results from agent output
+    triage_output=$(jq -r 'select(.type == "assistant") | .message.content[]? | select(.type == "text") | .text' "$triage_log" 2>/dev/null)
+    triage_block=$(echo "$triage_output" | sed -n '/^TRIAGE_RESULTS$/,/^TRIAGE_RESULTS_END$/p')
+
+    approved=0 refined=0 deferred=0
+    while IFS= read -r line; do
+      [[ "$line" == "TRIAGE_RESULTS" || "$line" == "TRIAGE_RESULTS_END" || -z "$line" ]] && continue
+      tid=$(echo "$line" | grep -oP '^[^:]+' | tr -d ' ')
+      [[ -z "$tid" ]] && continue
+
+      if [[ "$line" == *"APPROVED"* ]]; then
+        approved=$((approved + 1))
+        out "${C_GREEN}✓${C_RESET}" "$tid: approved"
+      elif [[ "$line" == *"REFINED"* ]]; then
+        refined=$((refined + 1))
+        summary=$(echo "$line" | sed 's/.*REFINED[[:space:]]*—[[:space:]]*//')
+        out "${C_CYAN}✎${C_RESET}" "$tid: refined — $summary"
+      elif [[ "$line" == *"DEFERRED"* ]]; then
+        deferred=$((deferred + 1))
+        reason=$(echo "$line" | sed 's/.*DEFERRED[[:space:]]*—[[:space:]]*//')
+        out "${C_YELLOW}⏸${C_RESET}" "$tid: deferred — $reason"
+        echo "$tid" >> "$DEFERRED_FILE"
+      fi
+    done <<< "$triage_block"
+
+    echo ""
+    detail "approved: $approved  refined: $refined  deferred: $deferred"
+
+    # Write triage report if there are deferred tickets
+    if [[ $deferred -gt 0 ]]; then
+      report_file="$LOG_DIR/triage-report-$(date '+%Y%m%d-%H%M%S').md"
+      report_log="$LOG_DIR/triage-report-gen.log"
+
+      phase_hdr "$C_YELLOW" "Triage report"
+      run_agent _discard "$report_log" "$SUMMARY_MODEL" -p "$(
+        export TRIAGE_LOG="$triage_log" REPORT_FILE="$report_file"
+        render_prompt "$PROMPTS_DIR/triage-report.md" TRIAGE_LOG REPORT_FILE
+      )" || true
+      extract_cost "triage-report" "$report_log"
+
+      if [[ -f "$report_file" ]]; then
+        echo ""
+        cat "$report_file"
+        echo ""
+        out "${C_YELLOW}⚠${C_RESET}" "Deferred tickets need your attention (tagged ${C_BOLD}needs-input${C_RESET})"
+        detail "report: $report_file"
+      fi
+    fi
+
+    if [[ "$TRIAGE_ONLY" == true ]]; then
+      section "${C_GREEN}Triage complete${C_RESET}"
+      # Print cost report and exit
+      if [[ "${AGENT_COSTS[@]+x}" ]]; then
+        section "Cost"
+        total=0
+        for agent_type in "${!AGENT_COSTS[@]}"; do
+          cost="${AGENT_COSTS[$agent_type]}"
+          printf "    %-20s \$%s\n" "$agent_type" "$(fmt_cost "$cost")"
+          total=$(echo "$total + $cost" | bc 2>/dev/null || echo "$total")
+        done
+        printf "    ${C_BOLD}%-20s \$%s${C_RESET}\n" "total" "$(fmt_cost "$total")"
+      fi
+      # Restore shelved untracked files
+      if [[ -n "$STASH_DIR" && -d "$STASH_DIR" ]]; then
+        cp -a "$STASH_DIR"/. . 2>/dev/null || true
+        rm -rf "$STASH_DIR"
+      fi
+      exit 0
+    fi
+  else
+    detail "no ready tickets to triage"
+    if [[ "$TRIAGE_ONLY" == true ]]; then
+      # Restore shelved untracked files
+      if [[ -n "$STASH_DIR" && -d "$STASH_DIR" ]]; then
+        cp -a "$STASH_DIR"/. . 2>/dev/null || true
+        rm -rf "$STASH_DIR"
+      fi
+      exit 0
+    fi
+  fi
+fi
+
 PRE_LOOP_HEAD=$(git rev-parse --verify HEAD 2>/dev/null || git hash-object -t tree /dev/null)
 
 # ---------------------------------------------------------------------------
@@ -532,6 +660,9 @@ while [[ "$REVIEW_ONLY" != true ]]; do
         if grep -qxF "$candidate" "$SKIP_FILE" 2>/dev/null; then
           continue   # failed earlier — drop from list
         fi
+        if grep -qxF "$candidate" "$DEFERRED_FILE" 2>/dev/null; then
+          continue   # deferred by triage — needs human input
+        fi
 
         # Check if all dependencies are closed
         ready_check=$(vima is-ready "$candidate" 2>/dev/null) || ready_check='{"ready":false}'
@@ -569,6 +700,9 @@ while [[ "$REVIEW_ONLY" != true ]]; do
       if grep -qxF "$ticket_id" "$SKIP_FILE" 2>/dev/null; then
         continue   # already failed — skip silently
       fi
+      if grep -qxF "$ticket_id" "$DEFERRED_FILE" 2>/dev/null; then
+        continue   # deferred by triage — needs human input
+      fi
 
       # Resolve title/type from vima show
       ticket_json=$(vima show "$ticket_id" 2>/dev/null) || ticket_json="{}"
@@ -589,7 +723,8 @@ while [[ "$REVIEW_ONLY" != true ]]; do
     count=$(echo "$ready_json" | jq 'length')
     for i in $(seq 0 $((count - 1))); do
       candidate=$(echo "$ready_json" | jq -r ".[$i].id")
-      if ! grep -qxF "$candidate" "$SKIP_FILE" 2>/dev/null; then
+      if ! grep -qxF "$candidate" "$SKIP_FILE" 2>/dev/null \
+         && ! grep -qxF "$candidate" "$DEFERRED_FILE" 2>/dev/null; then
         ticket_id="$candidate"
         ticket_title=$(echo "$ready_json" | jq -r ".[$i].title")
         ticket_type=$(echo "$ready_json" | jq -r ".[$i].type")
