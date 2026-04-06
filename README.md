@@ -1,6 +1,6 @@
 # ai-tooling
 
-Autonomous coding tools powered by [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and [vima](vima). Based on the [Ralph Loop](https://github.com/snarktank/ralph) pattern.
+Autonomous coding tools powered by [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and [vima](https://github.com/pheuberger/vima). Based on the [Ralph Loop](https://github.com/snarktank/ralph) pattern.
 
 | Tool | What it does |
 |------|-------------|
@@ -13,10 +13,16 @@ Autonomous coding tools powered by [Claude Code](https://docs.anthropic.com/en/d
 | Tool | Required by | Purpose |
 |------|------------|---------|
 | [`claude`](https://docs.anthropic.com/en/docs/claude-code) | both | Claude Code CLI |
-| [`vima`](vima) | ralph | vima issue tracker |
+| [`vima`](https://github.com/pheuberger/vima) | ralph | vima issue tracker |
 | `jq` | both | JSON processing |
 | `git` | ralph | Version control |
 | `envsubst` | both | Template variable substitution (part of `gettext`) |
+
+### Installing vima
+
+```bash
+cargo install --git https://github.com/pheuberger/vima --path vima-cli
+```
 
 ## Quick start
 

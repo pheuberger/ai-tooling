@@ -195,7 +195,14 @@ fi
 # Preflight
 # ---------------------------------------------------------------------------
 for cmd in claude vima jq git envsubst; do
-  command -v "$cmd" >/dev/null 2>&1 || { echo "Required: $cmd" >&2; exit 1; }
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "Required: $cmd is not installed." >&2
+    case "$cmd" in
+      vima)   echo "  Install: cargo install --git https://github.com/pheuberger/vima --path vima-cli" >&2 ;;
+      claude) echo "  Install: https://docs.anthropic.com/en/docs/claude-code" >&2 ;;
+    esac
+    exit 1
+  fi
 done
 
 git diff --quiet --cached 2>/dev/null || { echo "Staged changes exist. Commit or stash first." >&2; exit 1; }
