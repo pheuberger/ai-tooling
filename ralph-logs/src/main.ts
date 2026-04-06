@@ -5,7 +5,7 @@ const VERSION = 'ralph-logs 0.1.0'
 
 const HELP = `Usage: ralph-logs [options] [LOG_DIR]
 
-Browse and read ralph-bd session logs in a TUI viewer.
+Browse and read ralph session logs in a TUI viewer.
 
 Arguments:
   LOG_DIR                Path to a ralph log directory (default: .ralph-logs)

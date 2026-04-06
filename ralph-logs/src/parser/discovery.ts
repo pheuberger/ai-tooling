@@ -38,15 +38,15 @@ function classifyFilename(filename: string): ClassifyResult {
   m = filename.match(/^iter-(\d+)-(.+)-commit\.log$/)
   if (m) {
     const iterationNumber = parseInt(m[1], 10)
-    const beadId = m[2]
+    const ticketId = m[2]
     return {
       phase: 'iteration',
       agentType: 'commit',
       format: 'plain-text',
       groupKey: `iter-${iterationNumber}`,
-      beadId,
+      ticketId,
       iterationNumber,
-      displayLabel: `${beadId} commit`,
+      displayLabel: `${ticketId} commit`,
     }
   }
 
@@ -54,15 +54,15 @@ function classifyFilename(filename: string): ClassifyResult {
   m = filename.match(/^iter-(\d+)-(.+)-review\.log$/)
   if (m) {
     const iterationNumber = parseInt(m[1], 10)
-    const beadId = m[2]
+    const ticketId = m[2]
     return {
       phase: 'iteration',
       agentType: 'review',
       format: 'stream-json',
       groupKey: `iter-${iterationNumber}`,
-      beadId,
+      ticketId,
       iterationNumber,
-      displayLabel: `${beadId} review`,
+      displayLabel: `${ticketId} review`,
     }
   }
 
@@ -70,15 +70,15 @@ function classifyFilename(filename: string): ClassifyResult {
   m = filename.match(/^iter-(\d+)-(.+)\.log$/)
   if (m) {
     const iterationNumber = parseInt(m[1], 10)
-    const beadId = m[2]
+    const ticketId = m[2]
     return {
       phase: 'iteration',
       agentType: 'worker',
       format: 'stream-json',
       groupKey: `iter-${iterationNumber}`,
-      beadId,
+      ticketId,
       iterationNumber,
-      displayLabel: `${beadId} worker`,
+      displayLabel: `${ticketId} worker`,
     }
   }
 

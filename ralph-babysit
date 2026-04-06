@@ -222,7 +222,7 @@ extract_result() {
   jq -r 'select(.type == "result") | "\(.duration_ms // 0) \(.total_cost_usd // 0)"' "$1" 2>/dev/null | tail -1
 }
 
-# Stream filter — same as ralph-bd
+# Stream filter — same as ralph
 ralph_stream_filter() {
   jq --unbuffered -r '
     if .type == "assistant" then

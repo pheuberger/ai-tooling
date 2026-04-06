@@ -83,12 +83,12 @@ Call `ExitPlanMode` for the user to approve the plan.
 
 After approval, suggest the next steps:
 1. Run `./ralph-plan` to refine `PLAN.md` through multiple critic passes (produces `PLAN-REFINED.md`)
-2. Run `/plan-to-beads` to decompose the refined plan into trackable implementation tasks
+2. Run `/plan-to-tickets` to decompose the refined plan into trackable implementation tasks
 
 ## Rules
 
 - **NEVER skip the questioning phase** — this is the entire point of the command
-- **NEVER create beads** — that is `/plan-to-beads`, a separate command
+- **NEVER create tickets** — that is `/plan-to-tickets`, a separate command
 - **NEVER start writing code** — this command is purely about understanding
 - Branch names come from Linear — single source of truth
 - If the issue is already In Progress, warn but continue

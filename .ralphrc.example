@@ -7,7 +7,7 @@
 # Loop behavior
 # ---------------------------------------------------------------------------
 # MAX_ITERATIONS=50        # Total iterations before ralph stops
-# MAX_RETRIES=3            # Retries per bead on Claude failure
+# MAX_RETRIES=3            # Retries per ticket on Claude failure
 
 # ---------------------------------------------------------------------------
 # Model selection
@@ -30,12 +30,12 @@
 # MODEL="claude-sonnet-4-6"   # uncomment to force ALL agents
 
 # ---------------------------------------------------------------------------
-# Bead filters (same as CLI flags)
+# Ticket filters (same as CLI flags)
 # ---------------------------------------------------------------------------
 # FILTER_TYPE="feature"    # feature | bug | task
 # FILTER_PRIORITY=2        # 0=critical, 1=high, 2=medium, 3=low, 4=backlog
 # FILTER_OWNER=""
-# FILTER_LABEL=""
+# FILTER_TAG=""
 
 # ---------------------------------------------------------------------------
 # Paths

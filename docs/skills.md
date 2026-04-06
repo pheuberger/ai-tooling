@@ -2,7 +2,7 @@
 
 User-level [Claude Code skills](https://docs.anthropic.com/en/docs/claude-code/skills) that live in `claude-home/.claude/skills/` and are symlinked to `~/.claude/skills/` via [GNU Stow](https://www.gnu.org/software/stow/). A hook script in `claude-home/.claude/hooks/` is managed the same way.
 
-These skills are available in any Claude Code session (not just ralph-bd runs) and form the interactive counterpart to ralph's automated loop. Where ralph processes beads autonomously, these skills are invoked manually via `/skill-name` in a Claude Code conversation.
+These skills are available in any Claude Code session (not just ralph runs) and form the interactive counterpart to ralph's automated loop. Where ralph processes tickets autonomously, these skills are invoked manually via `/skill-name` in a Claude Code conversation.
 
 ## Setup
 
@@ -38,8 +38,8 @@ Skills are invoked in Claude Code with `/skill-name` (e.g. `/create-plan`). They
 | `/start-issue` | Beginning work on a Linear issue. Fetches the spec, marks it in progress, checks out the branch, and runs an interactive questioning phase to refine requirements before any code is written. |
 | `/research-codebase` | You need to understand how something works before planning. Spawns parallel sub-agents to explore the codebase and produces a timestamped research document in `.claude/research/`. |
 | `/create-plan` | After research and requirements are clear. Interactive multi-step process: gathers context, asks questions, explores code, and writes a phased implementation plan to `PLAN.md` in the project root. |
-| `/plan-to-beads` | After a plan is approved. Decomposes it into granular, self-contained beads (bd issues) with file paths, code snippets, and acceptance criteria. Every bead gets a shared feature label. |
-| `/review-beads` | Quality gate before running ralph-bd. Audits beads for completeness, splits oversized ones, enriches vague descriptions with actual code from the codebase. |
+| `/plan-to-tickets` | After a plan is approved. Decomposes it into granular, self-contained tickets (vima issues) with file paths, code snippets, and acceptance criteria. Every ticket gets a shared feature tag. |
+| `/review-tickets` | Quality gate before running ralph. Audits tickets for completeness, splits oversized ones, enriches vague descriptions with actual code from the codebase. |
 | `/create-issue` | Mid-session, you notice out-of-scope work. Captures it as a Linear issue with a quick refinement loop — keeps you focused on the current task. |
 
 ## Typical workflow
@@ -48,9 +48,9 @@ Skills are invoked in Claude Code with `/skill-name` (e.g. `/create-plan`). They
 /start-issue MA-123          # fetch spec, question requirements, write PLAN.md
 /create-plan                  # (alternative) write PLAN.md interactively
 ./ralph-plan                  # refine PLAN.md → PLAN-REFINED.md
-/plan-to-beads                # decompose plan into bd tasks
-/review-beads                 # quality-check the beads
-./ralph-bd --label feat-slug  # let ralph work them autonomously
+/plan-to-tickets              # decompose plan into vima tasks
+/review-tickets               # quality-check the tickets
+./ralph --tag feat-slug       # let ralph work them autonomously
 ```
 
 ## Hooks

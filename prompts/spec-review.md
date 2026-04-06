@@ -10,8 +10,7 @@ ${CHILDREN_JSON}
 4. No implicit dependencies on other tasks that aren't declared
 
 ## Actions
-- If a task fails validation, fix it: bd update <id> -d "<improved description>" --acceptance "<improved criteria>"
-- If a task is too large, split it: bd close <id> --reason "split" then create smaller tasks
-- After all fixes: bd sync
+- If a task fails validation, fix it: vima update <id> --description "<improved description>" --acceptance "<improved criteria>"
+- If a task is too large, split it: vima close <id> --reason "split" then create smaller tasks
 
 Output a one-line summary per task: PASS or what you fixed.

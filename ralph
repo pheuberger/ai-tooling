@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
-# ralph-bd.sh — Ralph Loop for beads-driven autonomous coding
+# ralph — Ralph Loop for vima-driven autonomous coding
 #
-# Spawns a fresh Claude Code instance per ready bead. Each instance gets
+# Spawns a fresh Claude Code instance per ready ticket. Each instance gets
 # clean context — no conversation history carries over. State lives in
 # the filesystem and git, not in the LLM's memory. This sidesteps context
 # degradation by treating every iteration as a brand-new session.
 #
-# Usage: ./ralph-bd [options]
+# Usage: ./ralph [options]
 #   --max-iterations N   Maximum total iterations (default: 50)
-#   --max-retries N      Retries per bead on failure (default: 3)
+#   --max-retries N      Retries per ticket on failure (default: 3)
 #   --model MODEL        Force ALL agents to this model (overrides per-agent models)
-#   --beads ID[,ID,...]  Only process these beads, in order (skip bd ready)
-#   --respect-deps       With --beads: skip beads whose dependencies aren't closed yet
-#   --type TYPE          Filter ready beads by issue_type (feature|bug|task)
-#   --priority N         Only pick beads with priority <= N (0=critical … 4=backlog)
-#   --owner NAME         Only pick beads owned by NAME
-#   --label LABEL        Filter ready beads by label
-#   --from-plan FILE     Decompose a plan file into label-grouped tasks, then work them
+#   --tickets ID[,ID,..] Only process these tickets, in order (skip vima ready)
+#   --respect-deps       With --tickets: skip tickets whose dependencies aren't closed yet
+#   --type TYPE          Filter ready tickets by type (feature|bug|task)
+#   --priority N         Only pick tickets with priority <= N (0=critical … 4=backlog)
+#   --owner NAME         Only pick tickets owned by NAME
+#   --tag TAG            Filter ready tickets by tag
+#   --from-plan FILE     Decompose a plan file into tag-grouped tasks, then work them
 #   --test-cmd CMD       Run CMD as pre-commit test gate; retries worker on failure
 #   --watchdog N         Kill worker after N minutes of inactivity (default: 15)
 #   --no-watchdog        Disable the inactivity watchdog
@@ -30,7 +30,7 @@
 #                        COMMIT_MODEL, FINAL_REVIEW_MODEL, LEAD_MODEL,
 #                        SPEC_MODEL, SUMMARY_MODEL,
 #                        FILTER_TYPE, FILTER_PRIORITY, FILTER_OWNER,
-#                        FILTER_LABEL, TEST_CMD, WATCHDOG_TIMEOUT,
+#                        FILTER_TAG, TEST_CMD, WATCHDOG_TIMEOUT,
 #                        LOG_DIR, RALPH_RULES_FILE.
 #                        CLI flags override values set here.
 #   .ralph-rules.md      Extra instructions injected into the agent prompt as a
@@ -38,7 +38,7 @@
 #                        that don't belong in AGENTS.md or CLAUDE.md. Silently
 #                        skipped if absent. Path configurable via RALPH_RULES_FILE.
 #
-# Requires: claude (Claude Code CLI), bd (beads), jq, git
+# Requires: claude (Claude Code CLI), vima, jq, git
 #
 # References:
 #   https://github.com/snarktank/ralph
@@ -63,8 +63,7 @@ C_WHITE='\033[97m'
 
 ts()         { printf '%s' "$(date '+%Y-%m-%d %H:%M:%S')"; }
 log_ts()     { echo -e "${C_DIM}[$(ts)]${C_RESET} $*"; }
-bd_sync()    { bd sync > /dev/null 2>&1 || true; }
-bead_field() { echo "$1" | jq -r ".[0].$2 // \"$3\""; }
+ticket_field() { echo "$1" | jq -r ".$2 // \"$3\""; }
 slugify()    { echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g; s/--*/-/g; s/^-//; s/-$//' | cut -c1-50; }
 
 # Output helpers — clean, scannable terminal output
@@ -111,11 +110,11 @@ render_prompt() {
   echo "$content" | envsubst "$varlist"
 }
 
-# True if there are unstaged, staged, or untracked changes outside .ralph-logs/ and .beads/
+# True if there are unstaged, staged, or untracked changes outside .ralph-logs/ and .vima/
 has_code_changes() {
-  git diff --quiet -- ':!.ralph-logs' ':!.beads' 2>/dev/null            || return 0
-  git diff --cached --quiet -- ':!.ralph-logs' ':!.beads' 2>/dev/null   || return 0
-  [[ -z "$(git ls-files --others --exclude-standard -- ':!.ralph-logs' ':!.beads' 2>/dev/null)" ]] || return 0
+  git diff --quiet -- ':!.ralph-logs' ':!.vima' 2>/dev/null            || return 0
+  git diff --cached --quiet -- ':!.ralph-logs' ':!.vima' 2>/dev/null   || return 0
+  [[ -z "$(git ls-files --others --exclude-standard -- ':!.ralph-logs' ':!.vima' 2>/dev/null)" ]] || return 0
   return 1
 }
 
@@ -134,15 +133,15 @@ SIMPLIFY_THRESHOLD=10 # skip simplify when worker diff is fewer lines than this
 REVIEWER_MODEL=""     # intermittent code reviewer — default: sonnet
 FINAL_REVIEW_MODEL="" # final parallel review personas — default: opus
 SUMMARY_MODEL=""      # post-run summary — default: haiku
-BEAD_IDS=""           # comma-separated explicit bead list (--beads mode only)
-PLAN_LABEL=""         # label slug generated from --from-plan title
-EXPLICIT_MODE=false   # set when --beads is used (prevents fallback to bd ready)
-RESPECT_DEPS=false    # with --beads: skip beads whose deps aren't closed
-FILTER_TYPE=""        # filter by issue_type (feature|bug|task)
-FILTER_PRIORITY=""    # only beads with priority <= this value (0=critical … 4=backlog)
-FILTER_OWNER=""       # only beads owned by this name
-FILTER_LABEL=""       # filter by label
-PLAN_FILE=""          # --from-plan: plan file to decompose into beads
+TICKET_IDS=""         # comma-separated explicit ticket list (--tickets mode only)
+PLAN_TAG=""           # tag slug generated from --from-plan title
+EXPLICIT_MODE=false   # set when --tickets is used (prevents fallback to vima ready)
+RESPECT_DEPS=false    # with --tickets: skip tickets whose deps aren't closed
+FILTER_TYPE=""        # filter by type (feature|bug|task)
+FILTER_PRIORITY=""    # only tickets with priority <= this value (0=critical … 4=backlog)
+FILTER_OWNER=""       # only tickets owned by this name
+FILTER_TAG=""         # filter by tag
+PLAN_FILE=""          # --from-plan: plan file to decompose into tickets
 TEST_CMD=""           # --test-cmd: command to run as pre-commit test gate
 WATCHDOG_TIMEOUT=15  # minutes of worker inactivity before kill (0=disabled)
 REVIEW_ONLY=false    # --review-only: skip loop, run final review + summary
@@ -163,12 +162,12 @@ while [[ $# -gt 0 ]]; do
     --max-iterations) MAX_ITERATIONS="$2"; shift 2 ;;
     --max-retries)    MAX_RETRIES="$2"; shift 2 ;;
     --model)          MODEL="$2"; shift 2 ;;
-    --beads)          BEAD_IDS="$2"; EXPLICIT_MODE=true; shift 2 ;;
+    --tickets)        TICKET_IDS="$2"; EXPLICIT_MODE=true; shift 2 ;;
     --respect-deps)   RESPECT_DEPS=true; shift ;;
     --type)           FILTER_TYPE="$2"; shift 2 ;;
     --priority)       FILTER_PRIORITY="$2"; shift 2 ;;
     --owner)          FILTER_OWNER="$2"; shift 2 ;;
-    --label)          FILTER_LABEL="$2"; shift 2 ;;
+    --tag)            FILTER_TAG="$2"; shift 2 ;;
     --from-plan)      PLAN_FILE="$2"; shift 2 ;;
     --test-cmd)       TEST_CMD="$2"; shift 2 ;;
     --watchdog)       WATCHDOG_TIMEOUT="$2"; shift 2 ;;
@@ -195,7 +194,7 @@ fi
 # ---------------------------------------------------------------------------
 # Preflight
 # ---------------------------------------------------------------------------
-for cmd in claude bd jq git envsubst; do
+for cmd in claude vima jq git envsubst; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "Required: $cmd" >&2; exit 1; }
 done
 
@@ -204,9 +203,9 @@ git diff --quiet --cached 2>/dev/null || { echo "Staged changes exist. Commit or
 # Move pre-existing untracked files (PLAN.md, SPEC.md, etc.) out of the
 # working tree so git add -A inside the loop doesn't pick them up.
 # We can't use git stash because it would also revert unstaged tracked
-# changes in .beads/, breaking bd ready.
+# changes in .vima/, breaking vima ready.
 STASH_DIR=""
-untracked=$(git ls-files --others --exclude-standard -- ':!.beads' ':!.ralph-logs' 2>/dev/null)
+untracked=$(git ls-files --others --exclude-standard -- ':!.vima' ':!.ralph-logs' 2>/dev/null)
 if [[ -n "$untracked" ]]; then
   STASH_DIR=$(mktemp -d /tmp/ralph-stash.XXXXXX)
   echo "$untracked" | while IFS= read -r f; do
@@ -260,10 +259,10 @@ ralph_stream_filter() {
   ' 2>/dev/null
 }
 
-# Extract titles of beads filed via `bd create` in a review log
-extract_filed_beads() {
+# Extract titles of tickets filed via `vima create` in a review log
+extract_filed_tickets() {
   jq -r 'select(.type == "assistant") | .message.content[]? | select(.type == "tool_use" and .name == "Bash") | .input.command // ""' "$1" 2>/dev/null \
-    | grep -oP 'bd create "\K[^"]+' \
+    | grep -oP 'vima create "\K[^"]+' \
     | while IFS= read -r title; do detail "⎿ $title"; done
 }
 
@@ -405,11 +404,11 @@ cfg_opt() { [[ -n "${2:-}" ]] && detail "$1: $2" || true; }
 [[ -f ".ralphrc" ]]          && detail ".ralphrc loaded"
 [[ -f "$RALPH_RULES_FILE" ]] && detail "$RALPH_RULES_FILE loaded"
 cfg_opt "plan"     "$PLAN_FILE"
-cfg_opt "beads"    "$BEAD_IDS"
+cfg_opt "tickets"  "$TICKET_IDS"
 cfg_opt "type"     "$FILTER_TYPE"
 cfg_opt "priority" "${FILTER_PRIORITY:+<= $FILTER_PRIORITY}"
 cfg_opt "owner"    "$FILTER_OWNER"
-cfg_opt "label"    "$FILTER_LABEL"
+cfg_opt "tag"      "$FILTER_TAG"
 cfg_opt "test"     "$TEST_CMD"
 (( WATCHDOG_TIMEOUT > 0 )) && cfg_opt "watchdog" "${WATCHDOG_TIMEOUT}m" || true
 [[ "$RESPECT_DEPS" == true ]] && detail "respect-deps: yes" || true
@@ -437,46 +436,44 @@ extract_cost() {
 }
 
 # ---------------------------------------------------------------------------
-# --from-plan: decompose a plan file into beads, then fall through to loop
+# --from-plan: decompose a plan file into tickets, then fall through to loop
 # ---------------------------------------------------------------------------
 if [[ -n "$PLAN_FILE" ]]; then
   # plan_title and plan_body were read before stashing (see above)
 
-  # Derive a label slug from the plan title for grouping
-  PLAN_LABEL=$(slugify "$plan_title")
-  [[ -z "$PLAN_LABEL" ]] && { echo "Could not generate label from plan title: $plan_title" >&2; exit 1; }
-  [[ -n "$FILTER_LABEL" ]] && detail "note: --label '$FILTER_LABEL' overridden by plan label '$PLAN_LABEL'"
-  FILTER_LABEL="$PLAN_LABEL"
-  detail "label: $PLAN_LABEL"
+  # Derive a tag slug from the plan title for grouping
+  PLAN_TAG=$(slugify "$plan_title")
+  [[ -z "$PLAN_TAG" ]] && { echo "Could not generate tag from plan title: $plan_title" >&2; exit 1; }
+  [[ -n "$FILTER_TAG" ]] && detail "note: --tag '$FILTER_TAG' overridden by plan tag '$PLAN_TAG'"
+  FILTER_TAG="$PLAN_TAG"
+  detail "tag: $PLAN_TAG"
 
   # --- Phase 1: Decompose epic into tasks ---
   phase_hdr "$C_BLUE" "Lead — $(short_model "$LEAD_MODEL")"
   lead_log="$LOG_DIR/lead-$(date '+%H%M%S').log"
 
   run_agent ralph_stream_filter "$lead_log" "$LEAD_MODEL" --output-format stream-json --verbose -p "$(
-    export PLAN_TITLE="$plan_title" PLAN_BODY="$plan_body" PLAN_LABEL="$PLAN_LABEL"
-    render_prompt "$PROMPTS_DIR/lead.md" PLAN_TITLE PLAN_BODY PLAN_LABEL
+    export PLAN_TITLE="$plan_title" PLAN_BODY="$plan_body" PLAN_TAG="$PLAN_TAG"
+    render_prompt "$PROMPTS_DIR/lead.md" PLAN_TITLE PLAN_BODY PLAN_TAG
   )" || true
   extract_cost "lead" "$lead_log"
-  bd_sync
   read -r dur cost <<< "$(extract_result "$lead_log")"
   out "${C_GREEN}✓${C_RESET}" "${C_DIM}$(fmt_duration "$dur") · \$$(fmt_cost "$cost")${C_RESET}"
 
   # --- Phase 2: Validate specs ---
   phase_hdr "$C_MAGENTA" "Spec review — $(short_model "$SPEC_MODEL")"
   spec_log="$LOG_DIR/spec-review-$(date '+%H%M%S').log"
-  children_json=$(bd list --label "$PLAN_LABEL" --status open --json --limit 0 2>/dev/null) || children_json="[]"
+  children_json=$(vima list --tag "$PLAN_TAG" --status open 2>/dev/null) || children_json="[]"
 
   run_agent ralph_stream_filter "$spec_log" "$SPEC_MODEL" --output-format stream-json --verbose -p "$(
     export CHILDREN_JSON="$children_json"
     render_prompt "$PROMPTS_DIR/spec-review.md" CHILDREN_JSON
   )" || true
   extract_cost "spec" "$spec_log"
-  bd_sync
   read -r dur cost <<< "$(extract_result "$spec_log")"
   out "${C_GREEN}✓${C_RESET}" "${C_DIM}$(fmt_duration "$dur") · \$$(fmt_cost "$cost")${C_RESET}"
 
-  # FILTER_LABEL is set — fall through into the main worker+reviewer loop
+  # FILTER_TAG is set — fall through into the main worker+reviewer loop
 fi
 
 PRE_LOOP_HEAD=$(git rev-parse --verify HEAD 2>/dev/null || git hash-object -t tree /dev/null)
@@ -495,29 +492,29 @@ if [[ "$REVIEW_ONLY" == true ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Main loop — runs as long as there are unblocked beads
+# Main loop — runs as long as there are unblocked tickets
 # ---------------------------------------------------------------------------
 while [[ "$REVIEW_ONLY" != true ]]; do
   # -----------------------------------------------------------------------
-  # Pick next bead — explicit list, filtered ready, or default ready
+  # Pick next ticket — explicit list, filtered ready, or default ready
   # -----------------------------------------------------------------------
-  bead_id=""
-  bead_title=""
-  bead_type=""
+  ticket_id=""
+  ticket_title=""
+  ticket_type=""
 
   if [[ "$EXPLICIT_MODE" == true ]]; then
-    # Explicit bead list — stop when exhausted
-    if [[ -z "$BEAD_IDS" ]]; then
+    # Explicit ticket list — stop when exhausted
+    if [[ -z "$TICKET_IDS" ]]; then
       break
     fi
 
     if [[ "$RESPECT_DEPS" == true ]]; then
-      # Scan the list for the first bead whose dependencies are all closed.
-      # Beads that are still blocked get re-queued at the end.
+      # Scan the list for the first ticket whose dependencies are all closed.
+      # Tickets that are still blocked get re-queued at the end.
       remaining=""
       found=false
 
-      IFS=',' read -ra candidates <<< "$BEAD_IDS"
+      IFS=',' read -ra candidates <<< "$TICKET_IDS"
       for candidate in "${candidates[@]}"; do
         if [[ "$found" == true ]]; then
           # Already picked one — keep the rest as-is
@@ -530,72 +527,72 @@ while [[ "$REVIEW_ONLY" != true ]]; do
         fi
 
         # Check if all dependencies are closed
-        dep_json=$(bd show "$candidate" --json 2>/dev/null) || dep_json="[]"
-        open_deps=$(echo "$dep_json" | jq \
-          '[.[0].dependencies // [] | .[] | select(.status != "closed")] | length')
+        ready_check=$(vima is-ready "$candidate" 2>/dev/null) || ready_check='{"ready":false}'
+        is_candidate_ready=$(echo "$ready_check" | jq -r '.ready')
 
-        if [[ "$open_deps" -gt 0 ]]; then
+        if [[ "$is_candidate_ready" != "true" ]]; then
           # Still blocked — re-queue at the end
           remaining="${remaining:+$remaining,}$candidate"
         else
           # Ready to go
-          bead_id="$candidate"
-          bead_title=$(bead_field "$dep_json" title unknown)
-          bead_type=$(bead_field "$dep_json" issue_type task)
+          ticket_id="$candidate"
+          ticket_json=$(vima show "$candidate" 2>/dev/null) || ticket_json="{}"
+          ticket_title=$(ticket_field "$ticket_json" title unknown)
+          ticket_type=$(ticket_field "$ticket_json" type task)
           found=true
         fi
       done
 
-      BEAD_IDS="$remaining"
+      TICKET_IDS="$remaining"
 
       if [[ "$found" == false ]]; then
         if [[ -n "$remaining" ]]; then
-          section "${C_YELLOW}All remaining beads are blocked${C_RESET}"
+          section "${C_YELLOW}All remaining tickets are blocked${C_RESET}"
           detail "${remaining//,/, }"
         fi
         break
       fi
     else
       # No dep checking — pop first ID from the comma-separated list
-      bead_id="${BEAD_IDS%%,*}"
-      rest="${BEAD_IDS#*,}"
-      [[ "$rest" == "$bead_id" ]] && rest=""   # was the last item
-      BEAD_IDS="$rest"
+      ticket_id="${TICKET_IDS%%,*}"
+      rest="${TICKET_IDS#*,}"
+      [[ "$rest" == "$ticket_id" ]] && rest=""   # was the last item
+      TICKET_IDS="$rest"
 
-      if grep -qxF "$bead_id" "$SKIP_FILE" 2>/dev/null; then
+      if grep -qxF "$ticket_id" "$SKIP_FILE" 2>/dev/null; then
         continue   # already failed — skip silently
       fi
 
-      # Resolve title/type from bd show
-      bead_json=$(bd show "$bead_id" --json 2>/dev/null) || bead_json="[]"
-      bead_title=$(bead_field "$bead_json" title unknown)
-      bead_type=$(bead_field "$bead_json" issue_type task)
+      # Resolve title/type from vima show
+      ticket_json=$(vima show "$ticket_id" 2>/dev/null) || ticket_json="{}"
+      ticket_title=$(ticket_field "$ticket_json" title unknown)
+      ticket_type=$(ticket_field "$ticket_json" type task)
     fi
   else
-    # Default mode — ask bd ready with passthrough filters
-    ready_args=(--json)
-    [[ -n "$FILTER_LABEL" ]]    && ready_args+=(--label "$FILTER_LABEL")
+    # Default mode — ask vima ready with passthrough filters
+    ready_args=()
+    [[ -n "$FILTER_TAG" ]]      && ready_args+=(--tag "$FILTER_TAG")
     [[ -n "$FILTER_TYPE" ]]     && ready_args+=(--type "$FILTER_TYPE")
     [[ -n "$FILTER_PRIORITY" ]] && ready_args+=(--priority "$FILTER_PRIORITY")
     [[ -n "$FILTER_OWNER" ]]    && ready_args+=(--assignee "$FILTER_OWNER")
 
-    ready_json=$(bd ready "${ready_args[@]}" 2>/dev/null) || ready_json="[]"
+    ready_json=$(vima ready "${ready_args[@]}" 2>/dev/null) || ready_json="[]"
 
     # Pick first not already skipped
     count=$(echo "$ready_json" | jq 'length')
     for i in $(seq 0 $((count - 1))); do
       candidate=$(echo "$ready_json" | jq -r ".[$i].id")
       if ! grep -qxF "$candidate" "$SKIP_FILE" 2>/dev/null; then
-        bead_id="$candidate"
-        bead_title=$(echo "$ready_json" | jq -r ".[$i].title")
-        bead_type=$(echo "$ready_json" | jq -r ".[$i].issue_type")
+        ticket_id="$candidate"
+        ticket_title=$(echo "$ready_json" | jq -r ".[$i].title")
+        ticket_type=$(echo "$ready_json" | jq -r ".[$i].type")
         break
       fi
     done
   fi
 
-  if [[ -z "$bead_id" ]]; then
-    section "${C_GREEN}No more ready beads — done${C_RESET}"
+  if [[ -z "$ticket_id" ]]; then
+    section "${C_GREEN}No more ready tickets — done${C_RESET}"
     break
   fi
 
@@ -605,33 +602,33 @@ while [[ "$REVIEW_ONLY" != true ]]; do
     exit 1
   fi
 
-  section "Iteration $iteration — $bead_id"
-  detail "$bead_title"
+  section "Iteration $iteration — $ticket_id"
+  detail "$ticket_title"
 
-  # Claim the bead
-  bd update "$bead_id" --status=in_progress > /dev/null 2>&1 || true
+  # Claim the ticket
+  vima start "$ticket_id" > /dev/null 2>&1 || true
 
   # -----------------------------------------------------------------------
   # Build the prompt — fresh context each time (core Ralph insight)
   # -----------------------------------------------------------------------
-  bead_details=$(bd show "$bead_id" 2>/dev/null)
-  bead_show_json=$(bd show "$bead_id" --json 2>/dev/null) || bead_show_json="[]"
-  acceptance=$(echo "$bead_show_json" | jq -r '.[0].acceptance_criteria // empty')
-  bead_labels=$(echo "$bead_show_json" | jq -r '.[0].labels // [] | map("-l " + .) | join(" ")') || bead_labels=""
+  ticket_details=$(vima show "$ticket_id" --pretty 2>/dev/null)
+  ticket_show_json=$(vima show "$ticket_id" 2>/dev/null) || ticket_show_json="{}"
+  acceptance=$(echo "$ticket_show_json" | jq -r '.acceptance // empty')
+  ticket_tags=$(echo "$ticket_show_json" | jq -r '.tags // [] | map("--tags " + .) | join(" ")') || ticket_tags=""
   prompt_file=$(mktemp /tmp/ralph-prompt.XXXXXX)
 
   (
-    export BEAD_LABELS="$bead_labels" BEAD_ID="$bead_id"
-    export PROJECT_RULES="$project_rules" BEAD_DETAILS="$bead_details"
+    export TICKET_TAGS="$ticket_tags" TICKET_ID="$ticket_id"
+    export PROJECT_RULES="$project_rules" TICKET_DETAILS="$ticket_details"
     export ACCEPTANCE="$acceptance"
-    render_prompt "$PROMPTS_DIR/worker.md" BEAD_LABELS BEAD_ID PROJECT_RULES BEAD_DETAILS ACCEPTANCE
+    render_prompt "$PROMPTS_DIR/worker.md" TICKET_TAGS TICKET_ID PROJECT_RULES TICKET_DETAILS ACCEPTANCE
   ) > "$prompt_file"
 
   # -----------------------------------------------------------------------
   # Run Claude — retry on failure
   # -----------------------------------------------------------------------
   pre_worker_head=$(git rev-parse HEAD 2>/dev/null || git hash-object -t tree /dev/null)
-  log_file="$LOG_DIR/iter-${iteration}-${bead_id}.log"
+  log_file="$LOG_DIR/iter-${iteration}-${ticket_id}.log"
   retries=0
   success=false
 
@@ -654,7 +651,7 @@ while [[ "$REVIEW_ONLY" != true ]]; do
       if [[ -n "$TEST_CMD" ]]; then
         echo ""
         phase_hdr "$C_CYAN" "Test gate"
-        test_gate_log="$LOG_DIR/iter-${iteration}-${bead_id}-test-${retries}.log"
+        test_gate_log="$LOG_DIR/iter-${iteration}-${ticket_id}-test-${retries}.log"
         if eval "$TEST_CMD" > "$test_gate_log" 2>&1; then
           out "${C_GREEN}✓${C_RESET}" "passed"
         else
@@ -697,9 +694,9 @@ TESTFAIL
   rm -f "$prompt_file"
 
   if [[ "$success" == false ]]; then
-    out "${C_RED}✗${C_RESET}" "failed after $MAX_RETRIES attempts — skipping $bead_id"
-    echo "$bead_id" >> "$SKIP_FILE"
-    bd update "$bead_id" --status=open > /dev/null 2>&1 || true   # release claim
+    out "${C_RED}✗${C_RESET}" "failed after $MAX_RETRIES attempts — skipping $ticket_id"
+    echo "$ticket_id" >> "$SKIP_FILE"
+    vima update "$ticket_id" --status open > /dev/null 2>&1 || true   # release claim
     continue
   fi
 
@@ -708,24 +705,23 @@ TESTFAIL
   # -----------------------------------------------------------------------
   if ! has_code_changes; then
     detail "no code changes — skipping commit & review"
-    bd close "$bead_id" --reason="No changes needed (iteration $iteration)" > /dev/null 2>&1 || true
-    out "${C_GREEN}✓${C_RESET}" "Closed $bead_id"
-    bd_sync
+    vima close "$ticket_id" --reason "No changes needed (iteration $iteration)" > /dev/null 2>&1 || true
+    out "${C_GREEN}✓${C_RESET}" "Closed $ticket_id"
     sleep 2
     continue
   fi
 
   # -----------------------------------------------------------------------
-  # Commit code + beads changes together.
-  # .ralph-logs/ and .beads/ are script-internal and excluded.
+  # Commit code changes.
+  # .ralph-logs/ and .vima/ are script-internal and excluded.
   # Exclude pathspecs (:!) don't play well with git add, so we use
   # add-then-reset instead.
   # -----------------------------------------------------------------------
   echo ""
-  commit_log="$LOG_DIR/iter-${iteration}-${bead_id}-commit.log"
+  commit_log="$LOG_DIR/iter-${iteration}-${ticket_id}-commit.log"
   run_agent _discard "$commit_log" "$COMMIT_MODEL" -p "$(
-    export BEAD_ID="$bead_id"
-    render_prompt "$PROMPTS_DIR/commit.md" BEAD_ID
+    export TICKET_ID="$ticket_id"
+    render_prompt "$PROMPTS_DIR/commit.md" TICKET_ID
   )" \
     && phase_hdr "$C_YELLOW" "Commit ${C_GREEN}✓${C_RESET}" \
     || phase_hdr "$C_YELLOW" "Commit ${C_RED}✗${C_RESET}"
@@ -734,14 +730,14 @@ TESTFAIL
   # Simplify — fix reuse, quality, and efficiency issues before review
   # Skipped when the worker diff is smaller than SIMPLIFY_THRESHOLD lines.
   # -----------------------------------------------------------------------
-  changed_lines=$(git diff --stat "$pre_worker_head"..HEAD -- ':!.ralph-logs' ':!.beads' 2>/dev/null | tail -1 | grep -oP '\d+(?= (insertion|file))' | head -1 || true)
-  del_lines=$(git diff --stat "$pre_worker_head"..HEAD -- ':!.ralph-logs' ':!.beads' 2>/dev/null | tail -1 | grep -oP '\d+(?= deletion)' || true)
+  changed_lines=$(git diff --stat "$pre_worker_head"..HEAD -- ':!.ralph-logs' ':!.vima' 2>/dev/null | tail -1 | grep -oP '\d+(?= (insertion|file))' | head -1 || true)
+  del_lines=$(git diff --stat "$pre_worker_head"..HEAD -- ':!.ralph-logs' ':!.vima' 2>/dev/null | tail -1 | grep -oP '\d+(?= deletion)' || true)
   changed_lines=$(( ${changed_lines:-0} + ${del_lines:-0} ))
 
   if (( changed_lines >= SIMPLIFY_THRESHOLD )); then
     echo ""
     phase_hdr "$C_CYAN" "Simplify — $(short_model "$SIMPLIFY_MODEL")"
-    simplify_log="$LOG_DIR/iter-${iteration}-${bead_id}-simplify.log"
+    simplify_log="$LOG_DIR/iter-${iteration}-${ticket_id}-simplify.log"
 
     run_agent ralph_stream_filter "$simplify_log" "$SIMPLIFY_MODEL" --output-format stream-json --verbose -p "$(
       export PRE_WORKER_HEAD="$pre_worker_head"
@@ -753,12 +749,12 @@ TESTFAIL
       read -r dur cost <<< "$(extract_result "$simplify_log")"
       out "${C_GREEN}✓${C_RESET}" "${C_DIM}$(fmt_duration "$dur") · \$$(fmt_cost "$cost")${C_RESET}"
       # Commit any simplify changes
-      if ! git diff --quiet HEAD -- ':!.ralph-logs' ':!.beads' 2>/dev/null || \
-         git ls-files --others --exclude-standard -- ':!.ralph-logs' ':!.beads' 2>/dev/null | grep -q .; then
-        simplify_commit_log="$LOG_DIR/iter-${iteration}-${bead_id}-simplify-commit.log"
+      if ! git diff --quiet HEAD -- ':!.ralph-logs' ':!.vima' 2>/dev/null || \
+         git ls-files --others --exclude-standard -- ':!.ralph-logs' ':!.vima' 2>/dev/null | grep -q .; then
+        simplify_commit_log="$LOG_DIR/iter-${iteration}-${ticket_id}-simplify-commit.log"
         run_agent _discard "$simplify_commit_log" "$COMMIT_MODEL" -p "$(
-          export BEAD_ID="$bead_id"
-          render_prompt "$PROMPTS_DIR/commit.md" BEAD_ID
+          export TICKET_ID="$ticket_id"
+          render_prompt "$PROMPTS_DIR/commit.md" TICKET_ID
         )" || true
       fi
     else
@@ -773,12 +769,12 @@ TESTFAIL
   # -----------------------------------------------------------------------
   echo ""
   phase_hdr "$C_MAGENTA" "Review — $(short_model "$REVIEWER_MODEL")"
-  review_log="$LOG_DIR/iter-${iteration}-${bead_id}-review.log"
+  review_log="$LOG_DIR/iter-${iteration}-${ticket_id}-review.log"
 
   run_agent _discard "$review_log" "$REVIEWER_MODEL" --output-format stream-json --verbose -p "$(
-    export BEAD_DETAILS="$bead_details" BEAD_ID="$bead_id"
-    export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" BEAD_LABELS="$bead_labels"
-    render_prompt "$PROMPTS_DIR/review.md" BEAD_DETAILS BEAD_ID PRE_LOOP_HEAD BEAD_LABELS
+    export TICKET_DETAILS="$ticket_details" TICKET_ID="$ticket_id"
+    export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" TICKET_TAGS="$ticket_tags"
+    render_prompt "$PROMPTS_DIR/review.md" TICKET_DETAILS TICKET_ID PRE_LOOP_HEAD TICKET_TAGS
   )" || true
 
   extract_cost "reviewer" "$review_log"
@@ -786,36 +782,33 @@ TESTFAIL
   if [[ "$review_result" == *"REVIEW_PASS"* ]]; then
     out "${C_GREEN}✓${C_RESET}" "pass"
   elif [[ "$review_result" == *"REVIEW_ISSUES_FILED"* ]]; then
-    extract_filed_beads "$review_log"
+    extract_filed_tickets "$review_log"
     out "${C_MAGENTA}●${C_RESET}" "issues filed"
   else
     out "${C_DIM}?${C_RESET}" "${review_result:-(no verdict)}"
   fi
 
   # -----------------------------------------------------------------------
-  # Close the bead (or release if blocked)
+  # Close the ticket (or release if blocked)
   # -----------------------------------------------------------------------
-  open_blockers=$(bd dep list "$bead_id" --json 2>/dev/null \
-    | jq '[.[] | select(.status != "closed")] | length' 2>/dev/null) || open_blockers=0
+  ready_check=$(vima is-ready "$ticket_id" 2>/dev/null) || ready_check='{"ready":true}'
+  is_ticket_ready=$(echo "$ready_check" | jq -r '.ready')
 
-  if [[ "$open_blockers" -gt 0 ]]; then
-    out "${C_YELLOW}●${C_RESET}" "$bead_id has $open_blockers open blocker(s) — released"
-    bd update "$bead_id" --status=open > /dev/null 2>&1 || true
+  if [[ "$is_ticket_ready" != "true" ]]; then
+    open_blockers=$(echo "$ready_check" | jq '.open_deps | length')
+    out "${C_YELLOW}●${C_RESET}" "$ticket_id has $open_blockers open blocker(s) — released"
+    vima update "$ticket_id" --status open > /dev/null 2>&1 || true
   else
-    bd close "$bead_id" --reason="Completed by ralph (iteration $iteration)" > /dev/null 2>&1 || true
+    vima close "$ticket_id" --reason "Completed by ralph (iteration $iteration)" > /dev/null 2>&1 || true
     echo ""
-    out "${C_GREEN}✓${C_RESET}" "Closed $bead_id"
+    out "${C_GREEN}✓${C_RESET}" "Closed $ticket_id"
   fi
-
-  bd_sync
   sleep 2
 done
 
 # ---------------------------------------------------------------------------
 # Wrap up
 # ---------------------------------------------------------------------------
-bd_sync
-
 # Restore shelved untracked files
 if [[ -n "$STASH_DIR" && -d "$STASH_DIR" ]]; then
   cp -a "$STASH_DIR"/. . 2>/dev/null || true
@@ -861,35 +854,35 @@ $(cat PLAN.md)"
   echo ""
   phase_hdr "$C_MAGENTA" "Final review ($persona_count personas) — $(short_model "$FINAL_REVIEW_MODEL")"
 
-  closed_beads=""
-  if [[ -n "${FILTER_LABEL:-}" ]]; then
-    closed_beads=$(bd list --label "$FILTER_LABEL" --status closed --json --limit 0 2>/dev/null) || closed_beads="[]"
+  closed_tickets=""
+  if [[ -n "${FILTER_TAG:-}" ]]; then
+    closed_tickets=$(vima list --tag "$FILTER_TAG" --status closed 2>/dev/null) || closed_tickets="[]"
   fi
   skipped=""; [[ -s "$SKIP_FILE" ]] && skipped=$(cat "$SKIP_FILE")
 
-  bead_labels_flag="${FILTER_LABEL:+-l $FILTER_LABEL}"
+  ticket_tags_flag="${FILTER_TAG:+--tags $FILTER_TAG}"
 
   # --- Persona A: Security Reviewer ---
   sec_log="$LOG_DIR/final-review-security-$(date '+%H%M%S').log"
   run_agent _discard "$sec_log" "$FINAL_REVIEW_MODEL" --output-format stream-json --verbose -p "$(
-    export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" BEAD_LABELS_FLAG="$bead_labels_flag"
-    render_prompt "$PROMPTS_DIR/final-review-security.md" PRE_LOOP_HEAD BEAD_LABELS_FLAG
+    export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" TICKET_TAGS_FLAG="$ticket_tags_flag"
+    render_prompt "$PROMPTS_DIR/final-review-security.md" PRE_LOOP_HEAD TICKET_TAGS_FLAG
   )" &
   sec_pid=$!
 
   # --- Persona B: Integration Reviewer ---
   int_log="$LOG_DIR/final-review-integration-$(date '+%H%M%S').log"
   run_agent _discard "$int_log" "$FINAL_REVIEW_MODEL" --output-format stream-json --verbose -p "$(
-    export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" BEAD_LABELS_FLAG="$bead_labels_flag"
-    render_prompt "$PROMPTS_DIR/final-review-integration.md" PRE_LOOP_HEAD BEAD_LABELS_FLAG
+    export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" TICKET_TAGS_FLAG="$ticket_tags_flag"
+    render_prompt "$PROMPTS_DIR/final-review-integration.md" PRE_LOOP_HEAD TICKET_TAGS_FLAG
   )" &
   int_pid=$!
 
   # --- Persona C: Codebase Patterns Reviewer ---
   pat_log="$LOG_DIR/final-review-patterns-$(date '+%H%M%S').log"
   run_agent _discard "$pat_log" "$FINAL_REVIEW_MODEL" --output-format stream-json --verbose -p "$(
-    export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" BEAD_LABELS_FLAG="$bead_labels_flag"
-    render_prompt "$PROMPTS_DIR/final-review-patterns.md" PRE_LOOP_HEAD BEAD_LABELS_FLAG
+    export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" TICKET_TAGS_FLAG="$ticket_tags_flag"
+    render_prompt "$PROMPTS_DIR/final-review-patterns.md" PRE_LOOP_HEAD TICKET_TAGS_FLAG
   )" &
   pat_pid=$!
 
@@ -899,9 +892,9 @@ $(cat PLAN.md)"
   if [[ -n "$plan_context" ]]; then
     plan_log="$LOG_DIR/final-review-plan-$(date '+%H%M%S').log"
     run_agent _discard "$plan_log" "$FINAL_REVIEW_MODEL" --output-format stream-json --verbose -p "$(
-      export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" BEAD_LABELS_FLAG="$bead_labels_flag"
+      export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" TICKET_TAGS_FLAG="$ticket_tags_flag"
       export PLAN_CONTEXT="$plan_context"
-      render_prompt "$PROMPTS_DIR/final-review-plan.md" PRE_LOOP_HEAD BEAD_LABELS_FLAG PLAN_CONTEXT
+      render_prompt "$PROMPTS_DIR/final-review-plan.md" PRE_LOOP_HEAD TICKET_TAGS_FLAG PLAN_CONTEXT
     )" &
     plan_pid=$!
   fi
@@ -920,7 +913,7 @@ $(cat PLAN.md)"
       out "${C_GREEN}✓${C_RESET}" "${label}: pass"
     elif [[ "$result" == *"_ISSUES"* ]]; then
       out "${C_MAGENTA}●${C_RESET}" "${label}: issues filed"
-      extract_filed_beads "$logfile"
+      extract_filed_tickets "$logfile"
       final_review_failed=true
     else
       out "${C_DIM}?${C_RESET}" "${label}: ${result:-(no verdict)}"

@@ -1,6 +1,6 @@
-# ralph-bd
+# ralph
 
-Autonomous coding loop powered by [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and [beads](https://github.com/steveyegge/beads). Spawns a fresh Claude Code instance per ready bead — no conversation history carries over between iterations. State lives in the filesystem and git, not in the LLM's memory. This sidesteps context degradation by treating every iteration as a brand-new session.
+Autonomous coding loop powered by [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and [vima](vima). Spawns a fresh Claude Code instance per ready ticket — no conversation history carries over between iterations. State lives in the filesystem and git, not in the LLM's memory. This sidesteps context degradation by treating every iteration as a brand-new session.
 
 Based on the [Ralph Loop](https://github.com/snarktank/ralph) pattern.
 
@@ -8,20 +8,20 @@ Based on the [Ralph Loop](https://github.com/snarktank/ralph) pattern.
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│  ralph-bd                                                │
+│  ralph                                                   │
 │                                                          │
-│  1. Pick next ready bead (bd ready / --beads list)       │
-│  2. Claim it (bd update → in_progress)                   │
-│  3. Build prompt from bead details + rules               │
+│  1. Pick next ready ticket (vima ready / --tickets list) │
+│  2. Claim it (vima start → in_progress)                  │
+│  3. Build prompt from ticket details + rules             │
 │  4. Spawn fresh Claude Code worker instance               │
 │  5. On failure: retry up to MAX_RETRIES, then skip       │
 │  6. On success: spawn commit agent (stages + commits)    │
-│  7. Spawn reviewer — files "Fix:" beads for any issues   │
-│  8. Close bead (or release if reviewer filed blockers)   │
+│  7. Spawn reviewer — files "Fix:" tickets for any issues │
+│  8. Close ticket (or release if reviewer filed blockers) │
 │  9. Loop back to 1                                       │
 │                                                          │
 │  Post-run:                                                │
-│    a. Test gate (--test-cmd) — files bead on failure     │
+│    a. Test gate (--test-cmd) — files ticket on failure   │
 │    b. Diff stats                                          │
 │    c. 3-4 parallel Opus final reviewers (Security,       │
 │       Integration, Patterns, Plan Adherence)              │
@@ -33,104 +33,103 @@ Based on the [Ralph Loop](https://github.com/snarktank/ralph) pattern.
 Each Claude Code instance runs with `--print --dangerously-skip-permissions` (headless, no confirmation prompts). The agent is told:
 
 - Do NOT create git commits (the outer loop handles that)
-- Do NOT run bead commands (`bd close`, `bd update`, etc.)
+- Do NOT run ticket commands (`vima close`, `vima update`, etc.)
 - Focus only on the assigned task
-- If genuinely blocked, file a blocker bead and stop
+- If genuinely blocked, file a blocker ticket and stop
 - End output with a `## Learnings` section
 
 After the coding agent finishes, a separate commit agent stages and commits the changes. It reviews the diff and writes a commit message that follows whatever conventions the project has (picked up from `CLAUDE.md` / `AGENTS.md`).
 
 ### Untracked file safety
 
-Before starting, ralph shelves any pre-existing untracked files (except `.beads/` and `.ralph-logs/`) to a temp directory. They're restored after the loop finishes. This prevents `git add -A` inside the loop from accidentally committing your scratch files.
+Before starting, ralph shelves any pre-existing untracked files (except `.vima/` and `.ralph-logs/`) to a temp directory. They're restored after the loop finishes. This prevents `git add -A` inside the loop from accidentally committing your scratch files.
 
 ### Worker watchdog
 
-By default, ralph monitors all agent output for activity. If any agent (worker, reviewer, commit, simplify, lead, spec, final review, or summary) produces no output for 15 minutes, the watchdog kills it. For workers, the bead retries (up to `MAX_RETRIES`) or releases back to `open` status. Other agents fail gracefully — the loop continues.
+By default, ralph monitors all agent output for activity. If any agent (worker, reviewer, commit, simplify, lead, spec, final review, or summary) produces no output for 15 minutes, the watchdog kills it. For workers, the ticket retries (up to `MAX_RETRIES`) or releases back to `open` status. Other agents fail gracefully — the loop continues.
 
 All agent output streams to log files via `tee` in real time. The watchdog checks each log file's modification time every 30 seconds. Since `--output-format stream-json` streams events continuously during normal operation, a stale log file reliably indicates a stuck process.
 
 Disable with `--no-watchdog` or `WATCHDOG_TIMEOUT=0` in `.ralphrc`. Adjust the timeout with `--watchdog N` (minutes).
 
-### Bead lifecycle
+### Ticket lifecycle
 
 | Step | Who | What happens |
 |------|-----|-------------|
-| Pick | ralph | Selects next bead from `bd ready` or `--beads` list |
-| Claim | ralph | `bd update <id> --status=in_progress` |
-| Work | Worker agent | Reads bead details, writes code |
-| Commit | Commit agent | `git add -A`, resets `.ralph-logs`, commits with `(bead-id)` in body |
-| Review | Reviewer agent | Reads the diff; files "Fix:" beads for any issues found |
-| Close | ralph | `bd close <id>` (or release if open blockers exist) |
-| Sync | ralph | `bd sync` |
+| Pick | ralph | Selects next ticket from `vima ready` or `--tickets` list |
+| Claim | ralph | `vima start <id>` |
+| Work | Worker agent | Reads ticket details, writes code |
+| Commit | Commit agent | `git add -A`, resets `.ralph-logs`, commits with `(ticket-id)` in body |
+| Review | Reviewer agent | Reads the diff; files "Fix:" tickets for any issues found |
+| Close | ralph | `vima close <id>` (or release if open blockers exist) |
 
-If the coding agent fails after all retries, the bead is released (`bd update → open`) and added to the skip list.
+If the coding agent fails after all retries, the ticket is released (`vima update → open`) and added to the skip list.
 
 ## CLI options
 
 ```
-./ralph-bd [options]
+./ralph [options]
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--max-iterations N` | `50` | Maximum total loop iterations |
-| `--max-retries N` | `3` | Retries per bead on Claude failure |
+| `--max-retries N` | `3` | Retries per ticket on Claude failure |
 | `--model MODEL` | per-agent | Force ALL agents to this model (overrides per-agent defaults) |
-| `--beads ID[,ID,...]` | — | Process only these beads, in order. Skips `bd ready`. |
-| `--respect-deps` | off | With `--beads`: skip beads whose dependencies aren't closed yet. Blocked beads are re-queued at the end of the list. |
-| `--from-plan FILE` | — | Decompose a plan file into label-grouped tasks, then work them. See [Plan mode](#plan-mode). |
-| `--test-cmd CMD` | — | Run `CMD` as a post-loop test gate. Files a bead and exits 1 on failure. |
+| `--tickets ID[,ID,...]` | — | Process only these tickets, in order. Skips `vima ready`. |
+| `--respect-deps` | off | With `--tickets`: skip tickets whose dependencies aren't closed yet. Blocked tickets are re-queued at the end of the list. |
+| `--from-plan FILE` | — | Decompose a plan file into tag-grouped tasks, then work them. See [Plan mode](#plan-mode). |
+| `--test-cmd CMD` | — | Run `CMD` as a post-loop test gate. Files a ticket and exits 1 on failure. |
 | `--watchdog N` | `15` | Kill any agent after N minutes of inactivity. Monitors the log file for writes — if `claude` produces no output for N minutes, the agent is killed. Workers retry (or release after `MAX_RETRIES`); other agents fail gracefully. |
 | `--no-watchdog` | — | Disable the inactivity watchdog (`WATCHDOG_TIMEOUT=0`) |
-| `--type TYPE` | — | Filter `bd ready` by `issue_type` (`feature`, `bug`, `task`) |
-| `--priority N` | — | Only pick beads with `priority <= N` (0=critical, 1=high, 2=medium, 3=low, 4=backlog) |
-| `--owner NAME` | — | Only pick beads owned by `NAME` |
-| `--label LABEL` | — | Filter `bd ready` by label |
+| `--type TYPE` | — | Filter `vima ready` by `issue_type` (`feature`, `bug`, `task`) |
+| `--priority N` | — | Only pick tickets with `priority <= N` (0=critical, 1=high, 2=medium, 3=low, 4=backlog) |
+| `--owner NAME` | — | Only pick tickets owned by `NAME` |
+| `--tag TAG` | — | Filter `vima ready` by tag |
 | `-h`, `--help` | — | Print usage and exit |
 
 ### Examples
 
 ```bash
 # Run only critical/high priority features
-./ralph-bd --type feature --priority 1
+./ralph --type feature --priority 1
 
-# Specific beads with dependency awareness
-./ralph-bd --beads auth-1,auth-2,auth-3 --respect-deps
+# Specific tickets with dependency awareness
+./ralph --tickets auth-1,auth-2,auth-3 --respect-deps
 
-# Decompose a plan into beads and work them
-./ralph-bd --from-plan PLAN.md
+# Decompose a plan into tickets and work them
+./ralph --from-plan PLAN.md
 
 # Run with a post-loop test gate
-./ralph-bd --from-plan PLAN.md --test-cmd 'npm test'
+./ralph --from-plan PLAN.md --test-cmd 'npm test'
 
 # Force all agents to a single model, limit iterations
-./ralph-bd --model claude-sonnet-4-6 --max-iterations 5
+./ralph --model claude-sonnet-4-6 --max-iterations 5
 
-# Only beads owned by a specific person
-./ralph-bd --owner bitbeckers
+# Only tickets owned by a specific person
+./ralph --owner bitbeckers
 
 # Maximum retries for flaky CI environments
-./ralph-bd --max-retries 5
+./ralph --max-retries 5
 
 # Tighter watchdog (kill after 10 minutes of inactivity)
-./ralph-bd --watchdog 10
+./ralph --watchdog 10
 
 # Disable watchdog entirely (let workers run as long as they need)
-./ralph-bd --no-watchdog
+./ralph --no-watchdog
 ```
 
 ## Plan mode
 
-`--from-plan FILE` runs a three-phase pipeline: a lead agent decomposes the plan into beads, a spec reviewer validates them, then the normal worker loop processes them all. Tasks are grouped by a label slug derived from the plan title.
+`--from-plan FILE` runs a three-phase pipeline: a lead agent decomposes the plan into tickets, a spec reviewer validates them, then the normal worker loop processes them all. Tasks are grouped by a tag slug derived from the plan title.
 
 ```
 ┌──────────────────────────────────────────────────────────┐
 │  --from-plan PLAN.md                                     │
 │                                                          │
 │  Phase 1 — Lead agent (opus)                             │
-│    Reads plan file, derives a label slug from the title, │
-│    decomposes it into small tasks with bd create.        │
+│    Reads plan file, derives a tag slug from the title,   │
+│    decomposes it into small tasks with vima create.      │
 │                                                          │
 │  Phase 2 — Spec reviewer (opus)                          │
 │    Validates each task is self-contained with file        │
@@ -138,30 +137,30 @@ If the coding agent fails after all retries, the bead is released (`bd update �
 │    Fixes or splits tasks that fail validation.           │
 │                                                          │
 │  Phase 3 — Worker loop (normal iteration)                │
-│    Processes all tasks with the plan label via bd ready. │
+│    Processes all tasks with the plan tag via vima ready. │
 └──────────────────────────────────────────────────────────┘
 ```
 
-The plan file should be a markdown file with a title on the first line. The plan title is slugified into a label (e.g. "Add user auth" → `add-user-auth`). The lead agent tags each task with this label, and the worker loop picks them up via `bd ready --label <slug>`.
+The plan file should be a markdown file with a title on the first line. The plan title is slugified into a tag (e.g. "Add user auth" → `add-user-auth`). The lead agent tags each task with this tag, and the worker loop picks them up via `vima ready --tag <slug>`.
 
 ## Configuration
 
 ### `.ralphrc`
 
-Per-project configuration file. Place it in the project root (where you run `ralph-bd`). It's sourced as a bash script before CLI arguments are parsed, so **CLI flags override `.ralphrc` values**.
+Per-project configuration file. Place it in the project root (where you run `ralph`). It's sourced as a bash script before CLI arguments are parsed, so **CLI flags override `.ralphrc` values**.
 
 ```bash
-# .ralphrc — ralph-bd project configuration
+# .ralphrc — ralph project configuration
 
 # How many total iterations before ralph stops (default: 50)
 MAX_ITERATIONS=30
 
-# How many times to retry a bead if Claude exits non-zero (default: 3)
+# How many times to retry a ticket if Claude exits non-zero (default: 3)
 MAX_RETRIES=5
 
 # Per-agent model overrides (defaults shown below)
 # WORKER_MODEL="claude-sonnet-4-6"             # coding worker — well-specified tasks
-# REVIEWER_MODEL="claude-sonnet-4-6"           # intermittent code reviewer (per-bead)
+# REVIEWER_MODEL="claude-sonnet-4-6"           # intermittent code reviewer (per-ticket)
 # FINAL_REVIEW_MODEL="claude-opus-4-6"         # parallel final review personas (post-loop)
 # COMMIT_MODEL="claude-haiku-4-5-20251001"     # commit agent — trivial mechanical task
 # LEAD_MODEL="claude-opus-4-6"                 # lead agent — plan decomposition
@@ -171,18 +170,18 @@ MAX_RETRIES=5
 # Force ALL agents to a single model (overrides per-agent settings above)
 # MODEL="claude-sonnet-4-6"
 
-# Filter beads by issue_type (default: "" = all types)
+# Filter tickets by issue_type (default: "" = all types)
 FILTER_TYPE="feature"
 
-# Only process beads with priority <= this value (default: "" = all priorities)
+# Only process tickets with priority <= this value (default: "" = all priorities)
 # 0=critical, 1=high, 2=medium, 3=low, 4=backlog
 FILTER_PRIORITY=2
 
-# Only process beads owned by this name (default: "" = all owners)
+# Only process tickets owned by this name (default: "" = all owners)
 FILTER_OWNER="bitbeckers"
 
-# Filter beads by label (default: "" = all labels)
-FILTER_LABEL=""
+# Filter tickets by tag (default: "" = all tags)
+FILTER_TAG=""
 
 # Post-loop test command (default: "" = no test gate)
 # TEST_CMD="npm test"
@@ -214,7 +213,7 @@ fi
 2. `.ralphrc` values
 3. Built-in defaults
 
-> **Note:** `BEAD_IDS`, `EXPLICIT_MODE`, `RESPECT_DEPS`, and `PLAN_FILE` are not settable via `.ralphrc` — they only make sense as CLI arguments.
+> **Note:** `TICKET_IDS`, `EXPLICIT_MODE`, `RESPECT_DEPS`, and `PLAN_FILE` are not settable via `.ralphrc` — they only make sense as CLI arguments.
 
 ### `.ralph-rules.md`
 
@@ -226,7 +225,7 @@ Example `.ralph-rules.md`:
 
 ```markdown
 - Always run `pnpm test` after making changes to verify nothing is broken.
-- This project uses a monorepo. Check which package a bead belongs to before editing files.
+- This project uses a monorepo. Check which package a ticket belongs to before editing files.
 - Do NOT modify files in `packages/shared/` — those require a separate review process.
 - When adding new API endpoints, also add an integration test in `tests/api/`.
 - Use the `logger` util from `src/lib/logger.ts` instead of console.log.
@@ -249,7 +248,7 @@ prompts/
   spec-review.md               # Spec validation (--from-plan)
   worker.md                    # Main coding agent
   commit.md                    # Commit agent
-  review.md                    # Per-bead reviewer
+  review.md                    # Per-ticket reviewer
   final-review-security.md     # Final review: security persona
   final-review-integration.md  # Final review: integration persona
   final-review-patterns.md     # Final review: codebase patterns persona
@@ -265,7 +264,7 @@ Templates use `${VAR_NAME}` placeholders (UPPER_SNAKE_CASE) and optional `{{#IF 
 You are a coding agent working on a single task.
 
 - If blocked, file a blocker:
-    NEW_ID=$(bd create "Blocker: <description>" -t bug -p 1 ${BEAD_LABELS} --silent)
+    NEW_ID=$(vima create "Blocker: <description>" -t bug -p 1 ${TICKET_TAGS} --silent)
 {{#IF PROJECT_RULES}}
 
 ## Project Rules
@@ -273,10 +272,10 @@ ${PROJECT_RULES}
 {{/IF PROJECT_RULES}}
 
 ## Task
-${BEAD_DETAILS}
+${TICKET_DETAILS}
 ```
 
-Variable substitution is handled by `envsubst` with an explicit variable list — only named variables are replaced. Literal `$` in agent instructions (like `$(bd create ...)`) are left untouched. No `eval` is used.
+Variable substitution is handled by `envsubst` with an explicit variable list — only named variables are replaced. Literal `$` in agent instructions (like `$(vima create ...)`) are left untouched. No `eval` is used.
 
 ### Customizing prompts
 
@@ -287,12 +286,12 @@ Override `PROMPTS_DIR` to point to a custom directory:
 PROMPTS_DIR="/path/to/my/prompts"
 ```
 
-Or edit the files in `prompts/` directly. Each call site in `ralph-bd` exports only the variables that template needs, scoped in a subshell:
+Or edit the files in `prompts/` directly. Each call site in `ralph` exports only the variables that template needs, scoped in a subshell:
 
 ```bash
 claude_as "$COMMIT_MODEL" -p "$(
-  export BEAD_ID="$bead_id"
-  render_prompt "$PROMPTS_DIR/commit.md" BEAD_ID
+  export TICKET_ID="$ticket_id"
+  render_prompt "$PROMPTS_DIR/commit.md" TICKET_ID
 )"
 ```
 
@@ -302,9 +301,9 @@ All output goes to `.ralph-logs/` (configurable via `LOG_DIR`):
 
 | File | Contents |
 |------|----------|
-| `iter-<N>-<bead-id>.log` | Full Claude Code output for the worker agent |
-| `iter-<N>-<bead-id>-commit.log` | Commit agent output |
-| `iter-<N>-<bead-id>-review.log` | Reviewer agent output |
+| `iter-<N>-<ticket-id>.log` | Full Claude Code output for the worker agent |
+| `iter-<N>-<ticket-id>-commit.log` | Commit agent output |
+| `iter-<N>-<ticket-id>-review.log` | Reviewer agent output |
 | `lead-<HHMMSS>.log` | Lead agent output (`--from-plan` only) |
 | `spec-review-<HHMMSS>.log` | Spec reviewer output (`--from-plan` only) |
 | `test-gate-<HHMMSS>.log` | Test gate output (`--test-cmd` only) |
@@ -312,7 +311,7 @@ All output goes to `.ralph-logs/` (configurable via `LOG_DIR`):
 | `final-review-integration-<HHMMSS>.log` | Integration reviewer output |
 | `final-review-patterns-<HHMMSS>.log` | Codebase patterns reviewer output |
 | `final-review-plan-<HHMMSS>.log` | Plan adherence reviewer output (when plan context exists) |
-| `.skipped` | Bead IDs that failed after all retries |
+| `.skipped` | Ticket IDs that failed after all retries |
 | `summary-<date>.md` | Post-run summary (generated by a final Claude instance) |
 
 Add `.ralph-logs` to your `.gitignore`:
@@ -358,7 +357,7 @@ Each agent type has a default model matched to its cognitive demand:
 | Spec reviewer | opus | Catches ambiguity and missing context in task specs |
 | Worker | sonnet | Tasks are well-specified with file paths and acceptance criteria — Sonnet's sweet spot |
 | Commit | haiku | Mechanical: stage files, read diff, write message |
-| Reviewer | sonnet | Per-bead check with cumulative diff context — good enough for quick checks |
+| Reviewer | sonnet | Per-ticket check with cumulative diff context — good enough for quick checks |
 | Final review | opus | 3-4 parallel personas (Security, Integration, Patterns, Plan Adherence) after all work is done |
 | Summary | haiku | Reading logs and writing a debrief |
 
@@ -368,8 +367,8 @@ The Ralph Loop design deliberately front-loads reasoning (lead + spec review pro
 
 ## Tips
 
-- **Start small.** Run with `--beads` on 1-2 beads first to verify the setup works before letting it loose on `bd ready`.
-- **Write detailed bead specs.** Each Claude instance starts from scratch. The bead description is all it has. The more context in the bead, the better the output.
+- **Start small.** Run with `--tickets` on 1-2 tickets first to verify the setup works before letting it loose on `vima ready`.
+- **Write detailed ticket specs.** Each Claude instance starts from scratch. The ticket description is all it has. The more context in the ticket, the better the output.
 - **Use `.ralph-rules.md` for guardrails.** If agents keep doing something you don't want (skipping tests, editing the wrong files), add a rule.
-- **Check the logs.** If a bead fails or the commit looks wrong, the answer is in `.ralph-logs/`.
+- **Check the logs.** If a ticket fails or the commit looks wrong, the answer is in `.ralph-logs/`.
 - **Commit conventions are automatic.** Put your preferred commit format in `AGENTS.md` and the commit agent will follow it. No need to configure ralph.

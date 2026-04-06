@@ -160,7 +160,7 @@ Once aligned on approach:
 After structure approval:
 
 1. **Write the plan** to `PLAN.md` in the project root.
-   This is the standard location that `ralph-plan` and `ralph-bd --from-plan` expect.
+   This is the standard location that `ralph-plan` and `ralph --from-plan` expect.
 
 2. **Use this template structure**:
 

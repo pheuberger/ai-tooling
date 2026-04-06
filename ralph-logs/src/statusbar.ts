@@ -49,8 +49,8 @@ export function createStatusBar(parentBox: any, palette: TerminalPalette): {
     const parts: string[] = []
 
     // 1. File identity
-    if (file.beadId) {
-      parts.push(`${file.beadId} ${file.agentType}`)
+    if (file.ticketId) {
+      parts.push(`${file.ticketId} ${file.agentType}`)
     } else {
       parts.push(file.agentType)
     }

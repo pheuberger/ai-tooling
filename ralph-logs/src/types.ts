@@ -22,7 +22,7 @@ export type LogFile = {
   agentType: AgentType | string
   format: FileFormat
   groupKey: string
-  beadId?: string
+  ticketId?: string
   iterationNumber?: number
   displayLabel: string
 }

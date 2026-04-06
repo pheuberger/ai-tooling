@@ -7,7 +7,7 @@ Write a concise run summary to stdout. Start with a line: "Generated: ${GENERATE
 Then include these sections:
 
 ## Completed
-One-line per bead: what was done.
+One-line per ticket: what was done.
 
 ## Learnings & Surprises
 Extract anything from the agents' "## Learnings" sections (or from the body
@@ -16,7 +16,7 @@ dependency quirks, code structure that differed from expectations.
 Group related items. Skip anything that was "None — task matched spec."
 
 ## Skipped / Failed
-List any beads that failed (if the skip file at ${SKIP_FILE} is non-empty,
+List any tickets that failed (if the skip file at ${SKIP_FILE} is non-empty,
 read it). Briefly note what went wrong if visible in the logs.
 
 Keep it tight — this is a debrief, not a novel.

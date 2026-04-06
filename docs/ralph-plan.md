@@ -146,7 +146,7 @@ A per-partner timeout (default 300s) prevents hangs. Partners that fail or time 
 
 ## Configuration via `.ralphrc`
 
-ralph-plan reads from `.ralphrc` just like ralph-bd. Plan-specific variables use the `PLAN_REVIEW_` prefix:
+ralph-plan reads from `.ralphrc` just like ralph. Plan-specific variables use the `PLAN_REVIEW_` prefix:
 
 ```bash
 # .ralphrc — ralph-plan configuration
@@ -211,4 +211,4 @@ If you stop a run (or want to answer questions and continue), use `--resume-from
 | `jq` | JSON processing |
 | `envsubst` | Template variable substitution (part of `gettext`) |
 
-Note: `bd` and `git` are NOT required for ralph-plan (unlike ralph-bd). ralph-plan only refines plan documents.
+Note: `vima` and `git` are NOT required for ralph-plan (unlike ralph). ralph-plan only refines plan documents.

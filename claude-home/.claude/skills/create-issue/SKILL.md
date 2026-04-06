@@ -101,7 +101,7 @@ After creation, offer:
 - **Don't start working on it** — The whole point is to defer this to stay focused on current scope.
 - **Always link context** — Note what you were working on when this emerged.
 - **Default to medium priority** — Unless the user explicitly says urgent/high.
-- **Don't create beads** — This creates a Linear issue only. Beads come later via `/start-issue`.
+- **Don't create tickets** — This creates a Linear issue only. Tickets come later via `/start-issue`.
 
 ## Examples
 
