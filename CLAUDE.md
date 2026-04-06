@@ -14,7 +14,8 @@ Runtime deps: `claude`, `vima`, `jq`, `git`
 - **Integrated loop** — each iteration: worker → commit → reviewer → close (or release if blocked)
 - **File-forward reviews** — reviewer files "Fix:" tickets instead of blocking; they appear in `vima ready` next iteration
 - **`--from-plan` mode** — lead agent decomposes plan into tag-grouped tickets, spec reviewer validates, then the worker loop runs
-- **Per-agent model selection** — each agent type (lead, spec, worker, commit, reviewer, summary) has its own model default; `--model` overrides all; `claude_as()` helper dispatches
+- **`--triage` mode** — evaluates open tickets before the worker loop; auto-refines underspecified ones, defers those needing human input (tagged `needs-input`), writes a report for deferred tickets. `--triage-only` stops after triage.
+- **Per-agent model selection** — each agent type (lead, spec, worker, commit, reviewer, triage, summary) has its own model default; `--model` overrides all; `claude_as()` helper dispatches
 - **Separate commit agent** — second Claude instance stages/commits with `(ticket-id)` in message
 - **Untracked file safety** — shelves untracked files before loop, restores after
 - **Config precedence**: CLI flags > `.ralphrc` (sourced as bash) > built-in defaults
