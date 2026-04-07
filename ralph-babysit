@@ -201,7 +201,7 @@ short_model() { echo "$1" | sed 's/^claude-//; s/-[0-9].*//'; }
 # Setup logging
 mkdir -p "$LOG_DIR"
 PROCESSED_FILE="$LOG_DIR/.processed-comments"
-touch "$PROCESSED_FILE"
+: > "$PROCESSED_FILE"  # reset each run — only skip threads within a single session
 
 # Load project rules
 project_rules=""
@@ -878,6 +878,48 @@ while true; do
 
   if [[ "$group_count" -gt 0 ]]; then
 
+  # --- Coverage check: ensure every input thread appears in triage output ---
+  # Extract all thread IDs from input
+  input_thread_ids=$(echo "$threads_json" | jq -r '.[].id')
+  # Extract all thread IDs covered by triage groups
+  covered_thread_ids=$(echo "$triage_json" | jq -r '.[].threads[]?.thread_id')
+
+  uncovered_threads=""
+  for tid in $input_thread_ids; do
+    if ! echo "$covered_thread_ids" | grep -qxF "$tid"; then
+      uncovered_threads+="$tid "
+    fi
+  done
+
+  if [[ -n "${uncovered_threads% }" ]]; then
+    uncovered_count=$(echo "$uncovered_threads" | wc -w)
+    out "${C_YELLOW}!${C_RESET}" "$uncovered_count thread(s) missed by triage — adding as fix groups"
+
+    for tid in $uncovered_threads; do
+      # Reconstruct thread info from input JSON
+      thread_data=$(echo "$threads_json" | jq -c --arg id "$tid" '.[] | select(.id == $id)')
+      [[ -z "$thread_data" ]] && continue
+
+      t_path=$(echo "$thread_data" | jq -r '.comments.nodes[0].path // ""')
+      t_line=$(echo "$thread_data" | jq -r '.comments.nodes[0].line // 0')
+      t_body=$(echo "$thread_data" | jq -r '.comments.nodes[0].body // "" | .[0:120]')
+      t_cid=$(get_comment_id "$thread_data")
+
+      triage_json=$(echo "$triage_json" | jq -c --arg tid "$tid" --arg cid "$t_cid" \
+        --arg path "$t_path" --arg line "$t_line" --arg body "$t_body" \
+        '. + [{
+          "group_id": "fix-uncovered-\($tid | .[0:8])",
+          "action": "fix",
+          "threads": [{"thread_id": $tid, "comment_id": ($cid | tonumber? // 0), "path": $path, "line": ($line | tonumber? // 0), "summary": $body}],
+          "fix_description": $body,
+          "files": [$path],
+          "reason": "Thread missed by triage — defaulting to fix (human reviewer benefit-of-the-doubt)"
+        }]')
+    done
+
+    group_count=$(echo "$triage_json" | jq 'length')
+  fi
+
   # Count by action
   fix_count=$(echo "$triage_json" | jq '[.[] | select(.action == "fix")] | length')
   defer_count=$(echo "$triage_json" | jq '[.[] | select(.action == "defer")] | length')
@@ -1048,8 +1090,7 @@ Output the issue identifier on the last line, prefixed with ISSUE_ID:. Example: 
         echo "• <${comment_permalink}|\`$path:$line\`> — answered" >> "$sum_questions"
         notify "question" "Answered: $path:$line — <${comment_permalink}|view comment>"
       else
-        # Cannot answer — leave unresolved, notify
-        mark_processed "$tid"
+        # Cannot answer — leave unresolved for next cycle, notify
         echo "• <${comment_permalink}|\`$path:$line\`> — ⚠️ needs human attention" >> "$sum_questions"
         notify "question" "⚠️ Needs human attention: $reason — $path:$line — <${comment_permalink}|view comment>"
       fi
