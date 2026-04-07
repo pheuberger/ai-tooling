@@ -40,22 +40,37 @@ Assign each thread to exactly one category:
 | Action | When | Thread resolved? | Linear issue? |
 |--------|------|-------------------|---------------|
 | **fix** | Concrete, actionable code change. The comment is correct. | Yes (after fix + reply) | No |
-| **defer** | Architectural concern, out of PR scope, requires broader changes | Yes (after reply with issue link) | Yes |
+| **defer** | Large architectural concern that genuinely cannot be addressed in this PR | Yes (after reply with issue link) | Yes |
 | **question** | Reviewer is asking a question, not requesting a change | Only if you can answer with 100% confidence | No |
-| **drop** | Comment is factually wrong, outdated, or already addressed | Yes (after reply with explanation) | No |
+| **drop** | Comment is factually wrong, outdated, already addressed, or acknowledged by author | Yes (after reply with explanation) | No |
+
+### Defer sparingly
+
+**Defer is expensive** — it creates a Linear ticket that someone must triage and prioritize later. Most deferred tickets become noise. Use defer ONLY when ALL of these are true:
+- The change is genuinely architectural / cross-cutting (spans many files or modules)
+- It cannot reasonably be done within this PR without risk
+- It is NOT a small improvement, naming suggestion, or "nice to have"
+
+If in doubt between fix and defer: **fix it**. Small improvements are cheaper to fix now than to track as tickets.
+If in doubt between defer and drop: **drop it** with a clear explanation.
+
+### Thumbsup reactions = agreed
+
+Check the `reactionGroups` field on each comment. If a comment has a THUMBS_UP reaction, the PR author agrees with the reviewer's feedback. **Always categorize these as "fix"** — the author has confirmed the comment is valid and wants it addressed.
 
 ## Step 4 — Group related threads
 
-If multiple threads point to the same underlying fix (e.g., "add null check" in 3 places), group them into a single fix group. Each group gets one worker invocation.
+Group aggressively to minimize the number of output items:
 
-## Neutrality Rules
+- **Fix groups:** If multiple threads point to the same underlying fix (e.g., "add null check" in 3 places), group them into a single fix group. Each group gets one worker invocation.
+- **Defer groups:** Group related defers into as few groups as possible. If all deferred items are thematically related (e.g., "error handling improvements"), combine them into a single defer group. Only split into separate defer groups when the items are genuinely unrelated and would make a confusing single ticket. Fewer Linear tickets is always better.
 
-You MUST be neutral and objective:
-- **Do NOT be skeptical of agent/bot comments by default.** Analyze every comment on its own merits.
-- **Do NOT give human comments more weight by default.** Humans can be wrong too.
+## Reviewer trust
+
+- **Human reviewers get the benefit of the doubt.** They often have context you don't — team conventions, past incidents, deployment constraints. Only "drop" a human comment if it's obviously wrong or clearly outdated. When unsure, lean toward "fix" or "question" rather than "drop."
+- **Agent/bot reviewers get less benefit of the doubt.** Evaluate their comments strictly on technical merit. Drop confidently if the suggestion is wrong or unhelpful.
 - **Thoroughly read the actual code** referenced by every comment before making a judgment.
-- The only thing that matters: is the comment correct and does the change improve the code?
-- When genuinely unsure about context the reviewer might have, categorize as "question" or "defer" — not "drop."
+- The primary question: is the comment correct and does the change improve the code?
 
 ## Output
 

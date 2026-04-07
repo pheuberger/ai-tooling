@@ -269,6 +269,10 @@ query($owner: String!, $repo: String!, $pr: Int!) {
               line
               createdAt
               url
+              reactionGroups {
+                content
+                users(first: 5) { nodes { login } }
+              }
             }
           }
         }
@@ -577,7 +581,7 @@ defer_comment_group() {
 
   # Extract issue ID from output
   local issue_id
-  issue_id=$(grep -oP 'ISSUE_ID:\s*\K\S+' "$defer_log" | tail -1)
+  issue_id=$(grep -oP 'ISSUE_ID:\s*\K\S+' "$defer_log" | tail -1 | tr -d '`')
   if [[ -n "$issue_id" ]]; then
     out "${C_GREEN}✓${C_RESET}" "created $issue_id" >&2
     echo "$issue_id"
@@ -961,16 +965,16 @@ while true; do
     notify "error" "Fix failed — no changes pushed"
   fi
 
-  # --- Process DEFER groups (grouped under one parent issue) ---
+  # --- Process DEFER groups ---
   defer_groups=$(echo "$triage_json" | jq -c '[.[] | select(.action == "defer")]')
   defer_len=$(echo "$defer_groups" | jq 'length')
   parent_issue_id=""
 
-  # Create parent issue if there are defer groups
-  if [[ "$defer_len" -gt 0 && -n "$LINEAR_TEAM" ]]; then
+  # Strategy: 1 defer group → single issue, 2+ → parent + sub-issues
+  if [[ "$defer_len" -gt 1 && -n "$LINEAR_TEAM" ]]; then
     echo ""
-    phase_hdr "$C_MAGENTA" "Defer — creating parent issue"
-    local parent_log="$LOG_DIR/defer-parent-$(date '+%H%M%S').log"
+    phase_hdr "$C_MAGENTA" "Defer — creating parent issue ($defer_len sub-issues)"
+    parent_log="$LOG_DIR/defer-parent-$(date '+%H%M%S').log"
     parent_issue_id=$(claude_as "$DEFER_MODEL" -p "Create a Linear issue using mcp__linear__save_issue with:
 - title: \"Review feedback: PR #${PR_NUMBER} — ${PR_TITLE}\"
 - description: \"Aggregated review feedback from ${PR_URL}. ${defer_len} item(s) deferred from this PR.\"
@@ -978,7 +982,7 @@ while true; do
 - priority: 3
 
 Output the issue identifier on the last line, prefixed with ISSUE_ID:. Example: ISSUE_ID: ENG-456" 2>"$parent_log" \
-      | grep -oP 'ISSUE_ID:\s*\K\S+' | tail -1) || true
+      | grep -oP 'ISSUE_ID:\s*\K\S+' | tail -1 | tr -d '`') || true
     extract_cost "defer" "$parent_log"
 
     if [[ -n "$parent_issue_id" ]]; then
@@ -1037,7 +1041,7 @@ Output the issue identifier on the last line, prefixed with ISSUE_ID:. Example: 
       path=$(echo "$thread" | jq -r '.path // ""')
       line=$(echo "$thread" | jq -r '.line // ""')
 
-      local comment_permalink="${PR_URL}#discussion_r${cid}"
+      comment_permalink="${PR_URL}#discussion_r${cid}"
       if [[ -n "$answer" ]]; then
         reply_to_thread "$cid" "$answer"
         mark_processed "$tid"
