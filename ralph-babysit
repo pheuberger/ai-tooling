@@ -396,11 +396,12 @@ triage_comments() {
   out "${C_GREEN}✓${C_RESET}" "${C_DIM}$(fmt_duration "$dur") · \$$(fmt_cost "$cost")${C_RESET}" >&2
 
   # Extract the JSON array from the assistant's text output
+  # Use jq -s 'last' to handle cases where Claude outputs multiple JSON blocks
   jq -r 'select(.type == "assistant") | .message.content[]? | select(.type == "text") | .text' \
     "$triage_log" 2>/dev/null \
     | grep -v '^$' \
     | sed -n '/^\[/,/^\]/p' \
-    | jq '.' 2>/dev/null || echo "[]"
+    | jq -s 'last' 2>/dev/null || echo "[]"
 }
 
 # Fix a group of comments
