@@ -13,15 +13,17 @@
 #   --max-cycles N       Max polling cycles, 0 = infinite (default: 0)
 #   --model MODEL        Force all agents to this model
 #   --once               Single cycle, then exit
-#   --test-cmd CMD       Run CMD as pre-commit test gate; retries worker on failure
+#   --quality-gate CMD   Run CMD after each fix; distill failures and retry worker
+#   --test-cmd CMD       Alias for --quality-gate (backward compat)
 #   --dry-run            Triage only, no fixes or pushes
 #   -h, --help           Show this help
 #
 # Configuration (.ralphrc):
 #   BABYSIT_INTERVAL, BABYSIT_MAX_CYCLES, BABYSIT_MAX_RETRIES,
-#   BABYSIT_LINEAR_TEAM, BABYSIT_TEST_CMD, TRIAGE_MODEL,
-#   BABYSIT_WORKER_MODEL, BABYSIT_COMMIT_MODEL, BABYSIT_CI_MODEL,
-#   DEFER_MODEL, BABYSIT_MAX_CI_CYCLES, BABYSIT_CI_TIMEOUT,
+#   BABYSIT_LINEAR_TEAM, BABYSIT_QUALITY_GATE (or BABYSIT_TEST_CMD),
+#   TRIAGE_MODEL, BABYSIT_WORKER_MODEL, BABYSIT_COMMIT_MODEL,
+#   BABYSIT_CI_MODEL, BABYSIT_GATE_MODEL, DEFER_MODEL,
+#   BABYSIT_MAX_CI_CYCLES, BABYSIT_CI_TIMEOUT,
 #   NOTIFY_TELEGRAM_TOKEN, NOTIFY_TELEGRAM_CHAT_ID, NOTIFY_SLACK_WEBHOOK
 #
 # Requires: claude (Claude Code CLI), gh (GitHub CLI), jq, git
@@ -98,6 +100,7 @@ TRIAGE_MODEL=""           # triage agent — default: opus
 BABYSIT_WORKER_MODEL=""   # fix worker — default: sonnet
 BABYSIT_COMMIT_MODEL=""   # commit agent — default: haiku
 BABYSIT_CI_MODEL=""       # CI fix worker — default: sonnet
+BABYSIT_GATE_MODEL=""     # gate distillation agent — default: haiku
 DEFER_MODEL=""            # defer agent (Linear issue) — default: sonnet
 DRY_RUN=false
 ONCE=false
@@ -126,7 +129,7 @@ MAX_RETRIES="${BABYSIT_MAX_RETRIES:-${PR_WATCH_MAX_RETRIES:-$MAX_RETRIES}}"
 LINEAR_TEAM="${BABYSIT_LINEAR_TEAM:-${PR_WATCH_LINEAR_TEAM:-$LINEAR_TEAM}}"
 MAX_CI_CYCLES="${BABYSIT_MAX_CI_CYCLES:-$MAX_CI_CYCLES}"
 CI_TIMEOUT="${BABYSIT_CI_TIMEOUT:-$CI_TIMEOUT}"
-TEST_CMD="${BABYSIT_TEST_CMD:-$TEST_CMD}"
+TEST_CMD="${BABYSIT_QUALITY_GATE:-${BABYSIT_TEST_CMD:-$TEST_CMD}}"
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -135,6 +138,7 @@ while [[ $# -gt 0 ]]; do
     --interval)     INTERVAL="$2"; shift 2 ;;
     --max-cycles)   MAX_CYCLES="$2"; shift 2 ;;
     --model)        MODEL="$2"; shift 2 ;;
+    --quality-gate) TEST_CMD="$2"; shift 2 ;;
     --test-cmd)     TEST_CMD="$2"; shift 2 ;;
     --once)         ONCE=true; MAX_CYCLES=1; shift ;;
     --dry-run)      DRY_RUN=true; shift ;;
@@ -187,6 +191,7 @@ BABYSIT_WORKER_MODEL="${MODEL:-${BABYSIT_WORKER_MODEL:-${BABYSIT_WORKER_MODEL:-c
 BABYSIT_COMMIT_MODEL="${MODEL:-${BABYSIT_COMMIT_MODEL:-${BABYSIT_COMMIT_MODEL:-claude-haiku-4-5-20251001}}}"
 BABYSIT_CI_MODEL="${MODEL:-${BABYSIT_CI_MODEL:-claude-sonnet-4-6}}"
 DEFER_MODEL="${MODEL:-${DEFER_MODEL:-claude-sonnet-4-6}}"
+BABYSIT_GATE_MODEL="${MODEL:-${BABYSIT_GATE_MODEL:-claude-haiku-4-5-20251001}}"
 
 # Common claude flags
 claude_flags=(--print --dangerously-skip-permissions)
@@ -220,6 +225,38 @@ extract_cost() {
 
 extract_result() {
   jq -r 'select(.type == "result") | "\(.duration_ms // 0) \(.total_cost_usd // 0)"' "$1" 2>/dev/null | tail -1
+}
+
+# Distill quality gate failure output through Claude for concise feedback
+distill_gate_output() {
+  local gate_log_file="$1" test_cmd="$2" attempt="$3"
+  local distill_log="$LOG_DIR/gate-distill-$(date '+%H%M%S').log"
+
+  # Cap input to last 500 lines to keep haiku context manageable
+  local test_output
+  test_output=$(tail -500 "$gate_log_file")
+
+  phase_hdr "$C_DIM" "Distilling gate output — $(short_model "$BABYSIT_GATE_MODEL")"
+
+  export TEST_CMD="$test_cmd" TEST_OUTPUT="$test_output" ATTEMPT="$attempt"
+  claude_as "$BABYSIT_GATE_MODEL" --output-format stream-json --verbose -p "$(
+    render_prompt "$PROMPTS_DIR/babysit-gate-distill.md" \
+      TEST_CMD TEST_OUTPUT ATTEMPT
+  )" 2>&1 | tee "$distill_log" | ralph_stream_filter > /dev/null || true
+
+  extract_cost "gate-distill" "$distill_log"
+
+  local distilled
+  distilled=$(jq -r 'select(.type == "assistant") | .message.content[]? | select(.type == "text") | .text' "$distill_log" 2>/dev/null | tail -1)
+
+  if [[ -n "$distilled" ]]; then
+    out "${C_GREEN}✓${C_RESET}" "distilled"
+    echo "$distilled"
+  else
+    # Fallback: if distillation fails, return truncated raw output
+    out "${C_YELLOW}⚠${C_RESET}" "distillation failed, using raw output"
+    tail -40 "$gate_log_file"
+  fi
 }
 
 # Stream filter — same as ralph
@@ -454,36 +491,44 @@ fix_comment_group() {
         return 1
       fi
 
-      # --- Pre-commit test gate ---
+      # --- Quality gate ---
       if [[ -n "$TEST_CMD" ]]; then
         echo ""
-        phase_hdr "$C_CYAN" "Test gate"
-        local test_gate_log="$LOG_DIR/test-${group_id}-${retries}.log"
+        phase_hdr "$C_CYAN" "Quality gate"
+        local test_gate_log="$LOG_DIR/gate-${group_id}-${retries}.log"
         if eval "$TEST_CMD" > "$test_gate_log" 2>&1; then
           out "${C_GREEN}✓${C_RESET}" "passed"
         else
           out "${C_RED}✗${C_RESET}" "failed"
           retries=$((retries + 1))
           if [[ $retries -lt $MAX_RETRIES ]]; then
-            local test_snippet
-            test_snippet=$(tail -80 "$test_gate_log")
-            cat >> "$prompt_file" <<TESTFAIL
+            # Distill the failure output and rebuild prompt from scratch
+            local distilled
+            distilled=$(distill_gate_output "$test_gate_log" "$TEST_CMD" "$retries")
 
-## Test Failures (attempt $retries)
+            # Fresh prompt — original task + distilled feedback only
+            export PR_NUMBER PR_TITLE PR_BASE REPO_FULL
+            export FIX_DESCRIPTION="$fix_desc" THREADS_JSON="$threads_json"
+            export PROJECT_RULES="$project_rules"
+            render_prompt "$PROMPTS_DIR/babysit-worker.md" \
+              PR_NUMBER PR_TITLE PR_BASE REPO_FULL FIX_DESCRIPTION THREADS_JSON PROJECT_RULES \
+              > "$prompt_file"
+            cat >> "$prompt_file" <<GATEFAIL
 
-Your previous changes cause test/typecheck failures. You MUST fix these.
+## Quality Gate Failure (attempt $retries of $MAX_RETRIES)
 
-Command: $TEST_CMD
-Output (last 80 lines):
-\`\`\`
-$test_snippet
-\`\`\`
-TESTFAIL
-            out "${C_YELLOW}↻${C_RESET}" "retrying worker with test output..."
+Your previous changes caused the quality gate to fail. You MUST fix these issues.
+
+**Command:** \`$TEST_CMD\`
+
+**Analysis of failures:**
+$distilled
+GATEFAIL
+            out "${C_YELLOW}↻${C_RESET}" "retrying worker with distilled feedback..."
             sleep 2
             continue
           fi
-          # Exhausted retries on test failure
+          # Exhausted retries on gate failure
           rm -f "$prompt_file"
           return 1
         fi
@@ -534,25 +579,14 @@ commit_changes() {
   return 0
 }
 
-# Push with rebase-retry on conflict
+# Push local branch (force — local state is authoritative)
 push_changes() {
-  local push_retries=0
-  while [[ $push_retries -lt 3 ]]; do
-    if git push 2>/dev/null; then
-      out "${C_GREEN}✓${C_RESET}" "pushed"
-      return 0
-    fi
-    push_retries=$((push_retries + 1))
-    detail "push conflict — pulling and retrying ($push_retries/3)"
-    if ! git pull --rebase 2>/dev/null; then
-      out "${C_RED}✗${C_RESET}" "rebase conflict on push — aborting"
-      git rebase --abort 2>/dev/null || true
-      notify "error" "Push failed — rebase conflict"
-      return 1
-    fi
-  done
-
-  out "${C_RED}✗${C_RESET}" "push failed after retries"
+  if git push --force-with-lease 2>/dev/null; then
+    out "${C_GREEN}✓${C_RESET}" "pushed"
+    return 0
+  fi
+  out "${C_YELLOW}⚠${C_RESET}" "push rejected — remote was updated since last fetch, needs manual review"
+  notify "error" "Push rejected (force-with-lease) — someone else pushed, needs manual review"
   return 1
 }
 
@@ -797,7 +831,7 @@ section "Babysit"
 detail "PR #$PR_NUMBER — $PR_TITLE"
 detail "repo: $REPO_FULL  branch: $PR_HEAD  base: $PR_BASE"
 detail "interval: ${INTERVAL}s  max-cycles: ${MAX_CYCLES:-∞}  ci-cycles: $MAX_CI_CYCLES  ci-timeout: ${CI_TIMEOUT}s"
-[[ -n "$TEST_CMD" ]]         && detail "test-cmd: $TEST_CMD"
+[[ -n "$TEST_CMD" ]]         && detail "quality-gate: $TEST_CMD"
 [[ -f ".ralphrc" ]]          && detail ".ralphrc loaded"
 [[ -f "$RALPH_RULES_FILE" ]] && detail "$RALPH_RULES_FILE loaded"
 [[ "$DRY_RUN" == true ]]     && detail "DRY RUN — triage only, no fixes"
@@ -807,7 +841,7 @@ detail "interval: ${INTERVAL}s  max-cycles: ${MAX_CYCLES:-∞}  ci-cycles: $MAX_
 if [[ -n "$MODEL" ]]; then
   detail "model (all): $(short_model "$MODEL")"
 else
-  detail "models: triage=$(short_model "$TRIAGE_MODEL")  worker=$(short_model "$BABYSIT_WORKER_MODEL")  commit=$(short_model "$BABYSIT_COMMIT_MODEL")  ci=$(short_model "$BABYSIT_CI_MODEL")  defer=$(short_model "$DEFER_MODEL")"
+  detail "models: triage=$(short_model "$TRIAGE_MODEL")  worker=$(short_model "$BABYSIT_WORKER_MODEL")  commit=$(short_model "$BABYSIT_COMMIT_MODEL")  ci=$(short_model "$BABYSIT_CI_MODEL")  defer=$(short_model "$DEFER_MODEL")  gate=$(short_model "$BABYSIT_GATE_MODEL")"
 fi
 
 has_notifications=false
@@ -837,17 +871,9 @@ while true; do
 
   section "Cycle $cycle"
 
-  # Pull latest changes
-  log_ts "pulling latest..."
-  if ! git pull --rebase 2>/dev/null; then
-    out "${C_RED}✗${C_RESET}" "rebase conflict on pull"
-    git rebase --abort 2>/dev/null || true
-    notify "error" "Rebase conflict on pull — skipping cycle $cycle"
-    if [[ $MAX_CYCLES -eq 1 ]]; then break; fi
-    log_ts "sleeping ${INTERVAL}s..."
-    sleep "$INTERVAL"
-    continue
-  fi
+  # Fetch remote (but don't merge — local state is authoritative)
+  log_ts "fetching remote..."
+  git fetch origin 2>/dev/null || true
 
   # Fetch unresolved threads
   log_ts "fetching unresolved threads..."
@@ -996,9 +1022,8 @@ while true; do
         fi
       done
     else
-      out "${C_RED}✗${C_RESET}" "push failed — resetting local commits"
-      git reset --hard "$pre_fix_sha" 2>/dev/null || true
-      notify "error" "Push failed after fixes — all changes reverted"
+      out "${C_RED}✗${C_RESET}" "push rejected — stopping babysit"
+      break 2  # exit main loop
     fi
   elif [[ "$all_fixes_passed" == false ]]; then
     if [[ "$(git rev-parse HEAD)" != "$pre_fix_sha" ]]; then
@@ -1188,8 +1213,8 @@ Output the issue identifier on the last line, prefixed with ISSUE_ID:. Example: 
     echo ""
     phase_hdr "$C_GREEN" "Push ($ci_fixed_this_round CI fix commit(s))"
     if ! push_changes; then
-      notify "error" "Push failed after CI fixes"
-      break
+      out "${C_RED}✗${C_RESET}" "push rejected — stopping babysit"
+      break 2  # exit main loop
     fi
     out "${C_GREEN}✓${C_RESET}" "fixed $ci_fixed_this_round check(s) this round"
   done
