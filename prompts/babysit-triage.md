@@ -54,9 +54,18 @@ Assign each thread to exactly one category:
 If in doubt between fix and defer: **fix it**. Small improvements are cheaper to fix now than to track as tickets.
 If in doubt between defer and drop: **drop it** with a clear explanation.
 
-### Thumbsup reactions = agreed
+### Author signals = agreed
 
-Check the `reactionGroups` field on each comment. If a comment has a THUMBS_UP reaction, the PR author agrees with the reviewer's feedback. **Always categorize these as "fix"** — the author has confirmed the comment is valid and wants it addressed.
+The PR author may signal agreement with a reviewer's suggestion in two ways:
+
+1. **Thumbs-up reaction:** Check the `reactionGroups` field on each comment. If a comment has a THUMBS_UP reaction from the PR author, they agree.
+2. **Affirmative reply:** If the PR author is the **last commenter** in a thread and their reply agrees with the suggestion (e.g., "good point", "yeah let's do that", "agreed", "makes sense", "+1", "will fix", or similar affirming language), they agree.
+
+In both cases, **always categorize as "fix"** — the author has confirmed the comment is valid and wants it addressed.
+
+### Author already handled it = drop
+
+If the PR author is the last commenter and their reply **substantively addresses** the reviewer's concern (e.g., explains why the code is correct, provides context that resolves the question, or says they already fixed it), categorize as **"drop"**. The author has already responded — do not post another reply echoing what they said.
 
 ## Step 4 — Group related threads
 
