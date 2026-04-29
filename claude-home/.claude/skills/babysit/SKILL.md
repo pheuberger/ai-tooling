@@ -39,13 +39,16 @@ echo "NOTIFY_SLACK_WEBHOOK=${NOTIFY_SLACK_WEBHOOK:-(not set)}"
 
 If `NOTIFY_SLACK_WEBHOOK` is not set, log a warning but continue — notifications will simply be skipped.
 
-**Step 3: Sync with remote**
+**Step 3: Check remote sync state**
 
 ```bash
-git pull --rebase
+git fetch
+LOCAL=$(git rev-parse @)
+REMOTE=$(git rev-parse @{u} 2>/dev/null || echo "")
+BASE=$(git merge-base @ @{u} 2>/dev/null || echo "")
 ```
 
-If rebase conflicts occur, abort the rebase, notify via Slack, and exit.
+**Never run `git pull` or `git pull --rebase`** — it has repeatedly caused conflicts and broken state. If `LOCAL != REMOTE` and `BASE != REMOTE` (i.e. remote has commits you don't), notify via Slack with the divergence and exit. Let the human resolve.
 
 ### 2. Handle Review Comments
 
@@ -188,11 +191,11 @@ After all review comment fixes are implemented:
 3. **Never use `--no-verify`** — if a hook fails, fix the issue
 4. Never commit planning artifacts (`PLAN*.md`, etc.) or secrets
 
-Push with retry:
+Push:
 ```bash
 git push
 ```
-If push fails, `git pull --rebase` and retry (up to 3 times). If still failing, notify via Slack and exit.
+If push fails (e.g. rejected, non-fast-forward), **do NOT pull**. Notify via Slack with the failure reason and exit. Let the human resolve remote divergence.
 
 ### 4. CI Checks
 
@@ -298,5 +301,6 @@ Notifications are **fire-and-forget** — never wait for a response.
 - **Resolve threads after action** — every thread should be resolved by the end (except escalated ones)
 - **Never block on human input** — if you can't decide, escalate via Slack and move on
 - **Never force-push** — always use regular `git push`
+- **Never `git pull`** — pulling has repeatedly caused conflicts/broken state. On remote divergence, notify via Slack and exit
 - **Never use `--no-verify`** — fix hook failures instead of bypassing them
 - **Cap CI fix cycles at 3** — don't loop forever on unfixable failures
