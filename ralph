@@ -17,7 +17,8 @@
 #   --owner NAME         Only pick tickets owned by NAME
 #   --tag TAG            Filter ready tickets by tag
 #   --from-plan FILE     Decompose a plan file into tag-grouped tasks, then work them
-#   --test-cmd CMD       Run CMD as pre-commit test gate; retries worker on failure
+#   --test-cmd CMD       After main loop, run CMD as final test gate; spawns
+#                        fix worker on failure (retries up to MAX_RETRIES)
 #   --watchdog N         Kill worker after N minutes of inactivity (default: 15)
 #   --no-watchdog        Disable the inactivity watchdog
 #   --triage            Evaluate and refine open tickets before starting work.
@@ -83,7 +84,6 @@ fmt_duration() {
   if [[ $secs -ge 60 ]]; then printf '%dm %ds' "$((secs/60))" "$((secs%60))"
   else printf '%ds' "$secs"; fi
 }
-fmt_cost() { printf '%.2f' "${1:-0}"; }
 
 # render_prompt <template_file> [VAR1 VAR2 ...]
 # Reads a markdown template, processes {{#IF VAR}}/{{/IF VAR}} conditionals,
@@ -284,9 +284,9 @@ extract_filed_tickets() {
     | while IFS= read -r title; do detail "⎿ $title"; done
 }
 
-# Extract duration_ms and total_cost_usd from a stream-json log file
+# Extract duration_ms from a stream-json log file
 extract_result() {
-  jq -r 'select(.type == "result") | "\(.duration_ms // 0) \(.total_cost_usd // 0)"' "$1" 2>/dev/null | tail -1
+  jq -r 'select(.type == "result") | "\(.duration_ms // 0)"' "$1" 2>/dev/null | tail -1
 }
 
 iteration=0
@@ -445,17 +445,6 @@ fi
 project_rules=""
 [[ -f "$RALPH_RULES_FILE" ]] && project_rules=$(<"$RALPH_RULES_FILE")
 
-# Cost tracking — associative array by agent type
-declare -A AGENT_COSTS
-extract_cost() {
-  local agent_type="$1" log_file="$2"
-  local cost
-  cost=$(jq -r 'select(.type == "result") | .total_cost_usd // 0' "$log_file" 2>/dev/null | tail -1)
-  if [[ -n "$cost" && "$cost" != "0" && "$cost" != "null" ]]; then
-    AGENT_COSTS[$agent_type]=$(echo "${AGENT_COSTS[$agent_type]:-0} + $cost" | bc 2>/dev/null || echo "${AGENT_COSTS[$agent_type]:-0}")
-  fi
-}
-
 # ---------------------------------------------------------------------------
 # --from-plan: decompose a plan file into tickets, then fall through to loop
 # ---------------------------------------------------------------------------
@@ -477,9 +466,8 @@ if [[ -n "$PLAN_FILE" ]]; then
     export PLAN_TITLE="$plan_title" PLAN_BODY="$plan_body" PLAN_TAG="$PLAN_TAG"
     render_prompt "$PROMPTS_DIR/lead.md" PLAN_TITLE PLAN_BODY PLAN_TAG
   )" || true
-  extract_cost "lead" "$lead_log"
-  read -r dur cost <<< "$(extract_result "$lead_log")"
-  out "${C_GREEN}✓${C_RESET}" "${C_DIM}$(fmt_duration "$dur") · \$$(fmt_cost "$cost")${C_RESET}"
+  read -r dur <<< "$(extract_result "$lead_log")"
+  out "${C_GREEN}✓${C_RESET}" "${C_DIM}$(fmt_duration "$dur")${C_RESET}"
 
   # --- Phase 2: Validate specs ---
   phase_hdr "$C_MAGENTA" "Spec review — $(short_model "$SPEC_MODEL")"
@@ -490,9 +478,8 @@ if [[ -n "$PLAN_FILE" ]]; then
     export CHILDREN_JSON="$children_json"
     render_prompt "$PROMPTS_DIR/spec-review.md" CHILDREN_JSON
   )" || true
-  extract_cost "spec" "$spec_log"
-  read -r dur cost <<< "$(extract_result "$spec_log")"
-  out "${C_GREEN}✓${C_RESET}" "${C_DIM}$(fmt_duration "$dur") · \$$(fmt_cost "$cost")${C_RESET}"
+  read -r dur <<< "$(extract_result "$spec_log")"
+  out "${C_GREEN}✓${C_RESET}" "${C_DIM}$(fmt_duration "$dur")${C_RESET}"
 
   # FILTER_TAG is set — fall through into the main worker+reviewer loop
 fi
@@ -525,9 +512,8 @@ if [[ "$TRIAGE" == true ]]; then
       render_prompt "$PROMPTS_DIR/triage.md" TICKETS_JSON PROJECT_RULES
     )" || true
 
-    extract_cost "triage" "$triage_log"
-    read -r dur cost <<< "$(extract_result "$triage_log")"
-    out "${C_GREEN}✓${C_RESET}" "${C_DIM}$(fmt_duration "$dur") · \$$(fmt_cost "$cost")${C_RESET}"
+    read -r dur <<< "$(extract_result "$triage_log")"
+    out "${C_GREEN}✓${C_RESET}" "${C_DIM}$(fmt_duration "$dur")${C_RESET}"
 
     # Parse triage results from agent output
     triage_output=$(jq -r 'select(.type == "assistant") | .message.content[]? | select(.type == "text") | .text' "$triage_log" 2>/dev/null)
@@ -567,7 +553,6 @@ if [[ "$TRIAGE" == true ]]; then
         export TRIAGE_LOG="$triage_log" REPORT_FILE="$report_file"
         render_prompt "$PROMPTS_DIR/triage-report.md" TRIAGE_LOG REPORT_FILE
       )" || true
-      extract_cost "triage-report" "$report_log"
 
       if [[ -f "$report_file" ]]; then
         echo ""
@@ -580,17 +565,6 @@ if [[ "$TRIAGE" == true ]]; then
 
     if [[ "$TRIAGE_ONLY" == true ]]; then
       section "${C_GREEN}Triage complete${C_RESET}"
-      # Print cost report and exit
-      if [[ "${AGENT_COSTS[@]+x}" ]]; then
-        section "Cost"
-        total=0
-        for agent_type in "${!AGENT_COSTS[@]}"; do
-          cost="${AGENT_COSTS[$agent_type]}"
-          printf "    %-20s \$%s\n" "$agent_type" "$(fmt_cost "$cost")"
-          total=$(echo "$total + $cost" | bc 2>/dev/null || echo "$total")
-        done
-        printf "    ${C_BOLD}%-20s \$%s${C_RESET}\n" "total" "$(fmt_cost "$total")"
-      fi
       # Restore shelved untracked files
       if [[ -n "$STASH_DIR" && -d "$STASH_DIR" ]]; then
         cp -a "$STASH_DIR"/. . 2>/dev/null || true
@@ -785,43 +759,9 @@ while [[ "$REVIEW_ONLY" != true ]]; do
       < "$prompt_file" || true
 
     # Check success from the stream-json result event (not pipeline exit code)
-    extract_cost "worker" "$log_file"
     if jq -e 'select(.type == "result" and .subtype == "success")' "$log_file" > /dev/null 2>&1; then
-      read -r dur cost <<< "$(extract_result "$log_file")"
-      out "${C_GREEN}✓${C_RESET}" "${C_DIM}$(fmt_duration "$dur") · \$$(fmt_cost "$cost")${C_RESET}"
-      # --- Pre-commit test gate ---
-      if [[ -n "$TEST_CMD" ]]; then
-        echo ""
-        phase_hdr "$C_CYAN" "Test gate"
-        test_gate_log="$LOG_DIR/iter-${iteration}-${ticket_id}-test-${retries}.log"
-        if eval "$TEST_CMD" > "$test_gate_log" 2>&1; then
-          out "${C_GREEN}✓${C_RESET}" "passed"
-        else
-          out "${C_RED}✗${C_RESET}" "failed"
-          retries=$((retries + 1))
-          if [[ $retries -lt $MAX_RETRIES ]]; then
-            # Augment prompt with test failure output for next worker attempt
-            test_snippet=$(tail -80 "$test_gate_log")
-            cat >> "$prompt_file" <<TESTFAIL
-
-## Test Failures (attempt $retries)
-
-Your previous changes cause test/typecheck failures. You MUST fix these.
-
-Command: $TEST_CMD
-Output (last 80 lines):
-\`\`\`
-$test_snippet
-\`\`\`
-TESTFAIL
-            out "${C_YELLOW}↻${C_RESET}" "retrying worker with test output..."
-            sleep 2
-            continue
-          fi
-          # Exhausted retries on test failure
-          break
-        fi
-      fi
+      read -r dur <<< "$(extract_result "$log_file")"
+      out "${C_GREEN}✓${C_RESET}" "${C_DIM}$(fmt_duration "$dur")${C_RESET}"
       success=true
       break
     fi
@@ -886,10 +826,9 @@ TESTFAIL
       render_prompt "$PROMPTS_DIR/simplify.md" PRE_WORKER_HEAD
     )" || true
 
-    extract_cost "simplify" "$simplify_log"
     if jq -e 'select(.type == "result" and .subtype == "success")' "$simplify_log" > /dev/null 2>&1; then
-      read -r dur cost <<< "$(extract_result "$simplify_log")"
-      out "${C_GREEN}✓${C_RESET}" "${C_DIM}$(fmt_duration "$dur") · \$$(fmt_cost "$cost")${C_RESET}"
+      read -r dur <<< "$(extract_result "$simplify_log")"
+      out "${C_GREEN}✓${C_RESET}" "${C_DIM}$(fmt_duration "$dur")${C_RESET}"
       # Commit any simplify changes
       if ! git diff --quiet HEAD -- ':!.ralph-logs' ':!.vima' 2>/dev/null || \
          git ls-files --others --exclude-standard -- ':!.ralph-logs' ':!.vima' 2>/dev/null | grep -q .; then
@@ -919,7 +858,6 @@ TESTFAIL
     render_prompt "$PROMPTS_DIR/review.md" TICKET_DETAILS TICKET_ID PRE_LOOP_HEAD TICKET_TAGS
   )" || true
 
-  extract_cost "reviewer" "$review_log"
   review_result=$(jq -r 'select(.type == "assistant") | .message.content[]? | select(.type == "text") | .text' "$review_log" 2>/dev/null | tail -1)
   if [[ "$review_result" == *"REVIEW_PASS"* ]]; then
     out "${C_GREEN}✓${C_RESET}" "pass"
@@ -964,6 +902,60 @@ if [[ "$REVIEW_ONLY" != true ]]; then
     detail "skipped (failed after retries):"
     while IFS= read -r id; do detail "  - $id"; done < "$SKIP_FILE"
   fi
+fi
+
+# ---------------------------------------------------------------------------
+# Post-loop test gate — run TEST_CMD once after all tickets done.
+# On failure spawn fix worker; retry up to MAX_RETRIES.
+# Skipped in --review-only mode and when no tickets ran.
+# ---------------------------------------------------------------------------
+test_gate_failed=false
+if [[ -n "$TEST_CMD" && "$REVIEW_ONLY" != true && $iteration -gt 0 ]]; then
+  echo ""
+  phase_hdr "$C_CYAN" "Test gate — $TEST_CMD"
+  fix_attempt=0
+  while :; do
+    test_log="$LOG_DIR/test-gate-$(date '+%H%M%S')-${fix_attempt}.log"
+    if eval "$TEST_CMD" > "$test_log" 2>&1; then
+      out "${C_GREEN}✓${C_RESET}" "passed"
+      break
+    fi
+    out "${C_RED}✗${C_RESET}" "failed (attempt $((fix_attempt + 1))/$MAX_RETRIES)"
+
+    if (( fix_attempt + 1 >= MAX_RETRIES )); then
+      out "${C_RED}✗${C_RESET}" "exhausted fix retries — leaving tree dirty"
+      detail "log: $test_log"
+      test_gate_failed=true
+      break
+    fi
+
+    fix_attempt=$((fix_attempt + 1))
+    echo ""
+    phase_hdr "$C_BLUE" "Fix worker (attempt $fix_attempt/$MAX_RETRIES) — $(short_model "$WORKER_MODEL")"
+    fix_log="$LOG_DIR/fix-${fix_attempt}-$(date '+%H%M%S').log"
+    test_output=$(tail -200 "$test_log")
+
+    run_agent ralph_stream_filter "$fix_log" "$WORKER_MODEL" --output-format stream-json --verbose -p "$(
+      export TEST_CMD="$TEST_CMD" TEST_OUTPUT="$test_output" PROJECT_RULES="$project_rules"
+      render_prompt "$PROMPTS_DIR/fix.md" TEST_CMD TEST_OUTPUT PROJECT_RULES
+    )" || true
+
+    if jq -e 'select(.type == "result" and .subtype == "success")' "$fix_log" > /dev/null 2>&1; then
+      read -r dur <<< "$(extract_result "$fix_log")"
+      out "${C_GREEN}✓${C_RESET}" "${C_DIM}$(fmt_duration "$dur")${C_RESET}"
+    else
+      out "${C_YELLOW}✗${C_RESET}" "fix agent failed — retrying test anyway"
+    fi
+
+    # Commit fix changes if any
+    if has_code_changes; then
+      fix_commit_log="$LOG_DIR/fix-${fix_attempt}-commit.log"
+      run_agent _discard "$fix_commit_log" "$COMMIT_MODEL" -p "$(
+        export TICKET_ID="fix-${fix_attempt}"
+        render_prompt "$PROMPTS_DIR/commit.md" TICKET_ID
+      )" || true
+    fi
+  done
 fi
 
 # ---------------------------------------------------------------------------
@@ -1049,7 +1041,6 @@ $(cat PLAN.md)"
     logfile="${!logvar}"
     [[ -z "$logfile" || ! -f "$logfile" ]] && continue
     label=$(basename "$logfile" .log | sed 's/final-review-//' | sed 's/-[0-9]*//')
-    extract_cost "final-$label" "$logfile"
     result=$(jq -r 'select(.type == "assistant") | .message.content[]? | select(.type == "text") | .text' "$logfile" 2>/dev/null | tail -1)
     if [[ "$result" == *"_PASS"* ]]; then
       out "${C_GREEN}✓${C_RESET}" "${label}: pass"
@@ -1091,22 +1082,8 @@ if [[ $iteration -gt 0 ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Cost report
+# Exit code — non-zero if final review or test gate found issues
 # ---------------------------------------------------------------------------
-if [[ "${AGENT_COSTS[@]+x}" ]]; then
-  section "Cost"
-  total=0
-  for agent_type in "${!AGENT_COSTS[@]}"; do
-    cost="${AGENT_COSTS[$agent_type]}"
-    printf "    %-20s \$%s\n" "$agent_type" "$(fmt_cost "$cost")"
-    total=$(echo "$total + $cost" | bc 2>/dev/null || echo "$total")
-  done
-  printf "    ${C_BOLD}%-20s \$%s${C_RESET}\n" "total" "$(fmt_cost "$total")"
-fi
-
-# ---------------------------------------------------------------------------
-# Exit code — non-zero if final review found issues
-# ---------------------------------------------------------------------------
-if [[ "${final_review_failed:-false}" == true ]]; then
+if [[ "${final_review_failed:-false}" == true || "${test_gate_failed:-false}" == true ]]; then
   exit 1
 fi
