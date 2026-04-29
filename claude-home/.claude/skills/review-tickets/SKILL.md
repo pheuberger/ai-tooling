@@ -8,7 +8,7 @@ Quality gate: a ticket passes only if ANY agent can implement it WITHOUT reading
 
 ## Workflow
 
-1. **Gather** — Read plan: prefer `PLAN-REFINED.md`, fall back to `PLAN.md` (or whatever the user provided as an argument). Identify the feature tag (ask user if unclear). List tickets: `vima list --tag <tag> --status open`. Verify all carry the tag; fix with: `current=$(vima show <id> | jq -r '.tags | join(",")'); vima update <id> --tags "$current,<tag>"`.
+1. **Gather** — Read plan: prefer `PLAN-REFINED.md`, fall back to `PLAN.md` (or whatever the user provided as an argument). Identify the feature tag (ask user if unclear). List tickets: `vima list --tag <tag> --status open`. Verify all carry the tag; fix with: `vima update <id> --tags "$(vima show <id> --pluck tags | jq -r 'join(",")'),<tag>"`.
 2. **Audit** — Review each ticket (dependency order: unblocked first) against quality criteria below.
 3. **Split** — Decompose oversized tickets per Split Protocol.
 4. **Enrich** — Read actual source files, add missing code snippets inline.
@@ -27,7 +27,7 @@ Quality gate: a ticket passes only if ANY agent can implement it WITHOUT reading
    ## Task
    ...
    TICKET_EOF
-   )" | tail -1 | jq -r '.id'
+   )" | jq -r '.id'
    ```
 4. Wire deps: `vima dep add <new> <upstream>` (first arg depends-on second arg). Chain sequential replacements. Point downstream tickets at final replacement.
 5. Verify: `vima ready --tag <tag>` — replacements appear, original gone.
@@ -85,14 +85,14 @@ vima show <id>                                 # Ticket details (deps, tags, bod
 vima close <id> --reason "replaced"            # Close ticket (vima has no delete)
 vima dep add <a> <b>                           # a depends-on (is blocked by) b
 vima undep <a> <b>                             # Remove dep link
-current=$(vima show <id> | jq -r '.tags | join(",")'); vima update <id> --tags "$current,<tag>"  # Add tag
+vima update <id> --tags "$(vima show <id> --pluck tags | jq -r 'join(",")'),<new-tag>"  # Append a tag
 vima update <id> --title "New title"           # Update field
 
 # Multi-line body (create or update) — use --description with command substitution
 vima create "Title" --type task --priority 2 --tags <tag> --description "$(cat << 'TICKET_EOF'
 body here
 TICKET_EOF
-)" | tail -1 | jq -r '.id'
+)" | jq -r '.id'
 vima update <id> --description "$(cat << 'TICKET_EOF'
 body here
 TICKET_EOF

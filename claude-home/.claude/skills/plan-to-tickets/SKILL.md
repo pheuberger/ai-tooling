@@ -62,10 +62,22 @@ If any results are returned, choose a different label (e.g., append a version: `
 
 ### 6. Create Tickets
 
-For each approved ticket, create it using `--description` to pass the multi-line description. **Every ticket must** carry the feature label.
+Use `vima create` for each ticket. vima outputs JSON by default — pipe through `jq -r '.id'` to extract the ticket ID.
+
+**vima create flags:**
+- `--type` — bug, feature, task, epic, chore
+- `--priority` — 0=critical, 1=high, 2=medium, 3=low, 4=backlog
+- `--tags` — comma-separated labels (e.g., `--tags feat-slug,backend`)
+- `--description` — main body (task details, context, file paths)
+- `--acceptance` — acceptance criteria (separate field from description)
+- `--dep` — dependency ticket IDs (can specify multiple: `--dep id1 --dep id2`)
 
 ```bash
-vima create "Ticket title" --type task --priority 2 --tags <feature-slug> --description "$(cat << 'TICKET_EOF'
+vima create "Ticket title" \
+  --type task --priority 2 \
+  --tags <feature-slug> \
+  --dep <upstream-ticket-id> \
+  --description "$(cat << 'DESC_EOF'
 ## Context
 ...
 
@@ -75,13 +87,23 @@ vima create "Ticket title" --type task --priority 2 --tags <feature-slug> --desc
 ## Files
 ...
 
-## Acceptance Criteria
+## Dependencies
 ...
-TICKET_EOF
-)" | tail -1 | jq -r '.id'
+DESC_EOF
+)" \
+  --acceptance "$(cat << 'AC_EOF'
+1. ...
+2. ...
+AC_EOF
+)" | jq -r '.id'
 ```
 
-Then set dependencies with `vima dep add`.
+**Other useful vima commands:**
+- `vima list --tag <slug>` — list tickets by tag
+- `vima list --pluck id,title` — extract specific fields (`--pluck` works on list/show, not create)
+- `vima dep add <ticket-id> <depends-on-id>` — add dependency after creation
+- `vima show <ticket-id>` — view a ticket
+- `vima show <ticket-id> --full` — view with description/acceptance/notes
 
 ## Ticket Quality Standard
 

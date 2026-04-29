@@ -7,7 +7,7 @@ This is a fresh Claude Code instance with full codebase access.
 
 `vima` is a local issue tracker. You need these commands:
 
-  vima show <id> --pretty          # full ticket details
+  vima show <id>                   # full ticket details (JSON)
   vima update <id> [flags]         # update a ticket
     --description "<text>"         # replace description (markdown OK)
     --acceptance "<criteria>"      # replace acceptance criteria
