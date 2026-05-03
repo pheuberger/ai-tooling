@@ -21,6 +21,9 @@
 #   --sparring-iterations N  Passes per sparring partner (default: 1)
 #   --log-dir DIR            Log directory (default: .ralph-logs/plan-review)
 #   --lenses L1,L2,...       Override default lens list
+#   --light                  Light preset: feasibility, gaps-and-edge-cases,
+#                            pragmatic-security, simplicity-and-clarity (4 lenses,
+#                            iterations=4 unless overridden). --lenses takes priority.
 #   --resume-from N          Skip passes 1..N-1, resume from pass N
 #   --no-codebase            Skip codebase access (plan-only review)
 #   -h, --help               Show usage
@@ -129,8 +132,11 @@ LENS_INSTRUCTIONS[gaps-and-edge-cases]="What's missing? Look for unhandled error
 LENS_INSTRUCTIONS[security-and-risk]="Look for injection vectors, secrets handling issues, auth gaps, blast radius concerns, supply chain risks, and insufficient input validation."
 LENS_INSTRUCTIONS[maintainability]="Evaluate testability, abstraction quality, coupling, observability, and future-proofing. Look for code that will be hard to debug, extend, or operate."
 LENS_INSTRUCTIONS[scope-and-priorities]="Is the scope bounded? Separate MVP from nice-to-have. Look for contradictions, premature decisions, gold-plating, and features that should be deferred."
+LENS_INSTRUCTIONS[pragmatic-security]="Light, pragmatic security review. Focus on: secrets/credentials accidentally logged or persisted, obvious injection vectors on user-facing inputs, missing auth or authorization on destructive or sensitive operations, and unsafe defaults. Skip deep threat modeling, supply chain analysis, and blast-radius modeling — flag those only if egregious."
+LENS_INSTRUCTIONS[simplicity-and-clarity]="Optimize for low cognitive load and minimal scope. Look for: scope creep beyond the stated goal, premature abstraction, unnecessary configurability or layering, gold-plating, and structures that a new reader would not grok in one pass. Prefer fewer moving parts, clearer names, and inlined logic over indirection. Flag anything that adds surface area without clear payoff."
 
 DEFAULT_LENSES=(feasibility gaps-and-edge-cases security-and-risk maintainability scope-and-priorities)
+LIGHT_LENSES=(feasibility gaps-and-edge-cases pragmatic-security simplicity-and-clarity)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -157,6 +163,8 @@ CONTEXT_FILES=()
 CUSTOM_LENSES=""
 RESUME_FROM=""
 NO_CODEBASE_FLAG=false
+LIGHT_FLAG=false
+ITERATIONS_USER_SET=false
 
 # Pick up single sparring cmd from .ralphrc if set
 if [[ -n "${PLAN_REVIEW_SPARRING_CMD:-}" ]]; then
@@ -168,7 +176,7 @@ fi
 # ---------------------------------------------------------------------------
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --iterations)          ITERATIONS="$2"; shift 2 ;;
+    --iterations)          ITERATIONS="$2"; ITERATIONS_USER_SET=true; shift 2 ;;
     --model)               REVIEW_MODEL="$2"; shift 2 ;;
     --output)              OUTPUT_FILE="$2"; shift 2 ;;
     --questions)           QUESTIONS_FILE="$2"; shift 2 ;;
@@ -177,6 +185,7 @@ while [[ $# -gt 0 ]]; do
     --sparring-iterations) SPARRING_ITERATIONS="$2"; shift 2 ;;
     --log-dir)             LOG_DIR="$2"; shift 2 ;;
     --lenses)              CUSTOM_LENSES="$2"; shift 2 ;;
+    --light)               LIGHT_FLAG=true; shift ;;
     --resume-from)         RESUME_FROM="$2"; shift 2 ;;
     --no-codebase)         NO_CODEBASE_FLAG=true; shift ;;
     -h|--help)             sed -n '/^# Usage/,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
@@ -206,6 +215,9 @@ claude_flags=(--print --dangerously-skip-permissions)
 # ---------------------------------------------------------------------------
 LENSES=()
 if [[ -n "$CUSTOM_LENSES" ]]; then
+  if [[ "$LIGHT_FLAG" == true ]]; then
+    log "${C_YELLOW}--light ignored: --lenses takes priority.${C_RESET}"
+  fi
   IFS=',' read -ra LENSES <<< "$CUSTOM_LENSES"
   for lens in "${LENSES[@]}"; do
     if [[ -z "${LENS_INSTRUCTIONS[$lens]:-}" ]]; then
@@ -213,6 +225,11 @@ if [[ -n "$CUSTOM_LENSES" ]]; then
       log "Custom lens '$lens' — using generic instructions."
     fi
   done
+elif [[ "$LIGHT_FLAG" == true ]]; then
+  LENSES=("${LIGHT_LENSES[@]}")
+  if [[ "$ITERATIONS_USER_SET" == false ]]; then
+    ITERATIONS=4
+  fi
 else
   LENSES=("${DEFAULT_LENSES[@]}")
 fi
