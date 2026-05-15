@@ -1,10 +1,10 @@
 ---
-description: "Start work on a Linear issue: fetch spec, mark in progress, enter planning mode, refine with questions, checkout branch"
+description: "Start work on a Linear issue: fetch spec, mark in progress, grill the user via /grill-me, checkout branch, write plan"
 ---
 
 # Start Issue
 
-You are beginning work on a Linear issue. Your job is to fetch the issue, understand it deeply through questioning, and produce a refined plan before any code is written.
+You are beginning work on a Linear issue. Your job is to fetch the issue, understand it deeply via the `/grill-me` skill, and produce a refined plan before any code is written.
 
 ## Input
 
@@ -35,59 +35,43 @@ If the issue description contains images, use `mcp__linear-server__extract_image
 
 Use `mcp__linear-server__update_issue` to set the issue state to "In Progress".
 
-### 3. Enter Planning Mode
+### 3. Grill the User
 
-Call `EnterPlanMode` to begin spec refinement.
+Invoke the `/grill-me` skill to interrogate the spec. Do **not** enter planning mode.
 
-### 4. Interrogate the Spec
+Frame the grilling around the Linear issue: ambiguities, missing details, architectural fit, dependencies, scope boundaries, error/edge cases, data model, security. Walk down each branch of the decision tree until shared understanding is reached.
 
-This is the core of the command. Read the Linear issue description as a spec and ask the user **non-trivial, non-obvious questions** about it.
+Per `/grill-me` rules: if a question can be answered by exploring the codebase, explore instead of asking. For every question asked, provide a recommended answer.
 
-**What to ask about:**
-- Ambiguities — anything that could be interpreted multiple ways
-- Missing details — inputs, outputs, error states, edge cases not addressed
-- Architectural implications — how does this fit with existing code? What needs to change?
-- Dependencies — what existing code does this build on? What might break?
-- Scope boundaries — what is explicitly NOT part of this work?
-- User experience — what happens when things go wrong? Loading states? Empty states?
-- Data model — does this require schema changes? New fields? Migrations?
-- Security — authentication, authorization, input validation implications
+Continue until the user signals they are satisfied.
 
-**How to ask:**
-- Ask 2-4 questions at a time using `AskUserQuestion`
-- After each round of answers, ask follow-up questions based on what you learned
-- Keep going until the user tells you to stop
-- Do NOT ask obvious questions that are clearly answered in the spec
-- Do NOT ask trivial questions — every question should surface something the user hasn't explicitly thought through
+### 4. Write the Plan
 
-### 5. Write the Plan
-
-Once the user is satisfied with the questioning, synthesize everything into `PLAN.md` in the project root:
-- The original spec from Linear
-- All clarifications from the questioning phase
+Synthesize everything into `PLAN.md` in the project root:
+- Original spec from Linear
+- Clarifications from the grilling phase
 - Proposed approach
 - Files likely to be modified
 - Open risks or unknowns
 
-### 6. Checkout Git Branch
+### 5. Checkout Git Branch
 
 Use the `branchName` from the Linear issue:
-- If the branch already exists locally: `git checkout <branchName>`
+- If branch exists locally: `git checkout <branchName>`
 - If not: `git checkout -b <branchName>`
 
 If Linear has no branch name set, **ask the user** — do not generate one.
 
-### 7. Exit Planning Mode
+### 6. Suggest Next Steps
 
-Call `ExitPlanMode` for the user to approve the plan.
-
-After approval, suggest the next steps:
+After `PLAN.md` is written and branch is checked out, suggest:
 1. Run `./ralph-plan` to refine `PLAN.md` through multiple critic passes (produces `PLAN-REFINED.md`)
 2. Run `/plan-to-tickets` to decompose the refined plan into trackable implementation tasks
 
 ## Rules
 
-- **NEVER skip the questioning phase** — this is the entire point of the command
+- **NEVER skip the grilling phase** — `/grill-me` is the core of this command
+- **NEVER enter planning mode** — grilling happens in normal mode
 - **NEVER create tickets** — that is `/plan-to-tickets`, a separate command
 - **NEVER start writing code** — this command is purely about understanding
 - Branch names come from Linear — single source of truth
