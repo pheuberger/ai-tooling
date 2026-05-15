@@ -76,38 +76,33 @@ The title must be:
 
 ### 6. Write the PR description
 
-Use this template:
+Default template — keep each section tight and scannable:
 
 ```markdown
 ## Why
 
-[1-3 sentences. What problem exists today? What's the motivation? Link to the ticket/issue if one exists. This is the most important section — a reviewer who reads nothing else should understand why this PR exists.]
+[1-3 sentences. The problem or motivation. Link the ticket if one exists. A reviewer who reads nothing else should understand why this PR exists.]
 
 ## What Changed
 
-[Narrative description of the approach. NOT a commit-by-commit or file-by-file list. Explain the key design decisions. Think of this as "if you were explaining this to a colleague over coffee, what would you say?" 1-2 short paragraphs.]
-
-## How to Review
-
-[Guide the reviewer through the PR. Where should they start? What deserves the most scrutiny? What can be skimmed? If there's a logical reading order that differs from the file list, say so.]
+[Bulleted summary of the approach and key design decisions. 3-6 bullets. Use a short prose paragraph instead only if narrative genuinely helps.]
 
 ## How to Test
 
-[Concrete verification steps. Prefer automated tests ("run `pnpm test`") but include manual steps if relevant. Be specific — "verify the page loads" is not enough; "go to /admin/lexicons, confirm the membership warning shows for non-members" is.]
-
-## Risks and Open Questions
-
-[What could go wrong? Are there edge cases you're unsure about? Anything you explicitly chose NOT to do that a reviewer might wonder about? If there are no concerns, omit this section entirely — don't write "none".]
+[Concrete steps. Be specific: "go to /admin/lexicons, confirm membership warning shows for non-members" — not "verify the page loads".]
 ```
 
-**Writing style guidelines:**
-- Lead with the **why**, not the what
-- Use plain language — no jargon unless the domain requires it
-- Be specific over comprehensive — highlight what matters, skip the obvious
-- If the PR is large, suggest a review strategy (e.g., "review commits individually" or "start with X file, the rest follows from it")
-- Don't list every file changed — the diff already shows that
-- Don't repeat commit messages — the commit log is right there
-- Omit sections that don't apply (e.g., skip "Risks" if it's a straightforward change)
+**Optional sections — add only when they carry signal:**
+
+- **How to Review** — only if reading order is non-obvious or one area deserves extra scrutiny. 1-3 bullets.
+- **Risks / Open Questions** — only if real concerns exist. Never write "none".
+
+**Style:**
+- Default to bullets; prose only when a narrative reads better
+- Lead with **why**, skip the **what** the diff already shows
+- Plain language, specific over comprehensive
+- No file lists, no commit-by-commit recap
+- Whitespace between sections — let it breathe
 
 ### 7. Create the PR
 
