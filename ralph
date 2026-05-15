@@ -26,8 +26,6 @@
 #                        needing human input (tagged needs-input), then runs
 #                        the worker loop on approved tickets only.
 #   --triage-only        Like --triage, but stop after triage (no worker loop)
-#   --review-only [REF]  Skip worker loop; run only final review + summary.
-#                        REF is the git ref to diff from (default: empty tree)
 #
 # Configuration files (optional):
 #   .ralphrc             Sourced from project root before CLI args are parsed.
@@ -153,8 +151,6 @@ FILTER_TAG=""         # filter by tag
 PLAN_FILE=""          # --from-plan: plan file to decompose into tickets
 TEST_CMD=""           # --test-cmd: command to run as pre-commit test gate
 WATCHDOG_TIMEOUT=15  # minutes of worker inactivity before kill (0=disabled)
-REVIEW_ONLY=false    # --review-only: skip loop, run final review + summary
-REVIEW_ONLY_REF=""   # git ref to diff from (empty = empty tree)
 LOG_DIR=".ralph-logs"
 RALPH_RULES_FILE=".ralph-rules.md"
 
@@ -183,9 +179,6 @@ while [[ $# -gt 0 ]]; do
     --test-cmd)       TEST_CMD="$2"; shift 2 ;;
     --watchdog)       WATCHDOG_TIMEOUT="$2"; shift 2 ;;
     --no-watchdog)    WATCHDOG_TIMEOUT=0; shift ;;
-    --review-only)    REVIEW_ONLY=true; shift
-                      # Optional ref argument (skip if next arg looks like a flag or is absent)
-                      if [[ $# -gt 0 && "$1" != -* ]]; then REVIEW_ONLY_REF="$1"; shift; fi ;;
     -h|--help)        sed -n '/^# Usage/,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
     *)                echo "Unknown option: $1" >&2; exit 1 ;;
   esac
@@ -588,22 +581,9 @@ fi
 PRE_LOOP_HEAD=$(git rev-parse --verify HEAD 2>/dev/null || git hash-object -t tree /dev/null)
 
 # ---------------------------------------------------------------------------
-# --review-only: skip worker loop, jump to final review
-# ---------------------------------------------------------------------------
-if [[ "$REVIEW_ONLY" == true ]]; then
-  if [[ -n "$REVIEW_ONLY_REF" ]]; then
-    PRE_LOOP_HEAD=$(git rev-parse --verify "$REVIEW_ONLY_REF" 2>/dev/null) \
-      || { echo "Cannot resolve ref: $REVIEW_ONLY_REF" >&2; exit 1; }
-  fi
-  iteration=1  # satisfy the iteration-gt-0 guards
-  section "Review-only mode — diffing from ${PRE_LOOP_HEAD:0:7}..HEAD"
-  git diff --stat "$PRE_LOOP_HEAD"..HEAD | while IFS= read -r line; do detail "  $line"; done
-fi
-
-# ---------------------------------------------------------------------------
 # Main loop — runs as long as there are unblocked tickets
 # ---------------------------------------------------------------------------
-while [[ "$REVIEW_ONLY" != true ]]; do
+while true; do
   # -----------------------------------------------------------------------
   # Pick next ticket — explicit list, filtered ready, or default ready
   # -----------------------------------------------------------------------
@@ -896,21 +876,19 @@ if [[ -n "$STASH_DIR" && -d "$STASH_DIR" ]]; then
   detail "restored shelved untracked files"
 fi
 
-if [[ "$REVIEW_ONLY" != true ]]; then
-  section "Completed — $iteration iteration(s)"
-  if [[ -s "$SKIP_FILE" ]]; then
-    detail "skipped (failed after retries):"
-    while IFS= read -r id; do detail "  - $id"; done < "$SKIP_FILE"
-  fi
+section "Completed — $iteration iteration(s)"
+if [[ -s "$SKIP_FILE" ]]; then
+  detail "skipped (failed after retries):"
+  while IFS= read -r id; do detail "  - $id"; done < "$SKIP_FILE"
 fi
 
 # ---------------------------------------------------------------------------
 # Post-loop test gate — run TEST_CMD once after all tickets done.
 # On failure spawn fix worker; retry up to MAX_RETRIES.
-# Skipped in --review-only mode and when no tickets ran.
+# Skipped when no tickets ran.
 # ---------------------------------------------------------------------------
 test_gate_failed=false
-if [[ -n "$TEST_CMD" && "$REVIEW_ONLY" != true && $iteration -gt 0 ]]; then
+if [[ -n "$TEST_CMD" && $iteration -gt 0 ]]; then
   echo ""
   phase_hdr "$C_CYAN" "Test gate — $TEST_CMD"
   fix_attempt=0
@@ -964,11 +942,9 @@ fi
 final_review_failed=false
 
 if [[ $iteration -gt 0 ]]; then
-  if [[ "$REVIEW_ONLY" != true ]]; then
-    echo ""
-    detail "diff stats:"
-    git diff --stat "$PRE_LOOP_HEAD"..HEAD | while IFS= read -r line; do detail "  $line"; done
-  fi
+  echo ""
+  detail "diff stats:"
+  git diff --stat "$PRE_LOOP_HEAD"..HEAD | while IFS= read -r line; do detail "  $line"; done
 
   # Build plan context — from --from-plan flag or PLAN.md in repo
   plan_context=""
