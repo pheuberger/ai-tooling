@@ -1,0 +1,309 @@
+#!/usr/bin/env bash
+# ralph-review — Standalone final review of branch changes vs a base branch
+#
+# Spawns parallel Claude personas that review `git diff <base>..HEAD` and
+# file vima tickets for issues found.
+#
+# Two modes:
+#   --full   (default) 4 personas: security, integration, patterns,
+#            plus plan-adherence if PLAN.md exists
+#   --light  2 personas: pragmatic-security + integration-light. No kaizen.
+#
+# Usage: ./ralph-review [options]
+#   --full              Full deep review (default)
+#   --light             Light pragmatic review
+#   --base BRANCH       Base branch to diff against (default: main)
+#   --tag TAG           Tag added to filed tickets
+#   --model MODEL       Override review model
+#   --log-dir DIR       Log directory (default: .ralph-logs/review)
+#   --plan FILE         Plan file for plan-adherence persona (default: PLAN.md)
+#   --no-plan           Skip plan-adherence persona even if PLAN.md exists
+#   -h, --help          Show usage
+#
+# Configuration:
+#   .ralphrc            Sourced from project root before CLI args are parsed.
+#                       Set FINAL_REVIEW_MODEL to change default model.
+#
+# Requires: claude (Claude Code CLI), vima, jq, git, envsubst
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROMPTS_DIR="${PROMPTS_DIR:-$SCRIPT_DIR/prompts}"
+
+# ---------------------------------------------------------------------------
+# Colors + helpers (mirrors ralph)
+# ---------------------------------------------------------------------------
+C_RESET='\033[0m'
+C_BOLD='\033[1m'
+C_DIM='\033[2m'
+C_CYAN='\033[36m'
+C_GREEN='\033[32m'
+C_YELLOW='\033[33m'
+C_MAGENTA='\033[35m'
+C_RED='\033[31m'
+
+ts()         { printf '%s' "$(date '+%Y-%m-%d %H:%M:%S')"; }
+log_ts()     { echo -e "${C_DIM}[$(ts)]${C_RESET} $*"; }
+out()        { echo -e "  $1 $2"; }
+detail()     { echo -e "    ${C_DIM}$1${C_RESET}"; }
+section()    { echo -e "\n${C_BOLD}$1${C_RESET}"; }
+phase_hdr()  { echo -e "  ${1}●${C_RESET} ${C_BOLD}${2}${C_RESET}"; }
+short_model() { echo "$1" | sed 's/^claude-//; s/-[0-9].*//'; }
+
+# render_prompt <template_file> [VAR1 VAR2 ...]
+render_prompt() {
+  local template="$1"; shift
+  [[ -f "$template" ]] || { echo "Missing prompt template: $template" >&2; return 1; }
+
+  local content
+  content=$(<"$template")
+
+  while [[ "$content" =~ \{\{#IF\ ([A-Z_]+)\}\} ]]; do
+    local var_name="${BASH_REMATCH[1]}"
+    local var_val="${!var_name:-}"
+    if [[ -n "$var_val" ]]; then
+      content=$(echo "$content" | sed "/{{#IF ${var_name}}}/d; /{{\/IF ${var_name}}}/d")
+    else
+      content=$(echo "$content" | sed "/{{#IF ${var_name}}}/,/{{\/IF ${var_name}}}/d")
+    fi
+  done
+
+  local varlist=""
+  for v in "$@"; do varlist="$varlist \${$v}"; done
+
+  echo "$content" | envsubst "$varlist"
+}
+
+# Stream filter — readable progress from stream-json
+ralph_stream_filter() {
+  jq --unbuffered -r '
+    if .type == "assistant" then
+      [.message.content[]? |
+        if .type == "tool_use" then
+          (.input // {}) as $in |
+          (.name as $n |
+            if   $n == "Bash"   then $in.command // ""
+            elif $n == "Edit"   then $in.file_path // ""
+            elif $n == "Read"   then $in.file_path // ""
+            elif $n == "Write"  then $in.file_path // ""
+            elif $n == "Grep"   then ($in.pattern // "") + " " + ($in.path // "")
+            elif $n == "Glob"   then $in.pattern // ""
+            else "" end
+          ) as $detail |
+          "    \u001b[36m>>> " + .name + "\u001b[2m " + ($detail | .[0:120]) + "\u001b[0m"
+        else empty end
+      ] | join("\n") | select(length > 0)
+    else empty end
+  ' 2>/dev/null
+}
+
+# Extract titles of tickets filed via `vima create` in a review log
+extract_filed_tickets() {
+  jq -r 'select(.type == "assistant") | .message.content[]? | select(.type == "tool_use" and .name == "Bash") | .input.command // ""' "$1" 2>/dev/null \
+    | grep -oP 'vima create "\K[^"]+' \
+    | while IFS= read -r title; do detail "⎿ $title"; done
+}
+
+# Run claude with model
+claude_as() {
+  local model="$1"; shift
+  CI=true setsid -w claude --print --dangerously-skip-permissions --model "$model" "$@"
+}
+
+# Sink — discards console output (quiet agents)
+_discard() { cat > /dev/null; }
+
+# run_agent <display_fn> <log_file> <model> [claude args...]
+run_agent() {
+  local display="$1" log_file="$2" model="$3"; shift 3
+  claude_as "$model" "$@" 2>&1 | tee "$log_file" | "$display"
+}
+
+# ---------------------------------------------------------------------------
+# Defaults + config
+# ---------------------------------------------------------------------------
+MODE="full"
+BASE_BRANCH="main"
+FILTER_TAG=""
+REVIEW_MODEL=""
+LOG_DIR=".ralph-logs/review"
+PLAN_FILE_ARG=""
+NO_PLAN=false
+
+# Source per-project config (CLI flags override)
+if [[ -f ".ralphrc" ]]; then
+  # shellcheck source=/dev/null
+  source ".ralphrc"
+fi
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --full)     MODE="full"; shift ;;
+    --light)    MODE="light"; shift ;;
+    --base)     BASE_BRANCH="$2"; shift 2 ;;
+    --tag)      FILTER_TAG="$2"; shift 2 ;;
+    --model)    REVIEW_MODEL="$2"; shift 2 ;;
+    --log-dir)  LOG_DIR="$2"; shift 2 ;;
+    --plan)     PLAN_FILE_ARG="$2"; shift 2 ;;
+    --no-plan)  NO_PLAN=true; shift ;;
+    -h|--help)  sed -n '/^# Usage/,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    *)          echo "Unknown option: $1" >&2; exit 1 ;;
+  esac
+done
+
+REVIEW_MODEL="${REVIEW_MODEL:-${FINAL_REVIEW_MODEL:-claude-opus-4-6}}"
+
+# ---------------------------------------------------------------------------
+# Preflight
+# ---------------------------------------------------------------------------
+for cmd in claude vima jq git envsubst; do
+  command -v "$cmd" >/dev/null 2>&1 || { echo "Required: $cmd" >&2; exit 1; }
+done
+
+# Resolve base branch -> merge-base with HEAD
+if ! git rev-parse --verify "$BASE_BRANCH" >/dev/null 2>&1; then
+  echo "Base branch not found: $BASE_BRANCH" >&2
+  exit 1
+fi
+
+BASE_REF=$(git merge-base HEAD "$BASE_BRANCH" 2>/dev/null) \
+  || { echo "Could not find merge-base between HEAD and $BASE_BRANCH" >&2; exit 1; }
+
+# Verify there is something to review
+if [[ -z "$(git diff --name-only "$BASE_REF"..HEAD)" ]]; then
+  section "${C_YELLOW}No changes between $BASE_BRANCH and HEAD — nothing to review${C_RESET}"
+  exit 0
+fi
+
+mkdir -p "$LOG_DIR"
+
+# Resolve plan file (full mode only)
+plan_context=""
+plan_file=""
+if [[ "$MODE" == "full" && "$NO_PLAN" != true ]]; then
+  if [[ -n "$PLAN_FILE_ARG" ]]; then
+    [[ -f "$PLAN_FILE_ARG" ]] || { echo "Plan file not found: $PLAN_FILE_ARG" >&2; exit 1; }
+    plan_file="$PLAN_FILE_ARG"
+  elif [[ -f "PLAN.md" ]]; then
+    plan_file="PLAN.md"
+  fi
+  if [[ -n "$plan_file" ]]; then
+    plan_context="## Original Plan (from ${plan_file})
+$(<"$plan_file")"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Startup banner
+# ---------------------------------------------------------------------------
+section "Ralph Review"
+detail "mode: $MODE"
+detail "base: $BASE_BRANCH (${BASE_REF:0:7})"
+detail "diff: $(git diff --shortstat "$BASE_REF"..HEAD | sed 's/^ *//')"
+detail "model: $(short_model "$REVIEW_MODEL")"
+[[ -n "$FILTER_TAG" ]] && detail "tag: $FILTER_TAG"
+[[ -n "$plan_file" ]] && detail "plan: $plan_file"
+
+PRE_LOOP_HEAD="$BASE_REF"
+ticket_tags_flag="${FILTER_TAG:+--tags $FILTER_TAG}"
+
+# ---------------------------------------------------------------------------
+# Run personas in parallel
+# ---------------------------------------------------------------------------
+echo ""
+if [[ "$MODE" == "light" ]]; then
+  phase_hdr "$C_MAGENTA" "Light review (2 personas) — $(short_model "$REVIEW_MODEL")"
+
+  sec_log="$LOG_DIR/pragmatic-security-$(date '+%H%M%S').log"
+  run_agent _discard "$sec_log" "$REVIEW_MODEL" --output-format stream-json --verbose -p "$(
+    export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" TICKET_TAGS_FLAG="$ticket_tags_flag"
+    render_prompt "$PROMPTS_DIR/final-review-pragmatic-security.md" PRE_LOOP_HEAD TICKET_TAGS_FLAG
+  )" &
+  sec_pid=$!
+
+  int_log="$LOG_DIR/integration-light-$(date '+%H%M%S').log"
+  run_agent _discard "$int_log" "$REVIEW_MODEL" --output-format stream-json --verbose -p "$(
+    export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" TICKET_TAGS_FLAG="$ticket_tags_flag"
+    render_prompt "$PROMPTS_DIR/final-review-integration-light.md" PRE_LOOP_HEAD TICKET_TAGS_FLAG
+  )" &
+  int_pid=$!
+
+  wait "$sec_pid" "$int_pid" 2>/dev/null || true
+
+  log_files=("$sec_log" "$int_log")
+else
+  persona_count=3
+  [[ -n "$plan_context" ]] && persona_count=4
+  phase_hdr "$C_MAGENTA" "Full review ($persona_count personas) — $(short_model "$REVIEW_MODEL")"
+
+  sec_log="$LOG_DIR/security-$(date '+%H%M%S').log"
+  run_agent _discard "$sec_log" "$REVIEW_MODEL" --output-format stream-json --verbose -p "$(
+    export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" TICKET_TAGS_FLAG="$ticket_tags_flag"
+    render_prompt "$PROMPTS_DIR/final-review-security.md" PRE_LOOP_HEAD TICKET_TAGS_FLAG
+  )" &
+  sec_pid=$!
+
+  int_log="$LOG_DIR/integration-$(date '+%H%M%S').log"
+  run_agent _discard "$int_log" "$REVIEW_MODEL" --output-format stream-json --verbose -p "$(
+    export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" TICKET_TAGS_FLAG="$ticket_tags_flag"
+    render_prompt "$PROMPTS_DIR/final-review-integration.md" PRE_LOOP_HEAD TICKET_TAGS_FLAG
+  )" &
+  int_pid=$!
+
+  pat_log="$LOG_DIR/patterns-$(date '+%H%M%S').log"
+  run_agent _discard "$pat_log" "$REVIEW_MODEL" --output-format stream-json --verbose -p "$(
+    export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" TICKET_TAGS_FLAG="$ticket_tags_flag"
+    render_prompt "$PROMPTS_DIR/final-review-patterns.md" PRE_LOOP_HEAD TICKET_TAGS_FLAG
+  )" &
+  pat_pid=$!
+
+  plan_pid=""
+  plan_log=""
+  if [[ -n "$plan_context" ]]; then
+    plan_log="$LOG_DIR/plan-$(date '+%H%M%S').log"
+    run_agent _discard "$plan_log" "$REVIEW_MODEL" --output-format stream-json --verbose -p "$(
+      export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" TICKET_TAGS_FLAG="$ticket_tags_flag"
+      export PLAN_CONTEXT="$plan_context"
+      render_prompt "$PROMPTS_DIR/final-review-plan.md" PRE_LOOP_HEAD TICKET_TAGS_FLAG PLAN_CONTEXT
+    )" &
+    plan_pid=$!
+  fi
+
+  wait "$sec_pid" "$int_pid" "$pat_pid" ${plan_pid:+"$plan_pid"} 2>/dev/null || true
+
+  log_files=("$sec_log" "$int_log" "$pat_log")
+  [[ -n "$plan_log" ]] && log_files+=("$plan_log")
+fi
+
+# ---------------------------------------------------------------------------
+# Collect results
+# ---------------------------------------------------------------------------
+review_failed=false
+
+echo ""
+for logfile in "${log_files[@]}"; do
+  [[ -f "$logfile" ]] || continue
+  label=$(basename "$logfile" .log | sed 's/-[0-9]*$//')
+  result=$(jq -r 'select(.type == "assistant") | .message.content[]? | select(.type == "text") | .text' "$logfile" 2>/dev/null | tail -1)
+  if [[ "$result" == *"_PASS"* ]]; then
+    out "${C_GREEN}✓${C_RESET}" "${label}: pass"
+  elif [[ "$result" == *"_ISSUES"* ]]; then
+    out "${C_MAGENTA}●${C_RESET}" "${label}: issues filed"
+    extract_filed_tickets "$logfile"
+    review_failed=true
+  else
+    out "${C_DIM}?${C_RESET}" "${label}: ${result:-(no verdict)}"
+  fi
+done
+
+echo ""
+detail "logs: $LOG_DIR/"
+
+if [[ "$review_failed" == true ]]; then
+  exit 1
+fi
+exit 0
