@@ -29,4 +29,6 @@ Do NOT modify any code. Do NOT close or update ticket status.
      --description "<what's wrong and why it matters>" \
      --acceptance "<how to verify the improvement>" | tail -1 | jq -r '.id'
    Kaizen tickets do NOT affect your verdict.
-5. Output EXACTLY one of: PATTERNS_PASS or PATTERNS_ISSUES
+5. First write a 2-4 sentence summary of what you reviewed (scope, key files,
+   notable findings or absence thereof). Then on a final line, output EXACTLY one
+   of: PATTERNS_PASS or PATTERNS_ISSUES

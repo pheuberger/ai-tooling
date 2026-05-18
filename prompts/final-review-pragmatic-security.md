@@ -20,4 +20,6 @@ Do NOT modify any code. Do NOT close or update ticket status.
      ${TICKET_TAGS_FLAG} --description "<what's wrong and how to fix it>" \
      --acceptance "<how to verify the fix>" | tail -1 | jq -r '.id')
 4. Do NOT file kaizen tickets in light mode — keep signal high.
-5. Output EXACTLY one of: SECURITY_PASS or SECURITY_ISSUES
+5. First write a 2-4 sentence summary of what you reviewed (scope, key files,
+   notable findings or absence thereof). Then on a final line, output EXACTLY one
+   of: SECURITY_PASS or SECURITY_ISSUES

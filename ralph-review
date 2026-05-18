@@ -304,16 +304,26 @@ echo ""
 for logfile in "${log_files[@]}"; do
   [[ -f "$logfile" ]] || continue
   label=$(basename "$logfile" .log | sed 's/-[0-9]*$//')
-  result=$(jq -r 'select(.type == "assistant") | .message.content[]? | select(.type == "text") | .text' "$logfile" 2>/dev/null | tail -1)
-  if [[ "$result" == *"_PASS"* ]]; then
+  all_text=$(jq -r 'select(.type == "assistant") | .message.content[]? | select(.type == "text") | .text' "$logfile" 2>/dev/null)
+  verdict=$(echo "$all_text" | grep -oE '[A-Z]+_(PASS|ISSUES)' | tail -1)
+  summary=$(echo "$all_text" | grep -vE '^[A-Z]+_(PASS|ISSUES)$' | sed '/^[[:space:]]*$/d')
+
+  if [[ "$verdict" == *"_PASS" ]]; then
     out "${C_GREEN}✓${C_RESET}" "${label}: pass"
-  elif [[ "$result" == *"_ISSUES"* ]]; then
+  elif [[ "$verdict" == *"_ISSUES" ]]; then
     out "${C_MAGENTA}●${C_RESET}" "${label}: issues filed"
-    extract_filed_tickets "$logfile"
     review_failed=true
   else
-    out "${C_DIM}?${C_RESET}" "${label}: ${result:-(no verdict)}"
+    out "${C_DIM}?${C_RESET}" "${label}: (no verdict)"
   fi
+
+  if [[ -n "$summary" ]]; then
+    while IFS= read -r line; do
+      detail "⎿ $line"
+    done <<< "$summary"
+  fi
+
+  [[ "$verdict" == *"_ISSUES" ]] && extract_filed_tickets "$logfile"
 done
 
 echo ""

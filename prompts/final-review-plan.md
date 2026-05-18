@@ -31,4 +31,6 @@ ${PLAN_CONTEXT}
      --description "<what's wrong and why it matters>" \
      --acceptance "<how to verify the improvement>" | tail -1 | jq -r '.id'
    Kaizen tickets do NOT affect your verdict.
-5. Output EXACTLY one of: PLAN_PASS or PLAN_ISSUES
+5. First write a 2-4 sentence summary of what you reviewed (scope, key files,
+   notable findings or absence thereof). Then on a final line, output EXACTLY one
+   of: PLAN_PASS or PLAN_ISSUES
