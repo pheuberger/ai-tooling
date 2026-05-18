@@ -12,7 +12,9 @@
 # Usage: ./ralph-review [options]
 #   --full              Full deep review (default)
 #   --light             Light pragmatic review
-#   --base BRANCH       Base branch to diff against (default: main)
+#   --base REF          Base ref to diff against — branch name or commit hash
+#                       (default: main). Branches use merge-base with HEAD;
+#                       commit hashes/tags are used directly as the base.
 #   --tag TAG           Tag added to filed tickets
 #   --model MODEL       Override review model
 #   --log-dir DIR       Log directory (default: .ralph-logs/review)
@@ -124,7 +126,7 @@ run_agent() {
 # Defaults + config
 # ---------------------------------------------------------------------------
 MODE="full"
-BASE_BRANCH="main"
+BASE_REF_INPUT="main"
 FILTER_TAG=""
 REVIEW_MODEL=""
 LOG_DIR=".ralph-logs/review"
@@ -144,7 +146,7 @@ while [[ $# -gt 0 ]]; do
   case $1 in
     --full)     MODE="full"; shift ;;
     --light)    MODE="light"; shift ;;
-    --base)     BASE_BRANCH="$2"; shift 2 ;;
+    --base)     BASE_REF_INPUT="$2"; shift 2 ;;
     --tag)      FILTER_TAG="$2"; shift 2 ;;
     --model)    REVIEW_MODEL="$2"; shift 2 ;;
     --log-dir)  LOG_DIR="$2"; shift 2 ;;
@@ -164,18 +166,25 @@ for cmd in claude vima jq git envsubst; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "Required: $cmd" >&2; exit 1; }
 done
 
-# Resolve base branch -> merge-base with HEAD
-if ! git rev-parse --verify "$BASE_BRANCH" >/dev/null 2>&1; then
-  echo "Base branch not found: $BASE_BRANCH" >&2
+# Resolve base ref. Branches use merge-base with HEAD; commits/tags used directly.
+if ! git rev-parse --verify "${BASE_REF_INPUT}^{commit}" >/dev/null 2>&1; then
+  echo "Base ref not found: $BASE_REF_INPUT" >&2
   exit 1
 fi
 
-BASE_REF=$(git merge-base HEAD "$BASE_BRANCH" 2>/dev/null) \
-  || { echo "Could not find merge-base between HEAD and $BASE_BRANCH" >&2; exit 1; }
+if git show-ref --verify --quiet "refs/heads/$BASE_REF_INPUT" \
+   || git show-ref --verify --quiet "refs/remotes/$BASE_REF_INPUT"; then
+  BASE_KIND="branch"
+  BASE_REF=$(git merge-base HEAD "$BASE_REF_INPUT" 2>/dev/null) \
+    || { echo "Could not find merge-base between HEAD and $BASE_REF_INPUT" >&2; exit 1; }
+else
+  BASE_KIND="commit"
+  BASE_REF=$(git rev-parse --verify "${BASE_REF_INPUT}^{commit}")
+fi
 
 # Verify there is something to review
 if [[ -z "$(git diff --name-only "$BASE_REF"..HEAD)" ]]; then
-  section "${C_YELLOW}No changes between $BASE_BRANCH and HEAD — nothing to review${C_RESET}"
+  section "${C_YELLOW}No changes between $BASE_REF_INPUT and HEAD — nothing to review${C_RESET}"
   exit 0
 fi
 
@@ -202,7 +211,8 @@ fi
 # ---------------------------------------------------------------------------
 section "Ralph Review"
 detail "mode: $MODE"
-detail "base: $BASE_BRANCH (${BASE_REF:0:7})"
+detail "base: $BASE_REF_INPUT ($BASE_KIND, ${BASE_REF:0:7})"
+detail "      $(git log -1 --format='%h %s' "$BASE_REF")"
 detail "diff: $(git diff --shortstat "$BASE_REF"..HEAD | sed 's/^ *//')"
 detail "model: $(short_model "$REVIEW_MODEL")"
 [[ -n "$FILTER_TAG" ]] && detail "tag: $FILTER_TAG"
