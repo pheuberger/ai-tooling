@@ -116,10 +116,16 @@ claude_as() {
 # Sink — discards console output (quiet agents)
 _discard() { cat > /dev/null; }
 
-# run_agent <display_fn> <log_file> <model> [claude args...]
+# Stream filter with persona label prefixed on each line
+labeled_stream() {
+  local label="$1"
+  ralph_stream_filter | sed -u "s/^/    \x1b[35m[${label}]\x1b[0m/"
+}
+
+# run_agent <label> <log_file> <model> [claude args...]
 run_agent() {
-  local display="$1" log_file="$2" model="$3"; shift 3
-  claude_as "$model" "$@" 2>&1 | tee "$log_file" | "$display"
+  local label="$1" log_file="$2" model="$3"; shift 3
+  claude_as "$model" "$@" 2>&1 | tee "$log_file" | labeled_stream "$label"
 }
 
 # ---------------------------------------------------------------------------
@@ -229,14 +235,14 @@ if [[ "$MODE" == "light" ]]; then
   phase_hdr "$C_MAGENTA" "Light review (2 personas) — $(short_model "$REVIEW_MODEL")"
 
   sec_log="$LOG_DIR/pragmatic-security-$(date '+%H%M%S').log"
-  run_agent _discard "$sec_log" "$REVIEW_MODEL" --output-format stream-json --verbose -p "$(
+  run_agent "pragmatic-security" "$sec_log" "$REVIEW_MODEL" --output-format stream-json --verbose -p "$(
     export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" TICKET_TAGS_FLAG="$ticket_tags_flag"
     render_prompt "$PROMPTS_DIR/final-review-pragmatic-security.md" PRE_LOOP_HEAD TICKET_TAGS_FLAG
   )" &
   sec_pid=$!
 
   int_log="$LOG_DIR/integration-light-$(date '+%H%M%S').log"
-  run_agent _discard "$int_log" "$REVIEW_MODEL" --output-format stream-json --verbose -p "$(
+  run_agent "integration-light" "$int_log" "$REVIEW_MODEL" --output-format stream-json --verbose -p "$(
     export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" TICKET_TAGS_FLAG="$ticket_tags_flag"
     render_prompt "$PROMPTS_DIR/final-review-integration-light.md" PRE_LOOP_HEAD TICKET_TAGS_FLAG
   )" &
@@ -251,21 +257,21 @@ else
   phase_hdr "$C_MAGENTA" "Full review ($persona_count personas) — $(short_model "$REVIEW_MODEL")"
 
   sec_log="$LOG_DIR/security-$(date '+%H%M%S').log"
-  run_agent _discard "$sec_log" "$REVIEW_MODEL" --output-format stream-json --verbose -p "$(
+  run_agent "security" "$sec_log" "$REVIEW_MODEL" --output-format stream-json --verbose -p "$(
     export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" TICKET_TAGS_FLAG="$ticket_tags_flag"
     render_prompt "$PROMPTS_DIR/final-review-security.md" PRE_LOOP_HEAD TICKET_TAGS_FLAG
   )" &
   sec_pid=$!
 
   int_log="$LOG_DIR/integration-$(date '+%H%M%S').log"
-  run_agent _discard "$int_log" "$REVIEW_MODEL" --output-format stream-json --verbose -p "$(
+  run_agent "integration" "$int_log" "$REVIEW_MODEL" --output-format stream-json --verbose -p "$(
     export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" TICKET_TAGS_FLAG="$ticket_tags_flag"
     render_prompt "$PROMPTS_DIR/final-review-integration.md" PRE_LOOP_HEAD TICKET_TAGS_FLAG
   )" &
   int_pid=$!
 
   pat_log="$LOG_DIR/patterns-$(date '+%H%M%S').log"
-  run_agent _discard "$pat_log" "$REVIEW_MODEL" --output-format stream-json --verbose -p "$(
+  run_agent "patterns" "$pat_log" "$REVIEW_MODEL" --output-format stream-json --verbose -p "$(
     export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" TICKET_TAGS_FLAG="$ticket_tags_flag"
     render_prompt "$PROMPTS_DIR/final-review-patterns.md" PRE_LOOP_HEAD TICKET_TAGS_FLAG
   )" &
@@ -275,7 +281,7 @@ else
   plan_log=""
   if [[ -n "$plan_context" ]]; then
     plan_log="$LOG_DIR/plan-$(date '+%H%M%S').log"
-    run_agent _discard "$plan_log" "$REVIEW_MODEL" --output-format stream-json --verbose -p "$(
+    run_agent "plan" "$plan_log" "$REVIEW_MODEL" --output-format stream-json --verbose -p "$(
       export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" TICKET_TAGS_FLAG="$ticket_tags_flag"
       export PLAN_CONTEXT="$plan_context"
       render_prompt "$PROMPTS_DIR/final-review-plan.md" PRE_LOOP_HEAD TICKET_TAGS_FLAG PLAN_CONTEXT
