@@ -33,11 +33,18 @@ echo "Owner: $OWNER, Repo: $REPO, Branch: $PR_HEAD → $PR_BASE"
 
 **Step 2: Check Slack webhook**
 
+Source project-local env file if present (Node-style convention), then check the var:
+
 ```bash
-echo "NOTIFY_SLACK_WEBHOOK=${NOTIFY_SLACK_WEBHOOK:-(not set)}"
+if [[ -f .env.local ]]; then
+  set -a
+  source .env.local
+  set +a
+fi
+echo "NOTIFY_SLACK_WEBHOOK=${NOTIFY_SLACK_WEBHOOK:+set}${NOTIFY_SLACK_WEBHOOK:-(not set)}"
 ```
 
-If `NOTIFY_SLACK_WEBHOOK` is not set, log a warning but continue — notifications will simply be skipped.
+If `NOTIFY_SLACK_WEBHOOK` is still not set, log a warning but continue — notifications will simply be skipped. Never echo the raw webhook URL.
 
 **Step 3: Check remote sync state**
 
