@@ -100,11 +100,45 @@ ralph_stream_filter() {
   ' 2>/dev/null
 }
 
-# Extract titles of tickets filed via `vima create` in a review log
-extract_filed_tickets() {
-  jq -r 'select(.type == "assistant") | .message.content[]? | select(.type == "tool_use" and .name == "Bash") | .input.command // ""' "$1" 2>/dev/null \
-    | grep -oP 'vima create "\K[^"]+' \
-    | while IFS= read -r title; do detail "⎿ $title"; done
+# Parse vima create commands + resulting IDs from a review log.
+# Emits tab-delimited records: kind\tpriority\tid\ttitle
+# kind = "fix" or "kaizen" (derived from title prefix)
+parse_filed_tickets() {
+  local log="$1"
+  jq -rs --compact-output '
+    . as $all |
+    [$all[] | select(.type == "assistant") | .message.content[]? |
+      select(.type == "tool_use" and .name == "Bash") |
+      select(.input.command | test("vima create"))] as $cmds |
+    [$all[] | select(.type == "user") | .message.content[]? |
+      select(.type == "tool_result")] as $results |
+    $cmds[] |
+    . as $c |
+    ($results | map(select(.tool_use_id == $c.id)) | .[0]) as $r |
+    {
+      command: $c.input.command,
+      output: ($r // {} | .content | if type == "string" then . elif type == "array" then (.[0].text // "") else "" end)
+    }
+  ' "$log" 2>/dev/null | while IFS= read -r json; do
+    [[ -z "$json" ]] && continue
+    cmd=$(printf '%s' "$json" | jq -r '.command // ""')
+    output=$(printf '%s' "$json" | jq -r '.output // ""' | tr -d '[:space:]')
+    title=$(printf '%s' "$cmd" | grep -oP 'vima create "\K[^"]+' | head -1)
+    [[ -z "$title" ]] && continue
+    prio=$(printf '%s' "$cmd" | grep -oP -- '--priority \K[0-9]+' | head -1)
+    if [[ "$output" =~ ^[a-z0-9-]+$ ]]; then
+      id="$output"
+    else
+      id=$(printf '%s' "$output" | grep -oP '"id"\s*:\s*"\K[^"]+' | head -1)
+      [[ -z "$id" ]] && id=$(printf '%s' "$output" | grep -oP '\b[a-z]{2,}-[a-z0-9]{3,}\b' | head -1)
+    fi
+    if [[ "$title" == Kaizen:* ]]; then
+      kind="kaizen"
+    else
+      kind="fix"
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$kind" "${prio:-?}" "${id:-?}" "$title"
+  done
 }
 
 # Run claude with model
@@ -298,21 +332,38 @@ fi
 # ---------------------------------------------------------------------------
 # Collect results
 # ---------------------------------------------------------------------------
-review_failed=false
+all_tickets_file=$(mktemp)
+trap 'rm -f "$all_tickets_file"' EXIT
 
 echo ""
 for logfile in "${log_files[@]}"; do
   [[ -f "$logfile" ]] || continue
   label=$(basename "$logfile" .log | sed 's/-[0-9]*$//')
-  all_text=$(jq -r 'select(.type == "assistant") | .message.content[]? | select(.type == "text") | .text' "$logfile" 2>/dev/null)
-  verdict=$(echo "$all_text" | grep -oE '[A-Z]+_(PASS|ISSUES)' | tail -1)
-  summary=$(echo "$all_text" | grep -vE '^[A-Z]+_(PASS|ISSUES)$' | sed '/^[[:space:]]*$/d')
+
+  # Final summary = last assistant text block only (drops mid-process narration).
+  final_text=$(jq -rs '[.[] | select(.type == "assistant") | .message.content[]? | select(.type == "text") | .text] | last // ""' "$logfile" 2>/dev/null)
+  verdict=$(echo "$final_text" | grep -oE '[A-Z]+_(PASS|ISSUES)' | tail -1)
+  summary=$(echo "$final_text" | grep -vE '^[A-Z]+_(PASS|ISSUES)[[:space:]]*$' | sed '/^[[:space:]]*$/d')
+
+  persona_tickets=$(parse_filed_tickets "$logfile")
+  fix_count=$(printf '%s\n' "$persona_tickets" | grep -c '^fix	' || true)
+  kaizen_count=$(printf '%s\n' "$persona_tickets" | grep -c '^kaizen	' || true)
 
   if [[ "$verdict" == *"_PASS" ]]; then
-    out "${C_GREEN}✓${C_RESET}" "${label}: pass"
+    if [[ "$kaizen_count" -gt 0 || "$fix_count" -gt 0 ]]; then
+      annot=""
+      [[ "$fix_count" -gt 0 ]] && annot="${fix_count} fix"
+      [[ "$kaizen_count" -gt 0 ]] && annot="${annot:+$annot, }${kaizen_count} kaizen"
+      out "${C_GREEN}✓${C_RESET}" "${label}: pass (${annot} filed)"
+    else
+      out "${C_GREEN}✓${C_RESET}" "${label}: pass"
+    fi
   elif [[ "$verdict" == *"_ISSUES" ]]; then
-    out "${C_MAGENTA}●${C_RESET}" "${label}: issues filed"
-    review_failed=true
+    annot=""
+    [[ "$fix_count" -gt 0 ]] && annot="${fix_count} fix"
+    [[ "$kaizen_count" -gt 0 ]] && annot="${annot:+$annot, }${kaizen_count} kaizen"
+    [[ -z "$annot" ]] && annot="no tickets parsed"
+    out "${C_MAGENTA}●${C_RESET}" "${label}: issues filed (${annot})"
   else
     out "${C_DIM}?${C_RESET}" "${label}: (no verdict)"
   fi
@@ -323,13 +374,56 @@ for logfile in "${log_files[@]}"; do
     done <<< "$summary"
   fi
 
-  [[ "$verdict" == *"_ISSUES" ]] && extract_filed_tickets "$logfile"
+  if [[ -n "$persona_tickets" ]]; then
+    while IFS=$'\t' read -r kind prio id title; do
+      [[ -z "$kind" ]] && continue
+      if [[ "$kind" == "fix" ]]; then
+        detail "⎿ Fix:    ${id} (P${prio}) ${title}"
+      else
+        detail "⎿ Kaizen: ${id} (P${prio}) ${title}"
+      fi
+      printf '%s\t%s\t%s\t%s\t%s\n' "$kind" "$prio" "$id" "$label" "$title" >> "$all_tickets_file"
+    done <<< "$persona_tickets"
+  fi
 done
+
+# ---------------------------------------------------------------------------
+# Roll-up
+# ---------------------------------------------------------------------------
+must_fix=$(awk -F'\t' '$1=="fix" && ($2=="1" || $2=="2")' "$all_tickets_file" | wc -l)
+should_fix=$(awk -F'\t' '$1=="fix" && $2=="3"' "$all_tickets_file" | wc -l)
+other_fix=$(awk -F'\t' '$1=="fix" && $2!="1" && $2!="2" && $2!="3"' "$all_tickets_file" | wc -l)
+kaizen_total=$(awk -F'\t' '$1=="kaizen"' "$all_tickets_file" | wc -l)
+
+print_bucket() {
+  local label="$1" filter="$2" count="$3"
+  detail "${label}: ${count}"
+  [[ "$count" -gt 0 ]] || return 0
+  awk -F'\t' "${filter} {printf \"      %s  P%s  [%s] %s\\n\", \$3, \$2, \$4, \$5}" "$all_tickets_file" \
+    | while IFS= read -r line; do echo -e "    ${C_DIM}${line}${C_RESET}"; done
+}
+
+section "Summary"
+print_bucket "must-fix (P1-P2)  " '$1=="fix" && ($2=="1" || $2=="2")' "$must_fix"
+print_bucket "should-fix (P3)   " '$1=="fix" && $2=="3"'              "$should_fix"
+[[ "$other_fix" -gt 0 ]] && \
+  print_bucket "other-fix         " '$1=="fix" && $2!="1" && $2!="2" && $2!="3"' "$other_fix"
+print_bucket "kaizen (deferrable)" '$1=="kaizen"' "$kaizen_total"
+
+echo ""
+deferrable=$((should_fix + other_fix + kaizen_total))
+if [[ "$must_fix" -gt 0 ]]; then
+  detail "verdict: ${C_RED}blocked${C_RESET} — ${must_fix} P1/P2 fix(es) must land before ship"
+elif [[ "$deferrable" -gt 0 ]]; then
+  detail "verdict: ${C_GREEN}ship-ready${C_RESET} — no P1/P2 blockers; ${deferrable} deferrable ticket(s) filed"
+else
+  detail "verdict: ${C_GREEN}clean${C_RESET} — nothing filed"
+fi
 
 echo ""
 detail "logs: $LOG_DIR/"
 
-if [[ "$review_failed" == true ]]; then
+if [[ "$must_fix" -gt 0 ]]; then
   exit 1
 fi
 exit 0
