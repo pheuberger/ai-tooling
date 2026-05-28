@@ -223,7 +223,7 @@ if [[ -n "$untracked" ]]; then
     mkdir -p "$STASH_DIR/$(dirname "$f")"
     mv "$f" "$STASH_DIR/$f"
   done
-  log_ts "Shelved $(echo "$untracked" | wc -l | tr -d ' ') untracked file(s)"
+  log_ts "Shelved $(echo "$untracked" | wc -l | tr -d ' ') untracked file(s) to $STASH_DIR"
 fi
 
 mkdir -p "$LOG_DIR"
