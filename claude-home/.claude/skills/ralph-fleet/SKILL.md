@@ -11,6 +11,38 @@ exactly — this skill only decides *who works on what* and pulls the trigger.
 
 `ralph-fleet` (the orchestrator) and `ralph` are on PATH. Run from the **target repo root**.
 
+## Slack events
+
+Post a Slack note at every important point so the user can follow the fleet without watching
+tmux. `NOTIFY_SLACK_WEBHOOK` lives in the repo's `.env.local` as a plain `key=value` (no `export`),
+so you must source it with auto-export before it's visible. Do this once at start:
+```bash
+if [[ -f .env.local ]]; then set -a; source .env.local; set +a; fi
+echo "NOTIFY_SLACK_WEBHOOK=${NOTIFY_SLACK_WEBHOOK:+set}${NOTIFY_SLACK_WEBHOOK:-(not set)}"
+```
+`set -a` exports everything `.env.local` defines, so the no-`export` lines are picked up. If the
+var is still unset, skip every Slack step silently (still do the work) and tell the user
+notifications are off. Never echo the raw webhook URL.
+
+Each Slack post — fire-and-forget, never wait. **Env vars don't survive between Bash calls** (each
+runs in a fresh shell), so re-source `.env.local` in the *same* command as the `curl`:
+```bash
+[[ -f .env.local ]] && { set -a; source .env.local; set +a; }
+if [[ -n "$NOTIFY_SLACK_WEBHOOK" ]]; then
+  curl -s -X POST "$NOTIFY_SLACK_WEBHOOK" -H 'Content-type: application/json' \
+    -d "{\"text\": $(echo "<message>" | jq -Rs .)}" > /dev/null 2>&1 || true
+fi
+```
+
+Post at exactly these points (prefix each with the repo name):
+- **Launched** — N lanes, ticket count, the critical-path lane.
+- **All lanes done** (`FLEET-DONE`) — starting linear apply.
+- **🛑 Needs you** — a conflict stopped the apply (lane / commit / files), **or** `FLEET-TIMEOUT`
+  left a lane hung. The actionable, must-not-miss events.
+- **Finished** — per-lane tickets closed + diffstat, and final apply result.
+
+Keep them short — one line each. Don't post per-ticket or per-poll; that's noise.
+
 ## Input → ticket set
 
 Resolve the user's input to a concrete set of **open** tickets:
@@ -50,46 +82,76 @@ vima update <id> --tags "${existing},worker<N>"
 Filed Fix: tickets inherit the lane tag (reviewer uses `${TICKET_TAGS}`) so they stay in
 lane and get worked the same run. New Kaizen: tickets get only `kaizen` → parked for later.
 
-## Launch
+## Launch the lanes
 
-Two steps. First start the lanes detached:
+Start the lanes detached:
 ```
 ralph-fleet --no-attach --lanes <N>
 ```
 Pass ralph flags after `--` (e.g. `ralph-fleet --no-attach -- --model claude-opus-4-6`).
 The orchestrator auto-detects lanes from `workerN` tags, creates worktrees under the repo's
-parent (so they resolve the same `.vima` store), forks branches off the current branch,
-and starts one tmux window per lane (each lane = a `ralph` run; its pane dies when ralph exits).
+parent (so they resolve the same `.vima` store), forks branch `ralph/worker<N>` per lane off
+the current branch, and starts one tmux window per lane (each lane = a `ralph` run; its pane
+dies when ralph exits).
 
-Then start the autopilot **as a backgrounded Bash call** so its output is captured back
-into this session:
+Then wait for every lane to finish. **Do not use `ralph-fleet --wait`** — it auto-squash-merges,
+and you apply the lanes yourself (next section). Instead background this poll so the harness
+re-invokes you the moment all lanes are done:
 ```
-ralph-fleet --wait --lanes <N> --poll 600
+elapsed=0; max=21600   # 6h ceiling — backstop against a hung lane
+while tmux has-session -t ralph-fleet 2>/dev/null; do
+  running=0
+  for w in $(tmux list-windows -t ralph-fleet -F '#{window_name}' 2>/dev/null | grep -E '^lane[0-9]+$'); do
+    [ "$(tmux list-panes -t "ralph-fleet:$w" -F '#{pane_dead}' 2>/dev/null | head -1)" = 0 ] && running=$((running+1))
+  done
+  [ "$running" -eq 0 ] && { echo "FLEET-DONE"; break; }
+  [ "$elapsed" -ge "$max" ] && { echo "FLEET-TIMEOUT: $running lane(s) still running after ${max}s"; break; }
+  sleep 600; elapsed=$((elapsed+600))
+done
 ```
-Run this with `run_in_background: true`. `--wait` polls every 10 min until all lane panes
-die, then **squash-merges** each lane into the base branch, tears down the worktrees, kills
-the tmux session, and prints a consolidated per-lane report (tickets, diffstat, ralph
-summary, exit status, merge result) to stdout. Because it's a backgrounded Bash, the harness
-re-invokes you when it finishes — surface that report to the user then.
+Run with `run_in_background: true`. Don't ScheduleWakeup/loop on top of it — this backgrounded
+poll is the wait; the harness notifies you when it exits.
 
-Don't poll it yourself with ScheduleWakeup/loop — the backgrounded `--wait` is the wait; the
-harness notifies you on completion.
+On wake, read the marker. `FLEET-DONE` → fire the **All lanes done** Slack event, then apply the
+lanes (next section). `FLEET-TIMEOUT` → **don't apply.** Fire the **🛑 Needs you** event, run
+`ralph-fleet --status`, report which lanes are still live, and ask the user whether to wait more,
+attach (`tmux attach -t ralph-fleet`), or kill and apply what finished.
 
-Report back immediately after launching:
+Report back immediately after launching, and fire the **Launched** Slack event:
 - the partition table (lane → tickets → domain), flagging the critical-path lane
 - `tmux attach -t ralph-fleet` to watch live (Ctrl-b n/p switch lanes, Ctrl-b d detach)
-- that the squash-merge + teardown + report will land here automatically when lanes finish
+- that you'll apply the lanes linearly and report once they finish
+
+## Apply the lane changes linearly
+
+When the poll returns, every lane is done. **You** apply the work onto the base branch — one
+lane at a time, in order, preserving each lane's commits — so you keep judgment over anything
+that doesn't apply cleanly. Don't hand this to an automated squash merge.
+
+1. `ralph-fleet --status` — each lane's branch, commit count, diffstat vs base. Skip any lane
+   with 0 commits beyond base.
+2. Put the main repo on `<base>`, clean: `git checkout <base>`. If the tree is dirty or you're
+   not on the expected base, **stop and ask** — don't guess.
+3. For each lane branch `ralph/worker<N>`, lowest N first:
+   - Inspect: `git log --oneline <base>..ralph/worker<N>`.
+   - Apply linearly: `git cherry-pick <base>..ralph/worker<N>` (keeps the per-ticket commits).
+     A clean fast-forward (`git merge --ff-only ralph/worker<N>`) is fine too.
+   - **On any conflict or anything unexpected: STOP.** `git cherry-pick --abort`, fire the
+     **🛑 Needs you** Slack event (lane / commit / files), then report and ask the user how to
+     proceed. Do **not** auto-resolve, and do **not** touch the remaining lanes until they answer.
+     A conflict means the partition leaked (two lanes hit one file) — a human call, not a machine merge.
+4. After all lanes land cleanly: `ralph-fleet --cleanup` (removes worktrees, deletes the lane
+   branches — it content-verifies each before deleting).
+
+Then fire the **Finished** Slack event and report per lane: tickets closed, diffstat, ralph
+summary (`.ralph-logs/fleet/*-summary.md` if present), and final apply result.
 
 ## Variants
 
-- **Fully detached** (survives this session ending): launch with `ralph-fleet --auto` instead
-  of the two-step flow. It spawns its own `--wait` autopilot in the background and writes the
-  report to `.ralph-logs/fleet/<session>-report.md`. Use when the user wants fire-and-forget
-  and doesn't need the report in-session.
-- **Full history instead of squash**: add `--strategy no-ff` (merge commit + every per-ticket
-  commit) to `--wait`/`--auto`/`--merge`.
-- **Manual finish**: skip `--wait`; later run `git checkout <base> && ralph-fleet --merge`
-  then `ralph-fleet --cleanup`.
+- **Fully detached** (survives this session ending): `ralph-fleet --auto` runs its own
+  `--wait` autopilot that squash-merges and writes the report to
+  `.ralph-logs/fleet/<session>-report.md`. Use only when the user wants fire-and-forget and
+  is fine with the orchestrator's auto squash-merge instead of the linear apply above.
 
 ## Rules
 
@@ -98,4 +160,6 @@ Report back immediately after launching:
 - Confirm the matched set before tagging when input was verbal.
 - Tagging is reversible (`vima update <id> --tags kaizen`); launching spawns live coding
   sessions and writes to branches — make sure the partition is right before launching.
+- Apply lanes linearly yourself (cherry-pick, lowest N first). **Any conflict → abort and ask;
+  never auto-resolve.** Lane branches survive until `--cleanup`, so a stopped apply loses nothing.
 - Don't modify `ralph` or `ralph-fleet` from here — this skill drives them, doesn't edit them.
