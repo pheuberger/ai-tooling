@@ -1,0 +1,447 @@
+#!/usr/bin/env bash
+# ralph-fleet — run N parallel ralph lanes, each in its own git worktree + branch.
+#
+# Orchestrates the existing `ralph` engine UNCHANGED: each lane is a normal
+# `ralph --tag <prefix>N` run inside an isolated worktree. The single-lane
+# process (worker → commit → simplify → review → close) is preserved exactly;
+# this wrapper only owns worktree lifecycle, parallel launch, and merge.
+#
+# Why it's safe to run lanes concurrently:
+#   * git      — one worktree + branch per lane → no working-tree contention
+#   * vima     — single shared store (walked up from cwd), guarded by .vima/lock;
+#                tag partition (--tag workerN) removes the ready→start race
+#   * logs     — .ralph-logs/ is per-worktree → no collision
+# The ONLY cross-lane hazard is two lanes editing the same source file (merge
+# conflict at the end). Partition tickets so each file lives in exactly one lane.
+#
+# Usage:
+#   ralph-fleet [options] [-- <ralph passthrough args>]
+#
+#   --lanes N            number of lanes (default: auto-detect <prefix>N tags with ready tickets)
+#   --prefix STR         lane tag prefix (default: worker → worker1, worker2, …)
+#   --base BRANCH        branch to fork worktrees from and merge into (default: current branch)
+#   --worktree-dir DIR   parent dir for worktrees (default: parent of repo root)
+#   --session NAME       tmux session name (default: ralph-fleet)
+#   --auto               after launch, spawn a detached autopilot that polls until all
+#                        lanes finish, then squash-merges into base and tears down worktrees
+#   --poll SECONDS       autopilot poll interval (default: 600 = 10 min)
+#   --no-attach          create the tmux session detached; print attach command
+#   --dry-run            print what would happen; touch nothing
+#
+# Subcommands (run after lanes finish):
+#   --status             show each lane's branch, commit count, and diffstat vs base
+#   --wait               block: poll lanes until all exit, then squash-merge + cleanup,
+#                        printing a consolidated per-lane report to stdout (run via --auto
+#                        for detached, or call directly to capture output in a caller)
+#   --merge              merge each lane branch into base sequentially; stop on conflict
+#     --strategy MODE    squash (default — one commit per lane) | no-ff (merge commit + lane history)
+#   --cleanup            remove lane worktrees and delete lane branches (merged ones only)
+#
+# Partitioning is NOT automated here — assign tickets to lanes first by tagging
+# them <prefix>N alongside their existing tags, e.g.:
+#   vima update <id> --tags kaizen,worker1
+# (vima --tags REPLACES, so always include the existing tags.)
+#
+# Requires: ralph (same dir), git (with worktree), tmux, vima, jq
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RALPH="$SCRIPT_DIR/ralph"
+SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
+
+# Colors (match ralph)
+C_RESET='\033[0m'; C_BOLD='\033[1m'; C_DIM='\033[2m'
+C_CYAN='\033[36m'; C_GREEN='\033[32m'; C_YELLOW='\033[33m'
+C_MAGENTA='\033[35m'; C_BLUE='\033[34m'; C_RED='\033[31m'
+
+section()  { echo -e "\n${C_BOLD}$1${C_RESET}"; }
+out()      { echo -e "  $1 $2"; }
+detail()   { echo -e "    ${C_DIM}$1${C_RESET}"; }
+die()      { echo -e "${C_RED}error:${C_RESET} $*" >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
+# Args
+# ---------------------------------------------------------------------------
+LANES=""
+PREFIX="worker"
+BASE=""
+WORKTREE_DIR=""
+SESSION="ralph-fleet"
+NO_ATTACH=false
+DRY_RUN=false
+ACTION="launch"   # launch | status | merge | cleanup | wait
+STRATEGY="squash" # merge strategy: squash | no-ff
+AUTO=false        # --auto: after launch, spawn a detached --wait autopilot
+POLL=600          # --wait poll interval (seconds) — default 10 min
+RALPH_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --lanes)        LANES="$2"; shift 2 ;;
+    --prefix)       PREFIX="$2"; shift 2 ;;
+    --base)         BASE="$2"; shift 2 ;;
+    --worktree-dir) WORKTREE_DIR="$2"; shift 2 ;;
+    --session)      SESSION="$2"; shift 2 ;;
+    --strategy)     STRATEGY="$2"; shift 2 ;;
+    --poll)         POLL="$2"; shift 2 ;;
+    --auto)         AUTO=true; shift ;;
+    --no-attach)    NO_ATTACH=true; shift ;;
+    --dry-run)      DRY_RUN=true; shift ;;
+    --status)       ACTION="status"; shift ;;
+    --merge)        ACTION="merge"; shift ;;
+    --cleanup)      ACTION="cleanup"; shift ;;
+    --wait)         ACTION="wait"; shift ;;
+    --)             shift; RALPH_ARGS=("$@"); break ;;
+    -h|--help)      sed -n '/^# Usage/,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    *)              die "unknown option: $1" ;;
+  esac
+done
+
+# ---------------------------------------------------------------------------
+# Preflight
+# ---------------------------------------------------------------------------
+for c in git tmux vima jq; do command -v "$c" >/dev/null 2>&1 || die "$c not installed"; done
+[[ -x "$RALPH" ]] || die "ralph not found/executable at $RALPH"
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not in a git repo"
+REPO_NAME="$(basename "$REPO_ROOT")"
+[[ -z "$BASE" ]] && BASE="$(git -C "$REPO_ROOT" branch --show-current)"
+[[ -z "$BASE" ]] && die "could not resolve base branch (detached HEAD?) — pass --base"
+[[ -z "$WORKTREE_DIR" ]] && WORKTREE_DIR="$(dirname "$REPO_ROOT")"
+
+# vima store the main repo resolves to — every worktree MUST resolve the same one.
+vima_store_of() { ( cd "$1" && p=$PWD; while [[ "$p" != / ]]; do [[ -d "$p/.vima" ]] && { echo "$p/.vima"; return; }; p=$(dirname "$p"); done ); }
+MAIN_STORE="$(vima_store_of "$REPO_ROOT")"
+[[ -z "$MAIN_STORE" ]] && die "no .vima store found at or above $REPO_ROOT"
+
+lane_branch()   { echo "ralph/${PREFIX}$1"; }
+lane_worktree() { echo "$WORKTREE_DIR/${REPO_NAME}-${PREFIX}$1"; }
+lane_tag()      { echo "${PREFIX}$1"; }
+
+# Auto-detect lane count from <prefix>N tags that currently have ready tickets.
+detect_lanes() {
+  local n=0 i=1
+  while :; do
+    local cnt; cnt=$(cd "$REPO_ROOT" && vima ready --tag "$(lane_tag "$i")" --count 2>/dev/null || echo 0)
+    [[ "$cnt" =~ ^[0-9]+$ ]] || cnt=0
+    [[ "$cnt" -eq 0 ]] && break
+    n=$i; i=$((i+1))
+  done
+  echo "$n"
+}
+[[ -z "$LANES" ]] && LANES="$(detect_lanes)"
+[[ "$LANES" =~ ^[0-9]+$ && "$LANES" -ge 1 ]] || die "no lanes: tag tickets '${PREFIX}1', '${PREFIX}2', … or pass --lanes N"
+
+section "ralph-fleet — $ACTION"
+detail "repo:      $REPO_ROOT (base: $BASE)"
+detail "lanes:     $LANES  (prefix: $PREFIX)"
+detail "worktrees: $WORKTREE_DIR/${REPO_NAME}-${PREFIX}N"
+detail "vima store: $MAIN_STORE"
+[[ ${#RALPH_ARGS[@]} -gt 0 ]] && detail "ralph args: ${RALPH_ARGS[*]}"
+
+# ---------------------------------------------------------------------------
+# Subcommand: status
+# ---------------------------------------------------------------------------
+if [[ "$ACTION" == "status" ]]; then
+  for i in $(seq 1 "$LANES"); do
+    br="$(lane_branch "$i")"; wt="$(lane_worktree "$i")"; tag="$(lane_tag "$i")"
+    echo ""
+    out "${C_CYAN}●${C_RESET}" "${C_BOLD}lane $i${C_RESET}  tag=$tag  branch=$br"
+    if git -C "$REPO_ROOT" rev-parse --verify "$br" >/dev/null 2>&1; then
+      ahead=$(git -C "$REPO_ROOT" rev-list --count "$BASE..$br" 2>/dev/null || echo "?")
+      detail "commits ahead of $BASE: $ahead"
+      git -C "$REPO_ROOT" diff --stat "$BASE...$br" 2>/dev/null | tail -1 | sed 's/^/    /'
+    else
+      detail "branch not created yet"
+    fi
+    ready=$(cd "$REPO_ROOT" && vima ready --tag "$tag" --count 2>/dev/null || echo "?")
+    detail "tickets still ready in lane: $ready"
+    [[ -d "$wt" ]] && detail "worktree: $wt" || detail "worktree: (none)"
+  done
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Subcommand: merge — sequential, conflict-aware
+# ---------------------------------------------------------------------------
+if [[ "$ACTION" == "merge" ]]; then
+  [[ "$STRATEGY" == squash || "$STRATEGY" == no-ff ]] || die "unknown --strategy '$STRATEGY' (squash|no-ff)"
+  cur="$(git -C "$REPO_ROOT" branch --show-current)"
+  [[ "$cur" == "$BASE" ]] || die "checkout $BASE in the main repo before merging (currently on $cur)"
+  ! git -C "$REPO_ROOT" diff --quiet 2>/dev/null && die "main repo working tree dirty — commit/stash first"
+  detail "strategy: $STRATEGY"
+  for i in $(seq 1 "$LANES"); do
+    br="$(lane_branch "$i")"; tag="$(lane_tag "$i")"
+    git -C "$REPO_ROOT" rev-parse --verify "$br" >/dev/null 2>&1 || { out "${C_DIM}–${C_RESET}" "lane $i: no branch, skipping"; continue; }
+    # Nothing to merge if the branch has no commits beyond base.
+    if [[ -z "$(git -C "$REPO_ROOT" rev-list "$BASE..$br" 2>/dev/null)" ]]; then
+      out "${C_DIM}–${C_RESET}" "lane $i: no commits ahead of $BASE, skipping"; continue
+    fi
+    echo ""
+    out "${C_BLUE}→${C_RESET}" "merging $br into $BASE (${STRATEGY})"
+
+    if [[ "$STRATEGY" == no-ff ]]; then
+      if $DRY_RUN; then detail "(dry-run) git merge --no-ff --no-edit $br"; continue; fi
+      if git -C "$REPO_ROOT" merge --no-ff --no-edit "$br"; then
+        out "${C_GREEN}✓${C_RESET}" "merged lane $i"
+      else
+        out "${C_RED}✗${C_RESET}" "conflict merging lane $i — resolve in $REPO_ROOT, then: git merge --continue"
+        detail "conflicting files:"; git -C "$REPO_ROOT" diff --name-only --diff-filter=U | sed 's/^/      /'
+        detail "abort with: git merge --abort  (then re-run --merge)"
+        exit 1
+      fi
+    else
+      # squash: collapse the lane to a single commit on base
+      n_commits=$(git -C "$REPO_ROOT" rev-list --count "$BASE..$br")
+      if $DRY_RUN; then detail "(dry-run) git merge --squash $br  (+ commit: $n_commits lane commit(s))"; continue; fi
+      if git -C "$REPO_ROOT" merge --squash "$br"; then
+        body=$(git -C "$REPO_ROOT" log --reverse --format='- %s' "$BASE..$br")
+        git -C "$REPO_ROOT" commit -q -m "merge lane $i ($tag): squash $n_commits commit(s)" -m "$body"
+        out "${C_GREEN}✓${C_RESET}" "squashed lane $i → 1 commit ($n_commits collapsed)"
+      else
+        out "${C_RED}✗${C_RESET}" "conflict squashing lane $i"
+        detail "conflicting files:"; git -C "$REPO_ROOT" diff --name-only --diff-filter=U | sed 's/^/      /'
+        detail "resolve in $REPO_ROOT, then: git commit   (squash leaves no MERGE_HEAD)"
+        detail "abort with: git reset --hard HEAD  (then re-run --merge)"
+        exit 1
+      fi
+    fi
+  done
+  out "${C_GREEN}✓${C_RESET}" "all lanes merged into $BASE"
+  detail "next: $0 --cleanup --lanes $LANES --prefix $PREFIX"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Subcommand: cleanup — remove worktrees + delete merged lane branches
+# ---------------------------------------------------------------------------
+if [[ "$ACTION" == "cleanup" ]]; then
+  for i in $(seq 1 "$LANES"); do
+    br="$(lane_branch "$i")"; wt="$(lane_worktree "$i")"
+    echo ""
+    if [[ -d "$wt" ]]; then
+      if $DRY_RUN; then detail "(dry-run) git worktree remove $wt"; else
+        git -C "$REPO_ROOT" worktree remove --force "$wt" 2>/dev/null \
+          && out "${C_GREEN}✓${C_RESET}" "removed worktree lane $i" \
+          || out "${C_YELLOW}!${C_RESET}" "could not remove $wt (uncommitted work?) — leaving it"
+      fi
+    fi
+    if git -C "$REPO_ROOT" rev-parse --verify "$br" >/dev/null 2>&1; then
+      if $DRY_RUN; then detail "(dry-run) git branch -d/-D $br (if merged)"; else
+        # git -d only sees ancestor merges (no-ff). For squash, verify content
+        # landed: every file the lane changed now matches base. Disjoint lanes
+        # make this exact — base's copy of those files == the lane's copy.
+        mb=$(git -C "$REPO_ROOT" merge-base "$BASE" "$br")
+        mapfile -t lane_files < <(git -C "$REPO_ROOT" diff --name-only "$mb" "$br")
+        if git -C "$REPO_ROOT" branch -d "$br" 2>/dev/null; then
+          out "${C_GREEN}✓${C_RESET}" "deleted branch $br"
+        elif [[ ${#lane_files[@]} -gt 0 ]] && git -C "$REPO_ROOT" diff --quiet "$BASE" "$br" -- "${lane_files[@]}"; then
+          git -C "$REPO_ROOT" branch -D "$br" >/dev/null \
+            && out "${C_GREEN}✓${C_RESET}" "deleted branch $br (squash-merged — content verified in $BASE)"
+        else
+          out "${C_YELLOW}!${C_RESET}" "kept $br (changes not all in $BASE — merge it first, or 'git branch -D $br' to force)"
+        fi
+      fi
+    fi
+  done
+  git -C "$REPO_ROOT" worktree prune 2>/dev/null || true
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Subcommand: wait — poll lanes until all exit, then squash-merge + cleanup,
+# emitting a consolidated report to stdout (so a caller can capture it).
+# ---------------------------------------------------------------------------
+if [[ "$ACTION" == "wait" ]]; then
+  tmux has-session -t "$SESSION" 2>/dev/null || die "no tmux session '$SESSION' to wait on"
+  # Lane count: explicit flag, else count lane[N] windows in the session.
+  if [[ -z "$LANES" ]]; then
+    LANES=$(tmux list-windows -t "$SESSION" -F '#{window_name}' 2>/dev/null | grep -cE '^lane[0-9]+$' || true)
+  fi
+  [[ "$LANES" =~ ^[0-9]+$ && "$LANES" -ge 1 ]] || die "could not determine lane count — pass --lanes N"
+
+  FLEET_LOG_DIR="$REPO_ROOT/.ralph-logs/fleet"
+  mkdir -p "$FLEET_LOG_DIR"
+  # We orchestrate errors manually from here — tmux queries on a vanished window
+  # must not abort the run via set -e/pipefail.
+  set +e
+  log_ts() { echo -e "${C_DIM}[$(date '+%H:%M:%S')]${C_RESET} $*"; }
+
+  # A lane is "finished" when its pane is dead OR its window is gone.
+  # Only a live pane (pane_dead == 0) counts as still running.
+  section "Wait — polling $LANES lane(s) every $((POLL/60))m (session: $SESSION)"
+  while :; do
+    running=0
+    for i in $(seq 1 "$LANES"); do
+      d=$(tmux list-panes -t "$SESSION:lane$i" -F '#{pane_dead}' 2>/dev/null | head -1)
+      [[ "$d" == "0" ]] && running=$((running+1))
+    done
+    log_ts "lanes finished: $((LANES-running))/$LANES"
+    [[ "$running" -eq 0 ]] && break
+    # Whole session gone (e.g. user killed it) → nothing to wait for.
+    tmux has-session -t "$SESSION" 2>/dev/null || { log_ts "session gone — stopping wait"; break; }
+    sleep "$POLL"
+  done
+
+  # Capture each lane's scrollback + exit status before we tear anything down.
+  echo ""; section "Lanes finished — capturing output"
+  declare -A lane_exit
+  for i in $(seq 1 "$LANES"); do
+    win="$SESSION:lane$i"
+    tmux capture-pane -p -S - -t "$win" > "$FLEET_LOG_DIR/$SESSION-lane$i.log" 2>/dev/null
+    st=$(tmux list-panes -t "$win" -F '#{pane_dead_status}' 2>/dev/null | head -1)
+    lane_exit[$i]="${st:-?}"
+    # Preserve ralph's own summary NOW — cleanup deletes the worktree below.
+    sm=$(ls -t "$(lane_worktree "$i")"/.ralph-logs/summary-*.md 2>/dev/null | head -1)
+    [[ -n "$sm" ]] && cp "$sm" "$FLEET_LOG_DIR/$SESSION-lane$i-summary.md" 2>/dev/null
+    out "${C_CYAN}●${C_RESET}" "lane $i exited (status ${lane_exit[$i]}) → $FLEET_LOG_DIR/$SESSION-lane$i.log"
+  done
+
+  # Auto-merge (squash) then cleanup on success.
+  echo ""; section "Auto-finish"
+  cur="$(git -C "$REPO_ROOT" branch --show-current)"
+  merged=false
+  if [[ "$cur" != "$BASE" ]]; then
+    if git -C "$REPO_ROOT" diff --quiet 2>/dev/null && git -C "$REPO_ROOT" diff --cached --quiet 2>/dev/null; then
+      git -C "$REPO_ROOT" checkout "$BASE" >/dev/null 2>&1 || true
+      cur="$(git -C "$REPO_ROOT" branch --show-current)"
+    fi
+  fi
+  if [[ "$cur" != "$BASE" ]]; then
+    out "${C_YELLOW}!${C_RESET}" "main repo not on $BASE (on $cur) — skipping auto-merge; run merge manually"
+  elif ! git -C "$REPO_ROOT" diff --quiet 2>/dev/null; then
+    out "${C_YELLOW}!${C_RESET}" "main repo working tree dirty — skipping auto-merge; run merge manually"
+  else
+    if "$SELF" --merge --lanes "$LANES" --prefix "$PREFIX" --base "$BASE" --strategy "$STRATEGY"; then
+      merged=true
+      echo ""
+      "$SELF" --cleanup --lanes "$LANES" --prefix "$PREFIX" --base "$BASE" || true
+      tmux kill-session -t "$SESSION" 2>/dev/null || true
+      out "${C_GREEN}✓${C_RESET}" "merged + cleaned up; tmux session killed"
+    else
+      out "${C_RED}✗${C_RESET}" "merge stopped (conflict) — worktrees + session left intact for manual resolution"
+    fi
+  fi
+
+  # Consolidated report → stdout (captured by the caller) + a file.
+  report="$FLEET_LOG_DIR/$SESSION-report.md"
+  {
+    echo "# ralph-fleet report — $SESSION"
+    echo "_base: $BASE · lanes: $LANES · strategy: $STRATEGY · merged: ${merged}_"
+    for i in $(seq 1 "$LANES"); do
+      tag="$(lane_tag "$i")"
+      echo ""
+      echo "## lane $i ($tag) — exit ${lane_exit[$i]:-?}"
+      remaining=$(cd "$REPO_ROOT" && vima ready --tag "$tag" --count 2>/dev/null || echo "?")
+      echo "- tickets still ready in lane: $remaining (non-zero ⇒ lane ended early / failures)"
+      # Prefer the preserved ralph summary; fall back to the captured pane log.
+      sm="$FLEET_LOG_DIR/$SESSION-lane$i-summary.md"
+      [[ -f "$sm" ]] || sm="$FLEET_LOG_DIR/$SESSION-lane$i.log"
+      if [[ -f "$sm" ]]; then
+        echo ""; echo "<details><summary>summary</summary>"; echo ""; echo '```'
+        tail -80 "$sm" | grep -v '^[[:space:]]*$'
+        echo '```'; echo "</details>"
+      fi
+    done
+    echo ""
+    echo "## merge"
+    git -C "$REPO_ROOT" log --oneline -n "$((LANES+1))" "$BASE" 2>/dev/null | sed 's/^/- /'
+  } | tee "$report"
+  echo ""
+  detail "report saved: $report"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Action: launch
+# ---------------------------------------------------------------------------
+# Validate every lane has ready tickets before touching git.
+section "Preflight"
+empty_lanes=()
+for i in $(seq 1 "$LANES"); do
+  tag="$(lane_tag "$i")"
+  cnt=$(cd "$REPO_ROOT" && vima ready --tag "$tag" --count 2>/dev/null || echo 0)
+  [[ "$cnt" =~ ^[0-9]+$ ]] || cnt=0
+  out "${C_CYAN}●${C_RESET}" "lane $i (tag=$tag): $cnt ready ticket(s)"
+  [[ "$cnt" -eq 0 ]] && empty_lanes+=("$i")
+done
+if [[ ${#empty_lanes[@]} -gt 0 ]]; then
+  detail "lanes with no ready tickets: ${empty_lanes[*]}"
+  detail "(tag tickets '${PREFIX}N,<existing-tags>' — remember --tags REPLACES)"
+fi
+
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+  die "tmux session '$SESSION' already exists — attach (tmux attach -t $SESSION) or kill it (tmux kill-session -t $SESSION)"
+fi
+
+# Create worktrees + branches.
+section "Worktrees"
+for i in $(seq 1 "$LANES"); do
+  br="$(lane_branch "$i")"; wt="$(lane_worktree "$i")"
+  if [[ -d "$wt" ]]; then
+    out "${C_DIM}=${C_RESET}" "lane $i: worktree exists ($wt) — reusing"
+    continue
+  fi
+  # Confirm the worktree path resolves the SAME vima store as the main repo.
+  parent_store="$(vima_store_of "$(dirname "$wt")")"
+  [[ "$parent_store" == "$MAIN_STORE" ]] || die "lane $i worktree ($wt) would resolve vima store '$parent_store' ≠ main '$MAIN_STORE' — pick --worktree-dir under $(dirname "$MAIN_STORE")"
+  if $DRY_RUN; then
+    detail "(dry-run) git worktree add $wt -b $br $BASE"
+  else
+    git -C "$REPO_ROOT" worktree add "$wt" -b "$br" "$BASE" >/dev/null \
+      && out "${C_GREEN}✓${C_RESET}" "lane $i: $wt  ($br)" \
+      || die "failed to create worktree for lane $i"
+  fi
+done
+
+$DRY_RUN && { section "${C_GREEN}dry-run complete${C_RESET}"; exit 0; }
+
+# Launch tmux session: one window per lane.
+section "Launch"
+ralph_cmd_extra=""
+[[ ${#RALPH_ARGS[@]} -gt 0 ]] && printf -v ralph_cmd_extra ' %q' "${RALPH_ARGS[@]}"
+
+for i in $(seq 1 "$LANES"); do
+  br="$(lane_branch "$i")"; wt="$(lane_worktree "$i")"; tag="$(lane_tag "$i")"
+  # Run ralph AS the window's command (not send-keys into a shell) so the pane
+  # dies when ralph exits — that pane-death is how --wait detects completion.
+  cmd="cd $(printf %q "$wt") && $(printf %q "$RALPH") --tag $(printf %q "$tag")${ralph_cmd_extra}"
+  if [[ "$i" -eq 1 ]]; then
+    tmux new-session -d -s "$SESSION" -n "lane1" "$cmd"
+  else
+    tmux new-window -t "$SESSION" -n "lane$i" "$cmd"
+  fi
+  # remain-on-exit is a WINDOW option — keep the dead pane (and its exit status)
+  # around so --wait can read it and the run summary stays visible on attach.
+  tmux set-option -w -t "$SESSION:lane$i" remain-on-exit on
+  out "${C_GREEN}▶${C_RESET}" "lane $i → window 'lane$i': ralph --tag $tag"
+done
+
+echo ""
+out "${C_GREEN}✓${C_RESET}" "$LANES lane(s) launched in tmux session '${C_BOLD}$SESSION${C_RESET}'"
+
+# --auto: spawn a detached autopilot that polls, then squash-merges + cleans up.
+if $AUTO; then
+  wait_log="$REPO_ROOT/.ralph-logs/fleet/$SESSION-wait.log"
+  mkdir -p "$(dirname "$wait_log")"
+  setsid "$SELF" --wait --session "$SESSION" --lanes "$LANES" --prefix "$PREFIX" \
+    --base "$BASE" --strategy "$STRATEGY" --poll "$POLL" >"$wait_log" 2>&1 < /dev/null &
+  out "${C_GREEN}▶${C_RESET}" "autopilot running detached (poll $((POLL/60))m) → $wait_log"
+  detail "it will squash-merge into $BASE and tear down worktrees when all lanes finish"
+fi
+
+detail "watch:   tmux attach -t $SESSION   (Ctrl-b n/p to switch lanes, Ctrl-b d to detach)"
+detail "status:  $0 --status --lanes $LANES --prefix $PREFIX"
+$AUTO || detail "wait:    $0 --wait --lanes $LANES --prefix $PREFIX   (poll → auto squash-merge + cleanup)"
+$AUTO || detail "merge:   git checkout $BASE && $0 --merge --lanes $LANES --prefix $PREFIX   (squash; --strategy no-ff for full history)"
+$AUTO || detail "cleanup: $0 --cleanup --lanes $LANES --prefix $PREFIX"
+
+# Don't steal the terminal when running unattended (--auto or --no-attach).
+if ! $NO_ATTACH && ! $AUTO; then
+  if [[ -n "${TMUX:-}" ]]; then
+    detail "(already inside tmux — attach manually: tmux attach -t $SESSION)"
+  else
+    tmux attach -t "$SESSION"
+  fi
+fi
