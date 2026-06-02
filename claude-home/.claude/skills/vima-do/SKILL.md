@@ -16,10 +16,10 @@ Do not guess. Do not list tickets.
 
 ## Workflow
 
-### 1. Fetch + start
+### 1. Start (returns spec)
 
-- `vima show <id>` — read spec. If empty/closed/missing, stop and report.
-- `vima start <id>` — set status `in_progress`.
+- `vima start <id>` — sets status `in_progress` **and** returns the full ticket JSON in one call. Read the spec from its `description` field. Do not also run `vima show` — it would re-fetch the same body for no reason.
+- If the response is an error, or the ticket is already closed/missing, stop and report.
 
 ### 2. Work
 
