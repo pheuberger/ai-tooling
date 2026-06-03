@@ -26,6 +26,9 @@
 #                        lanes finish, then squash-merges into base and tears down worktrees
 #   --poll SECONDS       autopilot poll interval (default: 600 = 10 min)
 #   --no-attach          create the tmux session detached; print attach command
+#   --reuse-dirty        launch on a dirty lane worktree AS-IS (continue prior run);
+#                        default: auto-stash any dirty lane (recoverable via
+#                        `git stash list`) and reset its branch to base — clean slate
 #   --dry-run            print what would happen; touch nothing
 #
 # Subcommands (run after lanes finish):
@@ -70,6 +73,7 @@ WORKTREE_DIR=""
 SESSION="ralph-fleet"
 NO_ATTACH=false
 DRY_RUN=false
+REUSE_DIRTY=false # --reuse-dirty: launch on a dirty lane AS-IS instead of aborting
 ACTION="launch"   # launch | status | merge | cleanup | wait
 STRATEGY="squash" # merge strategy: squash | no-ff
 AUTO=false        # --auto: after launch, spawn a detached --wait autopilot
@@ -87,6 +91,7 @@ while [[ $# -gt 0 ]]; do
     --poll)         POLL="$2"; shift 2 ;;
     --auto)         AUTO=true; shift ;;
     --no-attach)    NO_ATTACH=true; shift ;;
+    --reuse-dirty)  REUSE_DIRTY=true; shift ;;
     --dry-run)      DRY_RUN=true; shift ;;
     --status)       ACTION="status"; shift ;;
     --merge)        ACTION="merge"; shift ;;
@@ -380,7 +385,38 @@ section "Worktrees"
 for i in $(seq 1 "$LANES"); do
   br="$(lane_branch "$i")"; wt="$(lane_worktree "$i")"
   if [[ -d "$wt" ]]; then
-    out "${C_DIM}=${C_RESET}" "lane $i: worktree exists ($wt) — reusing"
+    # Guard: the dir exists but might be stale junk (e.g. a leftover node_modules
+    # tree from a crashed run), not a real worktree. Without this check every
+    # `git -C "$wt" …` below fails with "fatal: not a git repository" and the run
+    # dies with an opaque error. Prune in case the worktree admin is stale, then
+    # refuse with an actionable message rather than guessing.
+    if ! git -C "$wt" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      git -C "$REPO_ROOT" worktree prune 2>/dev/null || true
+      die "lane $i: $wt exists but is not a git worktree (stale dir from a crashed run?). Remove it and rerun:  rm -rf $wt"
+    fi
+    # Always start each lane from a clean slate: stash any uncommitted/untracked
+    # work (recoverable), then re-base the lane branch onto the CURRENT base.
+    # Otherwise dirty state and prior-run commits silently ride into this run and
+    # pollute the final merge. --reuse-dirty opts out to continue a prior run.
+    dirty=""; [[ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]] && dirty=1
+    if [[ -n "$dirty" ]] && $REUSE_DIRTY; then
+      out "${C_YELLOW}!${C_RESET}" "lane $i: worktree dirty ($wt) — reusing AS-IS, branch NOT reset (--reuse-dirty)"
+      continue
+    fi
+    if $DRY_RUN; then
+      [[ -n "$dirty" ]] && detail "(dry-run) lane $i: git -C $wt stash push -u (auto-stash dirty lane)"
+      detail "(dry-run) lane $i: git -C $wt checkout $br && git -C $wt reset --hard $BASE"
+      continue
+    fi
+    if [[ -n "$dirty" ]]; then
+      git -C "$wt" stash push -u -m "ralph-fleet auto-stash lane$i @$BASE" >/dev/null \
+        && out "${C_DIM}⤓${C_RESET}" "lane $i: dirty work auto-stashed (recover: git -C $wt stash list)" \
+        || die "lane $i: failed to auto-stash dirty worktree $wt"
+    fi
+    git -C "$wt" checkout -q "$br" 2>/dev/null || git -C "$wt" checkout -q -B "$br" "$BASE"
+    git -C "$wt" reset --hard "$BASE" >/dev/null \
+      && out "${C_DIM}=${C_RESET}" "lane $i: worktree reused, branch $br reset to $BASE" \
+      || die "lane $i: failed to reset $br to $BASE in $wt"
     continue
   fi
   # Confirm the worktree path resolves the SAME vima store as the main repo.
@@ -406,7 +442,9 @@ for i in $(seq 1 "$LANES"); do
   br="$(lane_branch "$i")"; wt="$(lane_worktree "$i")"; tag="$(lane_tag "$i")"
   # Run ralph AS the window's command (not send-keys into a shell) so the pane
   # dies when ralph exits — that pane-death is how --wait detects completion.
-  cmd="cd $(printf %q "$wt") && $(printf %q "$RALPH") --tag $(printf %q "$tag")${ralph_cmd_extra}"
+  # --clear-logs: lanes run unattended; ralph's interactive log-clear prompt
+  # (read </dev/tty) would block the pane forever with nobody to answer it.
+  cmd="cd $(printf %q "$wt") && $(printf %q "$RALPH") --tag $(printf %q "$tag") --clear-logs${ralph_cmd_extra}"
   if [[ "$i" -eq 1 ]]; then
     tmux new-session -d -s "$SESSION" -n "lane1" "$cmd"
   else
