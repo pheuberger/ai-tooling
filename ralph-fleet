@@ -124,6 +124,17 @@ lane_branch()   { echo "ralph/${PREFIX}$1"; }
 lane_worktree() { echo "$WORKTREE_DIR/${REPO_NAME}-${PREFIX}$1"; }
 lane_tag()      { echo "${PREFIX}$1"; }
 
+# All lanes live as side-by-side panes in ONE window so everything is visible at
+# a glance. Each pane's title is set to lane$i at launch.
+FLEET_WIN="fleet"
+# Resolve a lane's tmux pane TARGET (its pane id, e.g. %5) by pane title. Pane
+# ids are stable across layout changes and pane death (remain-on-exit); pane
+# INDICES are not, so never address lanes by index.
+lane_pane() {
+  tmux list-panes -t "$SESSION:$FLEET_WIN" -F '#{pane_title} #{pane_id}' 2>/dev/null \
+    | awk -v t="lane$1" '$1==t{print $2; exit}'
+}
+
 # Auto-detect lane count from <prefix>N tags that currently have ready tickets.
 detect_lanes() {
   local n=0 i=1
@@ -260,9 +271,9 @@ fi
 # ---------------------------------------------------------------------------
 if [[ "$ACTION" == "wait" ]]; then
   tmux has-session -t "$SESSION" 2>/dev/null || die "no tmux session '$SESSION' to wait on"
-  # Lane count: explicit flag, else count lane[N] windows in the session.
+  # Lane count: explicit flag, else count lane[N] panes in the fleet window.
   if [[ -z "$LANES" ]]; then
-    LANES=$(tmux list-windows -t "$SESSION" -F '#{window_name}' 2>/dev/null | grep -cE '^lane[0-9]+$' || true)
+    LANES=$(tmux list-panes -t "$SESSION:$FLEET_WIN" -F '#{pane_title}' 2>/dev/null | grep -cE '^lane[0-9]+$' || true)
   fi
   [[ "$LANES" =~ ^[0-9]+$ && "$LANES" -ge 1 ]] || die "could not determine lane count — pass --lanes N"
 
@@ -277,11 +288,9 @@ if [[ "$ACTION" == "wait" ]]; then
   # Only a live pane (pane_dead == 0) counts as still running.
   section "Wait — polling $LANES lane(s) every $((POLL/60))m (session: $SESSION)"
   while :; do
-    running=0
-    for i in $(seq 1 "$LANES"); do
-      d=$(tmux list-panes -t "$SESSION:lane$i" -F '#{pane_dead}' 2>/dev/null | head -1)
-      [[ "$d" == "0" ]] && running=$((running+1))
-    done
+    # One list-panes per poll: count lanes whose pane is still live (pane_dead==0).
+    # Same idiom as the SKILL.md background poll — avoids a tmux call per lane.
+    running=$(tmux list-panes -t "$SESSION:$FLEET_WIN" -F '#{pane_title} #{pane_dead}' 2>/dev/null | grep -cE '^lane[0-9]+ 0$')
     log_ts "lanes finished: $((LANES-running))/$LANES"
     [[ "$running" -eq 0 ]] && break
     # Whole session gone (e.g. user killed it) → nothing to wait for.
@@ -293,9 +302,9 @@ if [[ "$ACTION" == "wait" ]]; then
   echo ""; section "Lanes finished — capturing output"
   declare -A lane_exit
   for i in $(seq 1 "$LANES"); do
-    win="$SESSION:lane$i"
-    tmux capture-pane -p -S - -t "$win" > "$FLEET_LOG_DIR/$SESSION-lane$i.log" 2>/dev/null
-    st=$(tmux list-panes -t "$win" -F '#{pane_dead_status}' 2>/dev/null | head -1)
+    p="$(lane_pane "$i")"
+    tmux capture-pane -p -S - -t "$p" > "$FLEET_LOG_DIR/$SESSION-lane$i.log" 2>/dev/null
+    st=$(tmux display-message -p -t "$p" '#{pane_dead_status}' 2>/dev/null)
     lane_exit[$i]="${st:-?}"
     # Preserve ralph's own summary NOW — cleanup deletes the worktree below.
     sm=$(ls -t "$(lane_worktree "$i")"/.ralph-logs/summary-*.md 2>/dev/null | head -1)
@@ -433,7 +442,7 @@ done
 
 $DRY_RUN && { section "${C_GREEN}dry-run complete${C_RESET}"; exit 0; }
 
-# Launch tmux session: one window per lane.
+# Launch tmux session: one window, one pane per lane, side by side.
 section "Launch"
 ralph_cmd_extra=""
 [[ ${#RALPH_ARGS[@]} -gt 0 ]] && printf -v ralph_cmd_extra ' %q' "${RALPH_ARGS[@]}"
@@ -446,14 +455,24 @@ for i in $(seq 1 "$LANES"); do
   # (read </dev/tty) would block the pane forever with nobody to answer it.
   cmd="cd $(printf %q "$wt") && $(printf %q "$RALPH") --tag $(printf %q "$tag") --clear-logs${ralph_cmd_extra}"
   if [[ "$i" -eq 1 ]]; then
-    tmux new-session -d -s "$SESSION" -n "lane1" "$cmd"
+    # -x/-y size the DETACHED session wide enough to fit every lane side by side
+    # (default 80 cols can't host >2-3 horizontal panes → "no space for new pane").
+    tmux new-session -d -s "$SESSION" -n "$FLEET_WIN" -x 320 -y 50 "$cmd"
+    # remain-on-exit is a WINDOW option — keep dead panes (+ exit status) around so
+    # --wait can read them and the run summaries stay visible on attach. Set it
+    # BEFORE any lane can exit. Label panes with their titles on the border too.
+    tmux set-option -w -t "$SESSION:$FLEET_WIN" remain-on-exit on
+    tmux set-option -w -t "$SESSION:$FLEET_WIN" pane-border-status top      >/dev/null 2>&1 || true
+    tmux set-option -w -t "$SESSION:$FLEET_WIN" pane-border-format ' #{pane_title} ' >/dev/null 2>&1 || true
   else
-    tmux new-window -t "$SESSION" -n "lane$i" "$cmd"
+    # -h splits the active pane left|right → lanes end up next to each other.
+    tmux split-window -h -t "$SESSION:$FLEET_WIN" "$cmd"
   fi
-  # remain-on-exit is a WINDOW option — keep the dead pane (and its exit status)
-  # around so --wait can read it and the run summary stays visible on attach.
-  tmux set-option -w -t "$SESSION:lane$i" remain-on-exit on
-  out "${C_GREEN}▶${C_RESET}" "lane $i → window 'lane$i': ralph --tag $tag"
+  # new-session / split-window leave the new pane ACTIVE → title the active pane,
+  # then re-balance so all panes share equal width after every split.
+  tmux select-pane   -t "$SESSION:$FLEET_WIN" -T "lane$i"
+  tmux select-layout -t "$SESSION:$FLEET_WIN" even-horizontal >/dev/null 2>&1 || true
+  out "${C_GREEN}▶${C_RESET}" "lane $i → pane 'lane$i': ralph --tag $tag"
 done
 
 echo ""
@@ -469,7 +488,7 @@ if $AUTO; then
   detail "it will squash-merge into $BASE and tear down worktrees when all lanes finish"
 fi
 
-detail "watch:   tmux attach -t $SESSION   (Ctrl-b n/p to switch lanes, Ctrl-b d to detach)"
+detail "watch:   tmux attach -t $SESSION   (Ctrl-b ←/→ or o to switch lanes, Ctrl-b z to zoom a pane, Ctrl-b d to detach)"
 detail "status:  $0 --status --lanes $LANES --prefix $PREFIX"
 $AUTO || detail "wait:    $0 --wait --lanes $LANES --prefix $PREFIX   (poll → auto squash-merge + cleanup)"
 $AUTO || detail "merge:   git checkout $BASE && $0 --merge --lanes $LANES --prefix $PREFIX   (squash; --strategy no-ff for full history)"

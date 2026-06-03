@@ -91,19 +91,33 @@ ralph-fleet --no-attach --lanes <N>
 Pass ralph flags after `--` (e.g. `ralph-fleet --no-attach -- --model claude-opus-4-6`).
 The orchestrator auto-detects lanes from `workerN` tags, creates worktrees under the repo's
 parent (so they resolve the same `.vima` store), forks branch `ralph/worker<N>` per lane off
-the current branch, and starts one tmux window per lane (each lane = a `ralph` run; its pane
-dies when ralph exits).
+the current branch, and starts a single tmux window (`fleet`) with one pane per lane, laid out
+side by side so all lanes are visible at a glance (each lane = a `ralph` run; its pane dies when
+ralph exits).
 
 Then wait for every lane to finish. **Do not use `ralph-fleet --wait`** — it auto-squash-merges,
 and you apply the lanes yourself (next section). Instead background this poll so the harness
 re-invokes you the moment all lanes are done:
 ```
+# Resolve the real tmux BINARY, not the shell alias. The Bash tool sources the
+# user's zsh profile, which may define `alias tmux=_zsh_tmux_plugin_run` — that
+# plugin fn is undefined non-interactively, so a bare `tmux` errors and the poll
+# would exit instantly with a false FLEET-DONE. Find the on-disk binary instead.
+TMUX_BIN=""
+for p in /usr/bin/tmux /usr/local/bin/tmux /opt/homebrew/bin/tmux /bin/tmux; do
+  [ -x "$p" ] && { TMUX_BIN="$p"; break; }
+done
+[ -z "$TMUX_BIN" ] && TMUX_BIN="$(unalias tmux 2>/dev/null; type -P tmux 2>/dev/null)"
+[ -z "$TMUX_BIN" ] && { echo "FLEET-ERROR: no tmux binary found"; exit 1; }
+# Guard the ambiguous case: no session at entry means lanes never launched (or
+# the resolver is still wrong) — NOT "all done". A true completion is detected
+# by running==0 inside the loop, which prints FLEET-DONE.
+"$TMUX_BIN" has-session -t ralph-fleet 2>/dev/null || { echo "FLEET-ERROR: ralph-fleet session not found at poll start — lanes never launched"; exit 1; }
 elapsed=0; max=21600   # 6h ceiling — backstop against a hung lane
-while tmux has-session -t ralph-fleet 2>/dev/null; do
-  running=0
-  for w in $(tmux list-windows -t ralph-fleet -F '#{window_name}' 2>/dev/null | grep -E '^lane[0-9]+$'); do
-    [ "$(tmux list-panes -t "ralph-fleet:$w" -F '#{pane_dead}' 2>/dev/null | head -1)" = 0 ] && running=$((running+1))
-  done
+while "$TMUX_BIN" has-session -t ralph-fleet 2>/dev/null; do
+  # All lanes are side-by-side panes in the single 'fleet' window, titled laneN.
+  # A lane is live when its pane_dead == 0; count those still running.
+  running=$("$TMUX_BIN" list-panes -t ralph-fleet:fleet -F '#{pane_title} #{pane_dead}' 2>/dev/null | grep -cE '^lane[0-9]+ 0$')
   [ "$running" -eq 0 ] && { echo "FLEET-DONE"; break; }
   [ "$elapsed" -ge "$max" ] && { echo "FLEET-TIMEOUT: $running lane(s) still running after ${max}s"; break; }
   sleep 600; elapsed=$((elapsed+600))
@@ -115,11 +129,14 @@ poll is the wait; the harness notifies you when it exits.
 On wake, read the marker. `FLEET-DONE` → fire the **All lanes done** Slack event, then apply the
 lanes (next section). `FLEET-TIMEOUT` → **don't apply.** Fire the **🛑 Needs you** event, run
 `ralph-fleet --status`, report which lanes are still live, and ask the user whether to wait more,
-attach (`tmux attach -t ralph-fleet`), or kill and apply what finished.
+attach (`tmux attach -t ralph-fleet`), or kill and apply what finished. `FLEET-ERROR` → **don't
+apply, don't assume done.** The poll never observed a live session: lanes failed to launch or the
+session died at startup. Run `ralph-fleet --status`, inspect lane logs, fire **🛑 Needs you**, and
+report. **Empty output with no marker is also an error** — never read absence of a marker as done.
 
 Report back immediately after launching, and fire the **Launched** Slack event:
 - the partition table (lane → tickets → domain), flagging the critical-path lane
-- `tmux attach -t ralph-fleet` to watch live (Ctrl-b n/p switch lanes, Ctrl-b d detach)
+- `tmux attach -t ralph-fleet` to watch live — all lanes side by side in one window (Ctrl-b ←/→ or o to move between panes, Ctrl-b z to zoom one, Ctrl-b d to detach)
 - that you'll apply the lanes linearly and report once they finish
 
 ## Apply the lane changes linearly
