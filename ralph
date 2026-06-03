@@ -21,6 +21,8 @@
 #                        fix worker on failure (retries up to MAX_RETRIES)
 #   --watchdog N         Kill worker after N minutes of inactivity (default: 15)
 #   --no-watchdog        Disable the inactivity watchdog
+#   --clear-logs         Clear prior-run logs without prompting (for headless/tmux)
+#   --keep-logs          Keep prior-run logs without prompting
 #   --triage            Evaluate and refine open tickets before starting work.
 #                        Auto-improves underspecified tickets, defers ones
 #                        needing human input (tagged needs-input), then runs
@@ -151,6 +153,7 @@ FILTER_TAG=""         # filter by tag
 PLAN_FILE=""          # --from-plan: plan file to decompose into tickets
 TEST_CMD=""           # --test-cmd: command to run as pre-commit test gate
 WATCHDOG_TIMEOUT=15  # minutes of worker inactivity before kill (0=disabled)
+CLEAR_LOGS=""        # ""=ask interactively; "yes"=clear; "no"=keep (non-interactive)
 LOG_DIR=".ralph-logs"
 RALPH_RULES_FILE=".ralph-rules.md"
 
@@ -179,6 +182,8 @@ while [[ $# -gt 0 ]]; do
     --test-cmd)       TEST_CMD="$2"; shift 2 ;;
     --watchdog)       WATCHDOG_TIMEOUT="$2"; shift 2 ;;
     --no-watchdog)    WATCHDOG_TIMEOUT=0; shift ;;
+    --clear-logs)     CLEAR_LOGS="yes"; shift ;;
+    --keep-logs)      CLEAR_LOGS="no"; shift ;;
     -h|--help)        sed -n '/^# Usage/,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
     *)                echo "Unknown option: $1" >&2; exit 1 ;;
   esac
@@ -236,7 +241,18 @@ done
 
 if [[ ${#existing[@]} -gt 0 ]]; then
   log_ts "${C_YELLOW}Found ${#existing[@]} log file(s) from a previous run${C_RESET}"
-  read -r -p "  Clear old logs before starting? [Y/n] " answer </dev/tty
+  answer=""
+  if [[ "$CLEAR_LOGS" == "yes" ]]; then
+    answer="Y"
+  elif [[ "$CLEAR_LOGS" == "no" ]]; then
+    answer="n"
+  elif [[ -e /dev/tty && -t 0 ]]; then
+    # Interactive only — a read from /dev/tty blocks forever under tmux/headless.
+    read -r -p "  Clear old logs before starting? [Y/n] " answer </dev/tty
+  else
+    # No flag, no interactive terminal → clear by default (don't block the loop).
+    answer="Y"; detail "non-interactive — clearing (pass --keep-logs to retain)"
+  fi
   if [[ "${answer:-Y}" =~ ^[Yy]$ ]]; then
     rm -f "${existing[@]}"
     detail "cleared"
