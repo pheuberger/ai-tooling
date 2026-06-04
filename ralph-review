@@ -5,8 +5,8 @@
 # file vima tickets for issues found.
 #
 # Two modes:
-#   --full   (default) 4 personas: security, integration, patterns,
-#            plus plan-adherence if PLAN.md exists
+#   --full   (default) 5 personas: security, integration, patterns,
+#            maintainability, performance, plus plan-adherence if PLAN.md exists
 #   --light  2 personas: pragmatic-security + integration-light. No kaizen.
 #
 # Usage: ./ralph-review [options]
@@ -286,8 +286,8 @@ if [[ "$MODE" == "light" ]]; then
 
   log_files=("$sec_log" "$int_log")
 else
-  persona_count=3
-  [[ -n "$plan_context" ]] && persona_count=4
+  persona_count=5
+  [[ -n "$plan_context" ]] && persona_count=6
   phase_hdr "$C_MAGENTA" "Full review ($persona_count personas) — $(short_model "$REVIEW_MODEL")"
 
   sec_log="$LOG_DIR/security-$(date '+%H%M%S').log"
@@ -311,6 +311,20 @@ else
   )" &
   pat_pid=$!
 
+  mnt_log="$LOG_DIR/maintainability-$(date '+%H%M%S').log"
+  run_agent "maintainability" "$mnt_log" "$REVIEW_MODEL" --output-format stream-json --verbose -p "$(
+    export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" TICKET_TAGS_FLAG="$ticket_tags_flag"
+    render_prompt "$PROMPTS_DIR/final-review-maintainability.md" PRE_LOOP_HEAD TICKET_TAGS_FLAG
+  )" &
+  mnt_pid=$!
+
+  perf_log="$LOG_DIR/performance-$(date '+%H%M%S').log"
+  run_agent "performance" "$perf_log" "$REVIEW_MODEL" --output-format stream-json --verbose -p "$(
+    export PRE_LOOP_HEAD="$PRE_LOOP_HEAD" TICKET_TAGS_FLAG="$ticket_tags_flag"
+    render_prompt "$PROMPTS_DIR/final-review-performance.md" PRE_LOOP_HEAD TICKET_TAGS_FLAG
+  )" &
+  perf_pid=$!
+
   plan_pid=""
   plan_log=""
   if [[ -n "$plan_context" ]]; then
@@ -323,9 +337,9 @@ else
     plan_pid=$!
   fi
 
-  wait "$sec_pid" "$int_pid" "$pat_pid" ${plan_pid:+"$plan_pid"} 2>/dev/null || true
+  wait "$sec_pid" "$int_pid" "$pat_pid" "$mnt_pid" "$perf_pid" ${plan_pid:+"$plan_pid"} 2>/dev/null || true
 
-  log_files=("$sec_log" "$int_log" "$pat_log")
+  log_files=("$sec_log" "$int_log" "$pat_log" "$mnt_log" "$perf_log")
   [[ -n "$plan_log" ]] && log_files+=("$plan_log")
 fi
 

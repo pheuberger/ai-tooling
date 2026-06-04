@@ -61,6 +61,31 @@ const FULL = {
     fixType: 'task', fixPriority: 3, kaizen: true,
     pass: 'PATTERNS_PASS', issues: 'PATTERNS_ISSUES',
   },
+  maintainability: {
+    role: 'maintainability reviewer (DRY, KISS, coding guidelines)',
+    focus:
+      '- DRY: duplicated logic introduced by this diff that should be extracted (copy-pasted blocks, parallel branches doing the same thing, repeated literals/magic values)\n' +
+      '- KISS: needless complexity — abstractions with a single caller, premature generality, clever code where a plain version reads better, deep nesting that flattens with an early return\n' +
+      '- Coding guidelines: violations of the project conventions documented in CLAUDE.md, .ralph-rules.md, CONTRIBUTING, or a style guide in the repo (naming, error-handling style, file layout, comment density). Read those files if present before judging.\n' +
+      '- Single responsibility: functions/modules that grew too large or do too many unrelated things in this diff\n' +
+      '- Dead weight introduced: unused params/vars/imports, commented-out code, unreachable branches\n' +
+      'This lens is about INTERNAL simplicity and guideline fit. Reuse-of-existing-utilities and library choice belong to the patterns lens — defer those.',
+    fixType: 'task', fixPriority: 3, kaizen: true,
+    pass: 'MAINTAINABILITY_PASS', issues: 'MAINTAINABILITY_ISSUES',
+  },
+  performance: {
+    role: 'performance & scalability reviewer (DB load, SQL views, query cost)',
+    focus:
+      '- N+1 queries: queries issued inside a loop or per-row; missing eager-loading/joins where a single query would do\n' +
+      '- Query cost: missing indexes on filtered/joined/ordered columns, full-table scans, SELECT * on wide tables, unbounded result sets (no LIMIT/pagination), large IN lists\n' +
+      '- SQL views: inefficient or unnecessarily complex views, views stacked on views, non-sargable predicates (functions wrapping indexed columns), aggregation that should be precomputed\n' +
+      '- Round-trips & over-fetching: redundant DB hits, fetching more rows/columns than used, missing batching\n' +
+      '- Connection pool exhaustion: we run on Supabase Supavisor with a LIMITED connection budget, and Vercel serverless functions cap their own pool size. Flag new long-lived/unpooled connections, clients created per-request instead of reused, missing release/close, transaction-mode pooler misuse (prepared statements / session state), or fan-out that opens many concurrent connections. Connections are scarce — treat leaks and per-invocation client creation as real issues.\n' +
+      '- Scalability: per-request work that grows with data or users, O(n^2)+ on a hot path, unbounded memory growth, lock contention, missing caching where the cost is clear and repeated\n' +
+      'Tie every finding to a concrete cost on a real path — no speculative micro-optimization.',
+    fixType: 'bug', fixPriority: 2, kaizen: true,
+    pass: 'PERFORMANCE_PASS', issues: 'PERFORMANCE_ISSUES',
+  },
 }
 
 const LIGHT_PERSONAS = {
