@@ -46,7 +46,7 @@ echo "NOTIFY_SLACK_WEBHOOK=${NOTIFY_SLACK_WEBHOOK:+set}${NOTIFY_SLACK_WEBHOOK:-(
 
 If `NOTIFY_SLACK_WEBHOOK` is still not set, log a warning but continue — notifications will simply be skipped. Never echo the raw webhook URL.
 
-**Step 3: Check remote sync state**
+**Step 3: Sync with remote (rebase, never pull)**
 
 ```bash
 git fetch
@@ -55,7 +55,15 @@ REMOTE=$(git rev-parse @{u} 2>/dev/null || echo "")
 BASE=$(git merge-base @ @{u} 2>/dev/null || echo "")
 ```
 
-**Never run `git pull` or `git pull --rebase`** — it has repeatedly caused conflicts and broken state. If `LOCAL != REMOTE` and `BASE != REMOTE` (i.e. remote has commits you don't), notify via Slack with the divergence and exit. Let the human resolve.
+**Never run `git pull` or `git pull --rebase`.** But do NOT exit on divergence — rebase local onto remote so review fixes land on top of the latest, before any push (saves CI/Vercel cycles):
+
+```bash
+if [[ -n "$REMOTE" && "$LOCAL" != "$REMOTE" && "$BASE" != "$REMOTE" ]]; then
+  git rebase "@{u}"   # fetch already ran; rebase onto remote-tracking ref, not a pull
+fi
+```
+
+If the rebase hits conflicts it cannot resolve cleanly, abort (`git rebase --abort`), notify via Slack, and exit. Otherwise continue with the rebased branch.
 
 ### 2. Handle Review Comments
 
@@ -124,7 +132,7 @@ Categorize each thread/group into exactly one bucket — **no human approval ste
 | Decision | When | Action |
 |----------|------|--------|
 | **Fix** | Valid comment, clear fix | Implement it directly |
-| **Defer** | Valid but out of scope for this PR | Create Linear issue, reply with issue ID |
+| **Defer** | Valid but out of scope for this PR | Create **Linear** issue (never vima), as a sub-issue of the current issue if one exists; reply with issue ID |
 | **Drop** | Invalid, already addressed, or not applicable | Reply with reasoning |
 | **Escalate** | Genuinely cannot decide (see criteria below) | Reply "Flagging for human review", notify via Slack, do NOT resolve, move on |
 
@@ -176,9 +184,13 @@ gh api graphql -F query=@/tmp/resolve_thread.graphql -f threadId="<thread_id>"
 3. Resolve the thread
 
 #### For "Defer" items:
-1. Create a Linear issue using `mcp__linear__save_issue`
-2. Reply: `"Valid point — tracked in <ISSUE-ID> for follow-up. Deferring from this PR to keep scope focused."`
-3. Resolve the thread
+
+**Never create a vima ticket for deferred work — always Linear.**
+
+1. Determine the current Linear issue (the one this PR implements). Infer it from the branch name (e.g. `phi-123-...` → `PHI-123`) or the PR body/title. Confirm with `mcp__linear__get_issue` if unsure.
+2. Create a Linear issue with `mcp__linear__save_issue`. **If a current issue exists, set `parentId` to it** so the deferred work is a sub-issue. If no current issue can be determined, create it standalone.
+3. Reply: `"Valid point — tracked in <ISSUE-ID> for follow-up. Deferring from this PR to keep scope focused."`
+4. Resolve the thread
 
 #### For "Drop" items:
 1. Reply with reasoning (already handled, not applicable, etc.)
@@ -202,7 +214,13 @@ Push:
 ```bash
 git push
 ```
-If push fails (e.g. rejected, non-fast-forward), **do NOT pull**. Notify via Slack with the failure reason and exit. Let the human resolve remote divergence.
+If push is rejected (non-fast-forward, remote moved while you worked), **do NOT pull**. Re-sync by rebasing onto the remote, then push again:
+```bash
+git fetch
+git rebase "@{u}"   # rebase, not pull
+git push
+```
+If the rebase can't resolve conflicts cleanly, `git rebase --abort`, notify via Slack, and exit.
 
 ### 4. CI Checks
 
@@ -308,6 +326,6 @@ Notifications are **fire-and-forget** — never wait for a response.
 - **Resolve threads after action** — every thread should be resolved by the end (except escalated ones)
 - **Never block on human input** — if you can't decide, escalate via Slack and move on
 - **Never force-push** — always use regular `git push`
-- **Never `git pull`** — pulling has repeatedly caused conflicts/broken state. On remote divergence, notify via Slack and exit
+- **Never `git pull`** — pulling has repeatedly caused conflicts/broken state. On remote divergence, rebase onto the remote-tracking ref (`git fetch` + `git rebase @{u}`) so fixes land on the latest before pushing. Only notify + exit if the rebase has unresolvable conflicts
 - **Never use `--no-verify`** — fix hook failures instead of bypassing them
 - **Cap CI fix cycles at 3** — don't loop forever on unfixable failures
