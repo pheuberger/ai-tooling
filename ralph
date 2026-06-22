@@ -19,6 +19,8 @@
 #   --from-plan FILE     Decompose a plan file into tag-grouped tasks, then work them
 #   --test-cmd CMD       After main loop, run CMD as final test gate; spawns
 #                        fix worker on failure (retries up to MAX_RETRIES)
+#   --worker-skill NAME  Prefix each worker prompt with /NAME so it runs that
+#                        skill (e.g. tdd); the task becomes the skill's input
 #   --watchdog N         Kill worker after N minutes of inactivity (default: 15)
 #   --no-watchdog        Disable the inactivity watchdog
 #   --clear-logs         Clear prior-run logs without prompting (for headless/tmux)
@@ -36,7 +38,7 @@
 #                        COMMIT_MODEL, FINAL_REVIEW_MODEL, LEAD_MODEL,
 #                        SPEC_MODEL, SUMMARY_MODEL,
 #                        FILTER_TYPE, FILTER_PRIORITY, FILTER_OWNER,
-#                        FILTER_TAG, TEST_CMD, WATCHDOG_TIMEOUT,
+#                        FILTER_TAG, TEST_CMD, WATCHDOG_TIMEOUT, WORKER_SKILL,
 #                        LOG_DIR, RALPH_RULES_FILE.
 #                        TRIAGE_MODEL,
 #                        CLI flags override values set here.
@@ -133,6 +135,7 @@ MODEL=""              # global override — forces all agents to this model
 LEAD_MODEL=""         # lead agent (plan decomposition) — default: opus
 SPEC_MODEL=""         # spec reviewer — default: opus
 WORKER_MODEL=""       # coding worker — default: sonnet
+WORKER_SKILL=""       # if set, worker prompt is prefixed with /<skill> (e.g. tdd)
 COMMIT_MODEL=""       # commit agent — default: haiku
 SIMPLIFY_MODEL=""     # post-worker code simplifier — default: sonnet
 SIMPLIFY_THRESHOLD=10 # skip simplify when worker diff is fewer lines than this
@@ -180,6 +183,7 @@ while [[ $# -gt 0 ]]; do
     --triage)         TRIAGE=true; shift ;;
     --triage-only)    TRIAGE=true; TRIAGE_ONLY=true; shift ;;
     --test-cmd)       TEST_CMD="$2"; shift 2 ;;
+    --worker-skill)   WORKER_SKILL="$2"; shift 2 ;;
     --watchdog)       WATCHDOG_TIMEOUT="$2"; shift 2 ;;
     --no-watchdog)    WATCHDOG_TIMEOUT=0; shift ;;
     --clear-logs)     CLEAR_LOGS="yes"; shift ;;
@@ -440,6 +444,7 @@ cfg_opt "owner"    "$FILTER_OWNER"
 cfg_opt "tag"      "$FILTER_TAG"
 cfg_opt "test"     "$TEST_CMD"
 (( WATCHDOG_TIMEOUT > 0 )) && cfg_opt "watchdog" "${WATCHDOG_TIMEOUT}m" || true
+[[ -n "$WORKER_SKILL" ]] && cfg_opt "worker-skill" "/$WORKER_SKILL" || true
 [[ "$RESPECT_DEPS" == true ]] && detail "respect-deps: yes" || true
 if [[ -n "$MODEL" ]]; then
   detail "model (all): $(short_model "$MODEL")"
@@ -730,6 +735,9 @@ while true; do
   prompt_file=$(mktemp /tmp/ralph-prompt.XXXXXX)
 
   (
+    # A leading /<skill> line makes headless claude expand the skill before
+    # running; everything after it becomes the skill's input. Must be line 1.
+    [[ -n "$WORKER_SKILL" ]] && printf '/%s\n\n' "$WORKER_SKILL"
     export TICKET_TAGS="$ticket_tags" TICKET_ID="$ticket_id"
     export PROJECT_RULES="$project_rules" TICKET_DETAILS="$ticket_details"
     export ACCEPTANCE="$acceptance"

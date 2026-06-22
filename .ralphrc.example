@@ -39,6 +39,12 @@
 # FILTER_TAG=""
 
 # ---------------------------------------------------------------------------
+# Worker skill — prefix each worker prompt with /<skill> so the worker runs
+# that skill with the task as its input (e.g. test-driven development).
+# ---------------------------------------------------------------------------
+# WORKER_SKILL="tdd"
+
+# ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
 # LOG_DIR=".ralph-logs"
