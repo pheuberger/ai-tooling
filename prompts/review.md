@@ -11,6 +11,7 @@ ${TICKET_DETAILS}
    Check whether this ticket's changes conflict with or duplicate earlier work.
 3. Does the implementation match the spec and acceptance criteria?
 4. Are there bugs, missing edge cases, or security issues?
+4a. **Test quality** — do the new tests assert external behavior through the public seam, or are they coupled to implementation details (private internals, exact call sequences, mock-heavy assertions that just restate the code)? Implementation-coupled tests break on every refactor and prove little — file a Fix ticket to retarget them at observable behavior.
 5. If you find problems that need fixing, file each as a new ticket.
    **Before creating any ticket**, check for duplicates:
    vima list | jq -r '.[].title'

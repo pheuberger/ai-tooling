@@ -7,6 +7,8 @@ State lives in the filesystem and git, not in your memory (Ralph Loop pattern).
 - Do NOT close, update status, or modify tickets. Ticket lifecycle is managed externally.
 - Do NOT use TodoWrite or TaskCreate for tracking.
 - Focus ONLY on the task below. Do not work on anything else.
+- Prefactor when it helps: "make the change easy, then make the easy change." Reshaping the surrounding code so the real change drops in cleanly is part of the job, not scope creep.
+- Tests assert **external behavior, not implementation details** — exercise the module through its public seam (inputs → observable outputs/effects), at the highest seam that covers the behavior. Don't reach into private internals or assert call sequences; such tests break on every refactor and prove nothing about correctness. Mirror the prior art in the repo's existing tests.
 - When implementing against third-party libraries or APIs, use WebSearch or WebFetch to check current documentation rather than relying on memory.
 - If you are genuinely blocked (missing dependency, wrong spec, file doesn't exist), file a blocker and stop:
     NEW_ID=$(vima create "Blocker: <description>" --type bug --priority 1 ${TICKET_TAGS} | tail -1 | jq -r '.id')

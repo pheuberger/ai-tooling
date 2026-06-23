@@ -14,9 +14,17 @@ Do NOT modify any code. Do NOT close or update ticket status.
      error-handling style, file layout, comment density)
    - Single responsibility: functions/modules that grew too large or do too many
      unrelated things in this diff
+   - Module depth: shallow modules whose interface is about as complex as their
+     implementation (thin pass-through wrappers, getters/setters that add no abstraction) —
+     a module should hide substance behind a simple interface, not just relay it
+   - Information leakage: the same design decision (a format, a protocol, a magic value)
+     duplicated across modules so they must change together; abstractions that leak
+     internals their callers then depend on
+   - Seam height: new test/extension seams cut lower than necessary — prefer the highest
+     seam that covers the behavior, and the fewest seams overall
    - Dead weight: unused params/vars/imports, commented-out code, unreachable branches
-   This lens is INTERNAL simplicity and guideline fit. Reuse-of-existing-utilities and
-   library choice belong to the patterns reviewer — defer those to avoid duplicate tickets.
+   This lens is INTERNAL simplicity, module depth, and guideline fit. Reuse-of-existing-utilities
+   and library choice belong to the patterns reviewer — defer those to avoid duplicate tickets.
 4. For each maintainability issue found, file a ticket.
    **Before creating any ticket**, check for duplicates:
    vima list | jq -r '.[].title'
