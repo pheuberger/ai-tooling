@@ -6,7 +6,7 @@ Autonomous coding tools powered by [Claude Code](https://docs.anthropic.com/en/d
 |------|-------------|
 | [`ralph`](docs/ralph.md) | Autonomous coding loop — picks tickets, spawns a fresh Claude Code instance per task, commits, reviews, repeats |
 | [`ralph-plan`](docs/ralph-plan.md) | Self-healing plan refinement — N critic passes through rotating lenses, optional external sparring, final polish |
-| [Skills](docs/skills.md) | Interactive Claude Code skills for planning, research, and ticket management (`/create-plan`, `/plan-to-tickets`, etc.) |
+| [Skills](docs/skills.md) | Interactive Claude Code skills for planning, research, and ticket management (`/create-plan`, `/to-vima`, etc.) |
 
 ## Prerequisites
 

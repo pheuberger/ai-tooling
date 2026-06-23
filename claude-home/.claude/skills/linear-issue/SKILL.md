@@ -19,7 +19,7 @@ Nothing else. No implementation plans, no code excerpts, no architecture diagram
 - User explicitly invokes `/lean-issue`.
 
 Do NOT use when:
-- A spec/plan already exists and just needs filing → use `plan-to-tickets`.
+- A spec/plan already exists and just needs filing → use `to-vima`.
 - The work is in-flight and needs a tracking issue with implementation detail → user wants a regular issue, ask first.
 
 ## Workflow

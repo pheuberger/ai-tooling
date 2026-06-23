@@ -38,8 +38,8 @@ Skills are invoked in Claude Code with `/skill-name` (e.g. `/create-plan`). They
 | `/start-issue` | Beginning work on a Linear issue. Fetches the spec, marks it in progress, checks out the branch, and runs an interactive questioning phase to refine requirements before any code is written. |
 | `/research-codebase` | You need to understand how something works before planning. Spawns parallel sub-agents to explore the codebase and produces a timestamped research document in `.claude/research/`. |
 | `/create-plan` | After research and requirements are clear. Interactive multi-step process: gathers context, asks questions, explores code, and writes a phased implementation plan to `PLAN.md` in the project root. |
-| `/plan-to-tickets` | After a plan is approved. Decomposes it into granular, self-contained tickets (vima issues) with file paths, code snippets, and acceptance criteria. Every ticket gets a shared feature tag. |
-| `/review-tickets` | Quality gate before running ralph. Audits tickets for completeness, splits oversized ones, enriches vague descriptions with actual code from the codebase. |
+| `/to-vima` | After a plan is approved. Decomposes it into independently-grabbable vima tickets as tracer-bullet vertical slices — each a complete, demoable end-to-end path, described in domain language without stale file paths. Quizzes you on granularity and deps first. Every ticket gets a shared feature tag. |
+| `/review-tickets` | Quality gate before running ralph. Audits tickets as vertical slices, reslices horizontal/oversized ones, and sharpens vague behavior — without baking in stale file paths or code snippets. |
 | `/create-issue` | Mid-session, you notice out-of-scope work. Captures it as a Linear issue with a quick refinement loop — keeps you focused on the current task. |
 
 ## Typical workflow
@@ -48,8 +48,8 @@ Skills are invoked in Claude Code with `/skill-name` (e.g. `/create-plan`). They
 /start-issue MA-123          # fetch spec, question requirements, write PLAN.md
 /create-plan                  # (alternative) write PLAN.md interactively
 ./ralph-plan                  # refine PLAN.md → PLAN-REFINED.md
-/plan-to-tickets              # decompose plan into vima tasks
-/review-tickets               # quality-check the tickets
+/to-vima                      # decompose plan into vima tickets (vertical slices)
+/review-tickets               # quality-check the slices
 ./ralph --tag feat-slug       # let ralph work them autonomously
 ```
 
