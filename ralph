@@ -167,6 +167,10 @@ if [[ -f ".ralphrc" ]]; then
 fi
 
 SKIP_FILE="$LOG_DIR/.skipped"
+# Run-scoped scratch file accumulating worker "## Learnings" sections so each
+# fresh worker sees the pivots earlier tasks hit this session. Lives in LOG_DIR
+# (excluded from commits and untracked-file shelving).
+LEARNINGS_FILE="$LOG_DIR/.learnings.md"
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -601,6 +605,9 @@ fi
 
 PRE_LOOP_HEAD=$(git rev-parse --verify HEAD 2>/dev/null || git hash-object -t tree /dev/null)
 
+# Start with a clean learnings ledger — accumulate only this run's pivots.
+: > "$LEARNINGS_FILE" 2>/dev/null || true
+
 # ---------------------------------------------------------------------------
 # Main loop — runs as long as there are unblocked tickets
 # ---------------------------------------------------------------------------
@@ -734,14 +741,18 @@ while true; do
   ticket_tags=$(echo "$ticket_show_json" | jq -r '.tags // [] | map("--tags " + .) | join(" ")') || ticket_tags=""
   prompt_file=$(mktemp /tmp/ralph-prompt.XXXXXX)
 
+  # Feed forward learnings harvested from earlier workers this run (if any).
+  learnings_so_far=""
+  [[ -s "$LEARNINGS_FILE" ]] && learnings_so_far=$(<"$LEARNINGS_FILE")
+
   (
     # A leading /<skill> line makes headless claude expand the skill before
     # running; everything after it becomes the skill's input. Must be line 1.
     [[ -n "$WORKER_SKILL" ]] && printf '/%s\n\n' "$WORKER_SKILL"
     export TICKET_TAGS="$ticket_tags" TICKET_ID="$ticket_id"
     export PROJECT_RULES="$project_rules" TICKET_DETAILS="$ticket_details"
-    export ACCEPTANCE="$acceptance"
-    render_prompt "$PROMPTS_DIR/worker.md" TICKET_TAGS TICKET_ID PROJECT_RULES TICKET_DETAILS ACCEPTANCE
+    export ACCEPTANCE="$acceptance" LEARNINGS="$learnings_so_far"
+    render_prompt "$PROMPTS_DIR/worker.md" TICKET_TAGS TICKET_ID PROJECT_RULES TICKET_DETAILS ACCEPTANCE LEARNINGS
   ) > "$prompt_file"
 
   # -----------------------------------------------------------------------
@@ -784,6 +795,22 @@ while true; do
     echo "$ticket_id" >> "$SKIP_FILE"
     vima update "$ticket_id" --status open > /dev/null 2>&1 || true   # release claim
     continue
+  fi
+
+  # -----------------------------------------------------------------------
+  # Harvest the worker's "## Learnings" section → feed forward to later
+  # workers. Worker.md instructs the agent to end with this section; we
+  # extract its body and append to the run-scoped ledger, skipping the
+  # "nothing surprising" sentinel and empty content.
+  # -----------------------------------------------------------------------
+  worker_text=$(jq -r 'select(.type == "assistant") | .message.content[]? | select(.type == "text") | .text' "$log_file" 2>/dev/null)
+  learnings=$(printf '%s\n' "$worker_text" | sed -n '/^## Learnings/,$p' | tail -n +2)
+  if [[ -n "${learnings//[[:space:]]/}" && "$learnings" != *"None — task matched spec"* ]]; then
+    {
+      printf '\n### %s — %s\n' "$ticket_id" "$ticket_title"
+      printf '%s\n' "$learnings"
+    } >> "$LEARNINGS_FILE"
+    detail "recorded learnings from $ticket_id"
   fi
 
   # -----------------------------------------------------------------------
