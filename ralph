@@ -139,7 +139,7 @@ WORKER_SKILL=""       # if set, worker prompt is prefixed with /<skill> (e.g. td
 COMMIT_MODEL=""       # commit agent — default: haiku
 SIMPLIFY_MODEL=""     # post-worker code simplifier — default: sonnet
 SIMPLIFY_THRESHOLD=10 # skip simplify when worker diff is fewer lines than this
-REVIEWER_MODEL=""     # intermittent code reviewer — default: sonnet
+REVIEWER_MODEL=""     # intermittent code reviewer — default: opus
 FINAL_REVIEW_MODEL="" # final parallel review personas — default: opus
 SUMMARY_MODEL=""      # post-run summary — default: haiku
 TRIAGE_MODEL=""       # ticket triage/refinement — default: opus
@@ -312,15 +312,15 @@ iteration=0
 claude_flags=(--print --dangerously-skip-permissions)
 
 # Per-agent model defaults — global MODEL overrides everything
-LEAD_MODEL="${MODEL:-${LEAD_MODEL:-claude-opus-4-6}}"
-SPEC_MODEL="${MODEL:-${SPEC_MODEL:-claude-opus-4-6}}"
+LEAD_MODEL="${MODEL:-${LEAD_MODEL:-claude-opus-4-8}}"
+SPEC_MODEL="${MODEL:-${SPEC_MODEL:-claude-opus-4-8}}"
 WORKER_MODEL="${MODEL:-${WORKER_MODEL:-claude-sonnet-4-6}}"
 COMMIT_MODEL="${MODEL:-${COMMIT_MODEL:-claude-haiku-4-5-20251001}}"
 SIMPLIFY_MODEL="${MODEL:-${SIMPLIFY_MODEL:-claude-sonnet-4-6}}"
-REVIEWER_MODEL="${MODEL:-${REVIEWER_MODEL:-claude-sonnet-4-6}}"
-FINAL_REVIEW_MODEL="${MODEL:-${FINAL_REVIEW_MODEL:-claude-opus-4-6}}"
+REVIEWER_MODEL="${MODEL:-${REVIEWER_MODEL:-claude-opus-4-8}}"
+FINAL_REVIEW_MODEL="${MODEL:-${FINAL_REVIEW_MODEL:-claude-opus-4-8}}"
 SUMMARY_MODEL="${MODEL:-${SUMMARY_MODEL:-claude-haiku-4-5-20251001}}"
-TRIAGE_MODEL="${MODEL:-${TRIAGE_MODEL:-claude-opus-4-6}}"
+TRIAGE_MODEL="${MODEL:-${TRIAGE_MODEL:-claude-opus-4-8}}"
 
 # Run claude with a specific model: claude_as <model> [extra-args...]
 # setsid -w detaches from controlling terminal so claude can't write
@@ -431,8 +431,8 @@ run_agent() {
   fi
 }
 
-# Short model name for display: claude-sonnet-4-6 → sonnet
-short_model() { echo "$1" | sed 's/^claude-//; s/-[0-9].*//'; }
+# Model name for display: claude-sonnet-4-6 → sonnet-4-6 (exact version, drop vendor prefix)
+short_model() { echo "$1" | sed 's/^claude-//'; }
 
 section "Ralph Loop"
 detail "iterations: $MAX_ITERATIONS  retries: $MAX_RETRIES"
