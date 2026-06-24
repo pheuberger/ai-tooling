@@ -12,7 +12,15 @@ vima is the local agent-first issue tracker for this repo — NOT Linear. Ticket
 
 ### 1. Gather context
 
-Work from whatever is already in the conversation. If the user passes a plan file (`PLAN-REFINED.md`, `PLAN.md`, or a path argument) or a vima ticket id, read it fully first. If nothing is in context and no argument is given, ask for a plan or point them at `/create-plan`.
+Work from whatever is already in the conversation. If the user passes a plan file (`PLAN-REFINED.md`, `PLAN.md`, or a path argument) or a vima ticket id, read it fully first.
+
+If no argument is given, check the current git branch for a Linear issue id before asking the user. Linear branch names embed the issue id (e.g. `philipp/abc-123-some-title` → `ABC-123`):
+
+```bash
+git rev-parse --abbrev-ref HEAD | grep -oiE '[a-z]+-[0-9]+' | head -1
+```
+
+If an id is found, read that issue with the Linear MCP `get_issue` tool (and `list_comments` for any added context) and treat its description as the plan to break down. If no id is in the branch name and nothing is in context, ask for a plan or point them at `/create-plan`.
 
 ### 2. Explore the codebase
 
