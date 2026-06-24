@@ -201,6 +201,46 @@ gh api graphql -F query=@/tmp/resolve_thread.graphql -f threadId="<thread_id>"
 2. **Do NOT resolve** — leave for human
 3. Fire Slack notification (see below) and **continue to next item**
 
+### 2b. CodeRabbit Out-of-Diff Findings
+
+CodeRabbit surfaces extra findings *outside* the changed lines — they do NOT appear as `reviewThreads`, so Phase 2 misses them. They live in the review **body** markdown, inside collapsible `<details>` blocks titled **"Outside diff range comments (N)"** and **"Additional comments not posted (N)"**.
+
+These flag real bugs in code the PR didn't touch but is adjacent to. **Always worth a look — but they are scope risk.** Bias hard toward NOT expanding this PR.
+
+**Step 1: Fetch CodeRabbit review bodies**
+
+```bash
+gh api repos/$OWNER/$REPO/pulls/$PR_NUMBER/reviews \
+  --jq '.[] | select(.user.login=="coderabbitai[bot]") | .body'
+```
+
+Also check issue comments (CodeRabbit posts walkthrough/summary there too):
+
+```bash
+gh api repos/$OWNER/$REPO/issues/$PR_NUMBER/comments \
+  --jq '.[] | select(.user.login=="coderabbitai[bot]") | .body'
+```
+
+If no CodeRabbit output, skip to Phase 3.
+
+**Step 2: Extract the out-of-diff findings**
+
+Parse the `<details>` sections "Outside diff range comments" and "Additional comments not posted". Each finding has a file path, line range, and description. Ignore nitpicks/duplicates CodeRabbit already marked as such.
+
+**Step 3: Triage — scope-control bias**
+
+Same buckets as Phase 2, but the DEFAULT shifts. These are not in the diff, so fixing them grows the PR:
+
+| Decision | When (out-of-diff) |
+|----------|--------------------|
+| **Fix** | ONLY a true one-liner directly adjacent to changed code, AND a real bug (crash, data loss, security, broken behavior) — not style/refactor |
+| **Defer** | DEFAULT for anything valid but not a trivial-adjacent bug — file a Linear issue (sub-issue of current), capture the finding |
+| **Drop** | Nitpick, speculative, or already correct |
+
+**Hard rule: do not let out-of-diff findings balloon the PR.** If more than ~2 qualify as Fix, fix the single highest-severity one and Defer the rest to Linear. No refactors. No "while I'm here" cleanups.
+
+There is no thread to reply to or resolve for these (they are body text, not threads). Just Fix or Defer (Linear). Note them in the final summary under a "CodeRabbit out-of-diff" line.
+
 ### 3. Commit and Push
 
 After all review comment fixes are implemented:
@@ -285,6 +325,11 @@ After all work is done:
    - Dropped: <N>
    - Escalated: <N> (notified via Slack)
 
+   ### CodeRabbit Out-of-Diff
+   - Fixed: <N> (trivial-adjacent bugs only)
+   - Deferred: <N> (with Linear issue IDs)
+   - Dropped: <N>
+
    ### CI Checks
    - Fixed: <N> failures across <M> cycles
    - Still failing: <N> (notified via Slack)
@@ -322,6 +367,7 @@ Notifications are **fire-and-forget** — never wait for a response.
 - **ALWAYS read the actual code** before judging a comment — don't assess validity from the comment alone
 - **Group duplicates** — multiple bots/reviewers often flag the same thing
 - **Don't gold-plate** — implement the minimum fix that addresses the concern. Don't refactor surrounding code.
+- **Out-of-diff findings must not balloon the PR** — CodeRabbit's outside-diff comments are worth a look, but default to Defer (Linear). Fix only trivial-adjacent real bugs, ≤2 per run.
 - **NEVER resolve without replying** — every thread gets a reply explaining what was decided before it is resolved
 - **Resolve threads after action** — every thread should be resolved by the end (except escalated ones)
 - **Never block on human input** — if you can't decide, escalate via Slack and move on
