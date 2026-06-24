@@ -6,12 +6,15 @@ description: "Tear down a git worktree and its tmux session — the inverse of t
 # unccw
 
 Undo a worktree + tmux session created by `outsource`, `ralph-fleet`, `isolated-pr`,
-or by hand. Removes the worktree, kills the tmux session, and (if asked) deletes the
-branch. The inverse of those spawn skills.
+or by hand. Removes the worktree, kills the tmux session, and deletes the branch once it's
+safely merged. The inverse of those spawn skills.
 
-This is **destructive and hard to reverse** — uncommitted work in the worktree and an
-un-pushed branch are lost. Confirm targets before running, never `--force` without
-explicit user OK.
+This is **destructive and hard to reverse**, but it runs **without questions** in the
+normal case. You'll typically invoke it from inside the very worktree/branch that's meant
+to disappear — self-targeting and teardown are *expected*, not something to confirm.
+Resolve targets yourself and proceed. Stop to ask the user only when there's genuinely
+unrecoverable work at stake (the gates below pinpoint exactly when); never `--force`
+without explicit OK.
 
 ## Inputs
 
@@ -40,12 +43,12 @@ case "$SELF" in
 esac
 ```
 
-If self-targeting:
-- Warn the user explicitly: teardown ends this session; they continue from the main repo
-  root (or a new session).
+Self-targeting is the **normal, expected** case here — don't stop to confirm it. Just
+handle it safely:
 - Run the whole teardown from `$MAIN`, not the worktree.
 - Order: worktree remove → branch delete → **tmux kill LAST** (killing the session's own
   pane is what ends it; do the recoverable git ops first so nothing is lost if it dies).
+- Note in the final report that this session ends and they continue from the main repo root.
 
 ## Resolve the tmux binary
 
@@ -60,20 +63,24 @@ done
 [ -z "$TMUX_BIN" ] && TMUX_BIN="$(unalias tmux 2>/dev/null; type -P tmux 2>/dev/null)"
 ```
 
-## Confirm before destroying
+## Check what you'd lose (only stop if it's unrecoverable)
 
-Before removing, **check what you're about to lose** and report it:
+Before removing, check the worktree state:
 
 ```bash
-git -C "$WT" status --porcelain                    # uncommitted changes?
+git -C "$WT" status --porcelain                    # uncommitted / untracked changes?
 git -C "$WT" log --oneline @{upstream}.. 2>/dev/null  # un-pushed commits?
 ```
 
-- Uncommitted changes or un-pushed commits present → surface them, ask before proceeding.
-  Don't `--force` to paper over them.
-- Clean and pushed (or PR already open) → safe to proceed.
+- **Clean** (committed, or clean + pushed, or PR open) → proceed silently. No question.
+- **Un-pushed commits, clean tree** → the branch-delete gate below keeps the branch when
+  it's unmerged, so those commits survive on the branch. Proceed; no question.
+- **Uncommitted or untracked changes** → the one unrecoverable case. `git worktree remove`
+  refuses without `--force`. Surface exactly what's dirty and ask: force-remove (lose it)
+  or abort. Never `--force` silently. This is the *only* state that warrants a question.
 
-Ask whether to **keep or delete the branch** unless the user already said.
+The keep-or-delete-branch decision is **not** a question — derive it from the merge gate
+below.
 
 ## Branch-delete safety gate
 
@@ -104,7 +111,8 @@ From the main repo root, outside the worktree:
 
 ```bash
 git worktree remove "$WT"                  # add --force ONLY with explicit user OK
-# branch delete ONLY when the safety gate above passed AND the user wants it gone:
+# branch delete is automatic once the merge gate above passed — teardown is the point,
+# no need to ask. If the gate kept the branch (unmerged), skip this and report it.
 git branch -D "$BRANCH"
 git worktree prune                          # tidy stale admin entries
 "$TMUX_BIN" kill-session -t "$SESSION" 2>/dev/null || true   # LAST: may end this session
@@ -112,13 +120,14 @@ git worktree prune                          # tidy stale admin entries
 
 `worktree remove` leaves the branch intact by design — drop it separately only after the
 merge gate passes. `kill-session` on a missing session is harmless (`|| true`). Report what
-was removed: worktree path, session, and whether the branch was deleted, kept-because-asked,
-or **kept-because-unmerged**.
+was removed: worktree path, session, and whether the branch was deleted or
+**kept-because-unmerged**.
 
 ## Notes
 
 - Don't tear down a worktree whose agent is **still running** — check
   `tmux capture-pane -p -t "$SESSION"` if unsure; a live agent means work in flight.
-- Multiple worktrees (ralph-fleet lanes) → confirm the set, loop the teardown per lane.
+- Multiple worktrees (ralph-fleet lanes) → identify the set and loop the teardown per lane;
+  each lane runs the same gates, no per-lane questions.
 - This skill never touches the current session's own worktree unless that's explicitly the
   target the user named.
