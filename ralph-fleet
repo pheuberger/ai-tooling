@@ -21,6 +21,12 @@
 #   --prefix STR         lane tag prefix (default: worker → worker1, worker2, …)
 #   --base BRANCH        branch to fork worktrees from and merge into (default: current branch)
 #   --worktree-dir DIR   parent dir for worktrees (default: parent of repo root)
+#   --context-path PATH  untracked reference path (file or dir, relative to repo root) to
+#                        symlink into every lane so workers can read it — `git worktree add`
+#                        only carries TRACKED files. Repeatable; overrides the default set
+#                        (CONTEXT.md, docs/adr). Each link is registered in .git/info/exclude
+#                        so ralph's untracked-file shelving leaves it in place.
+#   --no-context         do not symlink any reference paths into lanes
 #   --session NAME       tmux session name (default: ralph-fleet)
 #   --auto               after launch, spawn a detached autopilot that polls until all
 #                        lanes finish, then squash-merges into base and tears down worktrees
@@ -78,6 +84,9 @@ ACTION="launch"   # launch | status | merge | cleanup | wait
 STRATEGY="squash" # merge strategy: squash | no-ff
 AUTO=false        # --auto: after launch, spawn a detached --wait autopilot
 POLL=600          # --wait poll interval (seconds) — default 10 min
+NO_CONTEXT=false  # --no-context: skip seeding reference paths into lanes
+CONTEXT_PATHS=()  # --context-path: user-supplied paths; empty → CONTEXT_PATHS_DEFAULT
+CONTEXT_PATHS_DEFAULT=(CONTEXT.md docs/adr) # untracked reference paths symlinked into each lane
 RALPH_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -86,6 +95,8 @@ while [[ $# -gt 0 ]]; do
     --prefix)       PREFIX="$2"; shift 2 ;;
     --base)         BASE="$2"; shift 2 ;;
     --worktree-dir) WORKTREE_DIR="$2"; shift 2 ;;
+    --context-path) CONTEXT_PATHS+=("$2"); shift 2 ;;
+    --no-context)   NO_CONTEXT=true; shift ;;
     --session)      SESSION="$2"; shift 2 ;;
     --strategy)     STRATEGY="$2"; shift 2 ;;
     --poll)         POLL="$2"; shift 2 ;;
@@ -123,6 +134,40 @@ MAIN_STORE="$(vima_store_of "$REPO_ROOT")"
 lane_branch()   { echo "ralph/${PREFIX}$1"; }
 lane_worktree() { echo "$WORKTREE_DIR/${REPO_NAME}-${PREFIX}$1"; }
 lane_tag()      { echo "${PREFIX}$1"; }
+
+# No --context-path given → seed the default reference set.
+[[ ${#CONTEXT_PATHS[@]} -eq 0 ]] && CONTEXT_PATHS=("${CONTEXT_PATHS_DEFAULT[@]}")
+
+# Make sure a path counts as git-ignored so ralph's loop-start shelving
+# (`git ls-files --others --exclude-standard`) leaves the symlink in place instead
+# of moving it to /tmp. Default paths are already gitignored → no-op; this only
+# writes .git/info/exclude (shared by all worktrees) for a custom --context-path
+# that isn't ignored yet.
+exclude_path() {
+  local p="$1" excl="$REPO_ROOT/.git/info/exclude"
+  git -C "$REPO_ROOT" check-ignore -q "$p" 2>/dev/null && return 0
+  [[ -f "$excl" ]] || : > "$excl"
+  grep -qxF "$p" "$excl" 2>/dev/null || printf '%s\n' "$p" >> "$excl"
+}
+
+# Symlink each present CONTEXT_PATHS entry from the main repo into one lane
+# worktree (absolute target → lanes read the live version). Never clobbers a real
+# tracked path. Echoes the count linked; warnings go to stderr so they don't taint it.
+link_context() {
+  local wt="$1" lane="$2" p src dst n=0
+  for p in "${CONTEXT_PATHS[@]}"; do
+    src="$REPO_ROOT/$p"
+    [[ -e "$src" ]] || continue
+    dst="$wt/$p"
+    if [[ -e "$dst" && ! -L "$dst" ]]; then
+      out "${C_YELLOW}!${C_RESET}" "lane $lane: $p exists as a real path in the lane — skipping symlink" >&2
+      continue
+    fi
+    mkdir -p "$(dirname "$dst")"
+    ln -sfn "$src" "$dst" && { exclude_path "$p"; n=$((n+1)); }
+  done
+  echo "$n"
+}
 
 # All lanes live as side-by-side panes in ONE window so everything is visible at
 # a glance. Each pane's title is set to lane$i at launch.
@@ -439,6 +484,26 @@ for i in $(seq 1 "$LANES"); do
       || die "failed to create worktree for lane $i"
   fi
 done
+
+# Seed each lane with untracked reference docs (ADRs, CONTEXT.md). `git worktree
+# add` only carries TRACKED files, so these never reach a lane on their own.
+# Symlink (not copy) back to the main repo → every lane reads the live version.
+if ! $NO_CONTEXT && [[ ${#CONTEXT_PATHS[@]} -gt 0 ]]; then
+  section "Context"
+  for i in $(seq 1 "$LANES"); do
+    wt="$(lane_worktree "$i")"
+    if $DRY_RUN; then
+      for p in "${CONTEXT_PATHS[@]}"; do
+        [[ -e "$REPO_ROOT/$p" ]] && detail "(dry-run) lane $i: ln -s $REPO_ROOT/$p → $wt/$p (+ .git/info/exclude)"
+      done
+      continue
+    fi
+    [[ -d "$wt" ]] || continue
+    n=$(link_context "$wt" "$i")
+    [[ "$n" -gt 0 ]] && out "${C_GREEN}✓${C_RESET}" "lane $i: linked $n context path(s)" \
+                     || detail "lane $i: no context paths present to link"
+  done
+fi
 
 $DRY_RUN && { section "${C_GREEN}dry-run complete${C_RESET}"; exit 0; }
 

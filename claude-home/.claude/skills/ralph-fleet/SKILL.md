@@ -95,6 +95,13 @@ the current branch, and starts a single tmux window (`fleet`) with one pane per 
 side by side so all lanes are visible at a glance (each lane = a `ralph` run; its pane dies when
 ralph exits).
 
+Untracked reference docs (`CONTEXT.md`, `docs/adr` by default) are symlinked into every lane —
+`git worktree add` carries only TRACKED files, so without this workers couldn't read them. The
+links point back at the main repo (live version) and are registered in `.git/info/exclude` so
+ralph's untracked-file shelving leaves them in place. Override the set with one or more
+`--context-path PATH` after `--`, or disable with `--no-context` (e.g.
+`ralph-fleet --no-attach -- --context-path CONTEXT.md --context-path docs/decisions`).
+
 Then wait for every lane to finish. **Do not use `ralph-fleet --wait`** — it auto-squash-merges,
 and you apply the lanes yourself (next section). Instead background this poll so the harness
 re-invokes you the moment all lanes are done:
